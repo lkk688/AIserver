@@ -1,2 +1,4 @@
 cosyvoice/CosyVoice/
 cosyvoice/pretrained_models/
+.env
+*/__pycache__/
