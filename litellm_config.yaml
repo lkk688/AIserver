@@ -1,0 +1,36 @@
+model_list:
+  - model_name: qwen3
+    litellm_params:
+      model: openai/Qwen/Qwen2.5-14B-Instruct-AWQ
+      api_base: http://vllm-qwen3:8000/v1
+      api_key: sk-dummy-key
+
+  - model_name: qwen3-vl
+    litellm_params:
+      model: openai/Qwen/Qwen2.5-VL-7B-Instruct-AWQ
+      api_base: http://vllm-qwen3-vl:8000/v1
+      api_key: sk-dummy-key
+
+  - model_name: cosyvoice
+    litellm_params:
+      model: openai/cosyvoice
+      api_base: http://cosyvoice:50000/v1
+      api_key: sk-dummy-key
+
+  - model_name: gemma
+    litellm_params:
+      model: openai/gemma
+      api_base: http://hfserve:8000/v1
+      api_key: sk-dummy-key
+
+  - model_name: medgemma
+    litellm_params:
+      model: openai/medgemma
+      api_base: http://hfserve:8000/v1
+      api_key: sk-dummy-key
+
+  - model_name: embedding
+    litellm_params:
+      model: openai/embedding
+      api_base: http://hfserve:8000/v1
+      api_key: sk-dummy-key

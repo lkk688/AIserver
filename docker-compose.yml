@@ -1,0 +1,170 @@
+version: '3.8'
+
+services:
+  vllm-qwen3:
+    image: vllm/vllm-openai:latest
+    profiles: ["qwen", "all"]
+    container_name: vllm-qwen3
+    env_file:
+      - .env
+      - vllm_config.env
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - CUDA_LAUNCH_BLOCKING=1
+      # Select model to load: "gemma3", "translategemma", "medgemma", or "all"
+      - MODEL_TYPE=${HFSERVE_MODEL_TYPE:-all}
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    ports:
+      - "8001:8000"
+    ipc: host
+    # Use variables from .env to control model version, context length, etc.
+    # Note: QUANTIZATION is now conditionally applied. If empty, it's omitted.
+    # But shell variable substitution doesn't easily support "omit if empty" in docker-compose command string directly without a script.
+    # Workaround: We will use a shell entrypoint to construct the command dynamically.
+    entrypoint: ["/bin/sh", "-c"]
+    command: 
+      - |
+        args="--model $${QWEN_MODEL_NAME} --host 0.0.0.0 --port 8000 --gpu-memory-utilization $${GPU_MEMORY_UTILIZATION} --max-model-len $${MAX_MODEL_LEN} --trust-remote-code $${VLLM_EXTRA_ARGS}"
+        if [ -n "$${QUANTIZATION}" ]; then
+          args="$$args --quantization $${QUANTIZATION}"
+        fi
+        echo "Running vLLM with args: $$args"
+        exec python3 -m vllm.entrypoints.openai.api_server $$args
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  vllm-qwen3-vl:
+    image: vllm/vllm-openai:latest
+    profiles: ["vl", "all"]
+    container_name: vllm-qwen3-vl
+    env_file:
+      - .env
+      - vllm_config.env
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    ports:
+      - "8002:8000"
+    ipc: host
+    # Use variables from .env to control model version, context length, etc.
+    entrypoint: ["/bin/sh", "-c"]
+    command: 
+      - |
+        args="--model $${QWEN_VL_MODEL_NAME} --host 0.0.0.0 --port 8000 --gpu-memory-utilization $${GPU_MEMORY_UTILIZATION_VL} --max-model-len $${MAX_MODEL_LEN} --trust-remote-code --dtype float16 $${VLLM_EXTRA_ARGS}"
+        if [ -n "$${QUANTIZATION}" ]; then
+          args="$$args --quantization $${QUANTIZATION}"
+        fi
+        echo "Running vLLM VL with args: $$args"
+        exec python3 -m vllm.entrypoints.openai.api_server $$args
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  cosyvoice:
+    build: ./cosyvoice
+    profiles: ["cosyvoice", "all"]
+    container_name: cosyvoice
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - PYTHONPATH=/app/CosyVoice:/app/CosyVoice/third_party/Matcha-TTS
+    volumes:
+      - ~/.cache/modelscope:/root/.cache/modelscope
+      - ./cosyvoice/CosyVoice:/app/CosyVoice
+      - ./cosyvoice/pretrained_models:/app/pretrained_models
+    ports:
+      - "50000:50000"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  hfserve:
+    build: ./HFserve
+    profiles: ["hfserve", "all"]
+    container_name: hfserve
+    env_file:
+      - .env
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - CUDA_LAUNCH_BLOCKING=1
+      - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-2}
+      # Default to loading only gemma3 to save memory. Override with MODEL_TYPE=all if needed.
+      - MODEL_TYPE=${HFSERVE_MODEL_TYPE:-gemma3}
+      - EMBEDDING_MODEL_NAME=${HFSERVE_EMBEDDING_MODEL}
+      # Cache locations (should match Dockerfile or be overridden here)
+      - HF_HOME=/models
+      - HF_HUB_CACHE=/models/hub
+      - TRANSFORMERS_CACHE=/models/transformers
+    volumes:
+      # Mount host cache to container /models
+      - ~/.cache/huggingface:/models
+    ports:
+      - "8005:8000"
+    # depends_on:
+    #   vllm-qwen3:
+    #     condition: service_healthy
+    #   # vllm-qwen3-vl:
+    #   #   condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/readyz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    profiles: ["litellm", "all"]
+    container_name: litellm
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml
+    command: [ "--config", "/app/config.yaml", "--port", "4000" ]
+    depends_on:
+      # vllm-qwen3:
+      #   condition: service_healthy
+      # vllm-qwen3-vl:
+      #   condition: service_healthy
+      hfserve:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    ipc: host
