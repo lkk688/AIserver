@@ -1,0 +1,26 @@
+metadata_backend: sqlite
+lexical_backend: fts5
+vector_backend: faiss
+
+storage:
+  data_dir: ./data
+  sqlite_path: ./data/metadata.db
+  faiss_dir: ./data/faiss_index
+
+ingestion:
+  chunk_size_tokens: 512
+  chunk_overlap_tokens: 50
+  max_file_mb: 10
+
+bookmarks:
+  chrome_bookmarks_path: ~/.config/google-chrome/Default/Bookmarks
+
+web_fetch:
+  enabled: true
+  timeout_sec: 10
+  user_agent: "MyLocalSearch/0.1"
+
+embedding:
+  provider: "sentence-transformers"
+  model_name: "all-MiniLM-L6-v2"
+  dim: 384

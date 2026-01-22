@@ -1,0 +1,49 @@
+{
+   "checksum": "e3277732040e67272826727727",
+   "roots": {
+      "bookmark_bar": {
+         "children": [ {
+            "date_added": "13217765555555555",
+            "id": "1",
+            "name": "Google",
+            "type": "url",
+            "url": "https://www.google.com/"
+         }, {
+            "children": [ {
+               "date_added": "13217765555555555",
+               "id": "3",
+               "name": "Example",
+               "type": "url",
+               "url": "https://example.com/"
+            } ],
+            "date_added": "13217765555555555",
+            "date_modified": "13217765555555555",
+            "id": "2",
+            "name": "Folder",
+            "type": "folder"
+         } ],
+         "date_added": "13217765555555555",
+         "date_modified": "13217765555555555",
+         "id": "1",
+         "name": "Bookmarks bar",
+         "type": "folder"
+      },
+      "other": {
+         "children": [  ],
+         "date_added": "13217765555555555",
+         "date_modified": "13217765555555555",
+         "id": "2",
+         "name": "Other bookmarks",
+         "type": "folder"
+      },
+      "synced": {
+         "children": [  ],
+         "date_added": "13217765555555555",
+         "date_modified": "13217765555555555",
+         "id": "3",
+         "name": "Mobile bookmarks",
+         "type": "folder"
+      }
+   },
+   "version": 1
+}
