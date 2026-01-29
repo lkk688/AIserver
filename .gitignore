@@ -4,3 +4,4 @@ cosyvoice/pretrained_models/
 */__pycache__/
 *.pyc
 data
+test_vibevoice_direct.wav
