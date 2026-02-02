@@ -50,6 +50,22 @@ class EmbeddingConfig(BaseModel):
     model_name: str
     dim: int = Field(gt=0)
 
+
+class TextProcessingConfig(BaseModel):
+    use_kenlm: bool = True
+    use_seq2seq: bool = False
+    kenlm_model_path: Optional[Path] = None
+    seq2seq_model: Optional[str] = None
+    seq2seq_prefix: Optional[str] = None
+
+    @field_validator("kenlm_model_path")
+    @classmethod
+    def normalize_kenlm_path(cls, v: Optional[Path]) -> Optional[Path]:
+        if v:
+            return v.expanduser().resolve()
+        return v
+
+
 class AppConfig(BaseModel):
     metadata_backend: MetadataBackend
     lexical_backend: LexicalBackend
@@ -59,3 +75,4 @@ class AppConfig(BaseModel):
     bookmarks: BookmarksConfig
     web_fetch: WebFetchConfig
     embedding: EmbeddingConfig
+    text_processing: TextProcessingConfig = TextProcessingConfig()

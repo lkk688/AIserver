@@ -6,7 +6,7 @@ This repository sets up an inference server for **Qwen3** and **Qwen3-VL** model
 
 - **vLLM Container 1 (`vllm-qwen3`)**: Serves `Qwen/Qwen2.5-14B-Instruct-AWQ` (acting as Qwen3 placeholder).
 - **vLLM Container 2 (`vllm-qwen3-vl`)**: Serves `Qwen/Qwen2.5-VL-7B-Instruct-AWQ` (acting as Qwen3-VL placeholder).
-- **CosyVoice Service (`cosyvoice`)**: Custom container serving `Fun-CosyVoice3-0.5B` via OpenAI-compatible Speech API.
+- **CosyVoice Service (`audio-cosyvoice`)**: Custom container serving `Fun-CosyVoice3-0.5B` via OpenAI-compatible Speech API.
 - **LiteLLM Container (`litellm`)**: Unified entry point (Port 4000) that routes requests to the appropriate vLLM container.
 
 ## Prerequisites
@@ -17,7 +17,7 @@ This repository sets up an inference server for **Qwen3** and **Qwen3-VL** model
 
 ## Recent Updates & Troubleshooting
 
-- **CosyVoice Integration**: Added a custom `Dockerfile` in `cosyvoice/` directory that extends `vllm/vllm-openai` to serve CosyVoice models.
+- **CosyVoice Integration**: Added a custom `Dockerfile` in `Audio/cosyvoice/` directory that extends `vllm/vllm-openai` to serve CosyVoice models.
   - Fixes: Resolved `grpcio` build failures by filtering it out from requirements (not needed for HTTP/FastAPI).
   - Environment: Sets `PYTHONPATH` to include the cloned `CosyVoice` repo and `Matcha-TTS` submodule.
 - **Model Fallbacks & Quantization**: Switched to **AWQ Quantized** models (`Qwen2.5-14B-Instruct-AWQ` and `Qwen2.5-VL-7B-Instruct-AWQ`) to resolve "No available memory for cache blocks" errors on GPUs with limited memory.
@@ -134,9 +134,9 @@ To save GPU memory, you can start only the services you need using the provided 
 1. **Clone/Navigate to this folder**.
 
 2. **Clone CosyVoice Repository**:
-   The CosyVoice service requires the official repository code. Run the following command inside the `cosyvoice` directory:
+   The CosyVoice service requires the official repository code. Run the following command inside the `Audio/cosyvoice` directory:
    ```bash
-   cd cosyvoice
+   cd Audio/cosyvoice
    git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git
    mkdir -p pretrained_models
    cd ..

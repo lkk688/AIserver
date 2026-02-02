@@ -14,7 +14,7 @@ model_list:
   - model_name: cosyvoice
     litellm_params:
       model: openai/cosyvoice
-      api_base: http://cosyvoice:50000/v1
+      api_base: http://audio-cosyvoice:50000/v1
       api_key: sk-dummy-key
 
   - model_name: gemma

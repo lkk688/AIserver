@@ -116,6 +116,31 @@ class IndexingService:
 
             content = extractor.extract(doc.uri)
             
+            sections_meta: List[Dict] = []
+            if isinstance(content.extra, dict):
+                raw_sections = content.extra.get("sections") or []
+                if isinstance(raw_sections, list):
+                    for s in raw_sections:
+                        if not isinstance(s, dict):
+                            continue
+                        title = s.get("title")
+                        start = s.get("start")
+                        level = s.get("level", 1)
+                        if not isinstance(title, str):
+                            continue
+                        if not isinstance(start, int):
+                            continue
+                        end = s.get("end")
+                        sections_meta.append(
+                            {
+                                "title": title,
+                                "level": int(level),
+                                "start": int(start),
+                                "end": int(end) if isinstance(end, int) else None,
+                            }
+                        )
+                sections_meta.sort(key=lambda x: x["start"])
+
             # Update doc metadata from extraction
             doc.title = content.title or doc.title
             doc_hash = compute_hash(content.text)
@@ -128,24 +153,124 @@ class IndexingService:
             doc.doc_hash = doc_hash
             self.metadata.upsert_document(doc)
 
-            # 2. Chunk
-            chunks_data = chunk_text(
-                content.text, 
-                self.config.ingestion.chunk_size_tokens, 
-                self.config.ingestion.chunk_overlap_tokens
-            )
-            
-            chunks_to_persist = []
-            for cd in chunks_data:
-                chunk = models.Chunk(
-                    doc_id=doc.id,
-                    chunk_index=cd.chunk_index,
-                    text=cd.text,
-                    start_offset=cd.start_offset,
-                    end_offset=cd.end_offset,
-                    chunk_hash=compute_hash(cd.text)
+            sections_to_persist: List[models.Section] = []
+            if sections_meta:
+                for s in sections_meta:
+                    section = models.Section(
+                        doc_id=doc.id,
+                        title=s["title"],
+                        level=s["level"],
+                    )
+                    sections_to_persist.append(section)
+
+                for idx, section in enumerate(sections_to_persist):
+                    parent_id = None
+                    for j in range(idx - 1, -1, -1):
+                        if sections_to_persist[j].level < section.level:
+                            parent_id = sections_to_persist[j].id
+                            break
+                    section.parent_section_id = parent_id
+
+                saved_sections: List[models.Section] = []
+                for section in sections_to_persist:
+                    saved_sections.append(self.metadata.upsert_section(section))
+
+                section_ids = [s.id for s in saved_sections]
+                spans = []
+                for idx, meta in enumerate(sections_meta):
+                    start = meta["start"]
+                    end = meta["end"] if meta["end"] is not None else len(content.text)
+                    if start < 0:
+                        start = 0
+                    if end > len(content.text):
+                        end = len(content.text)
+                    if end <= start:
+                        continue
+                    spans.append((start, end, section_ids[idx]))
+
+                spans.sort(key=lambda v: v[0])
+                chunk_idx = 0
+                chunks_to_persist: List[models.Chunk] = []
+                prev_end = 0
+
+                for start, end, section_id in spans:
+                    if prev_end < start:
+                        prefix_text = content.text[prev_end:start]
+                        prefix_chunks = chunk_text(
+                            prefix_text,
+                            self.config.ingestion.chunk_size_tokens,
+                            0,
+                        )
+                        for cd in prefix_chunks:
+                            chunk = models.Chunk(
+                                doc_id=doc.id,
+                                chunk_index=chunk_idx,
+                                text=cd.text,
+                                start_offset=prev_end + cd.start_offset,
+                                end_offset=prev_end + cd.end_offset,
+                                chunk_hash=compute_hash(cd.text),
+                                section_id=None,
+                            )
+                            chunks_to_persist.append(chunk)
+                            chunk_idx += 1
+
+                    section_text = content.text[start:end]
+                    section_chunks = chunk_text(
+                        section_text,
+                        self.config.ingestion.chunk_size_tokens,
+                        0,
+                    )
+                    for cd in section_chunks:
+                        chunk = models.Chunk(
+                            doc_id=doc.id,
+                            chunk_index=chunk_idx,
+                            text=cd.text,
+                            start_offset=start + cd.start_offset,
+                            end_offset=start + cd.end_offset,
+                            chunk_hash=compute_hash(cd.text),
+                            section_id=section_id,
+                        )
+                        chunks_to_persist.append(chunk)
+                        chunk_idx += 1
+                    prev_end = end
+
+                if prev_end < len(content.text):
+                    tail_text = content.text[prev_end:]
+                    tail_chunks = chunk_text(
+                        tail_text,
+                        self.config.ingestion.chunk_size_tokens,
+                        0,
+                    )
+                    for cd in tail_chunks:
+                        chunk = models.Chunk(
+                            doc_id=doc.id,
+                            chunk_index=chunk_idx,
+                            text=cd.text,
+                            start_offset=prev_end + cd.start_offset,
+                            end_offset=prev_end + cd.end_offset,
+                            chunk_hash=compute_hash(cd.text),
+                            section_id=None,
+                        )
+                        chunks_to_persist.append(chunk)
+                        chunk_idx += 1
+            else:
+                chunks_data = chunk_text(
+                    content.text,
+                    self.config.ingestion.chunk_size_tokens,
+                    self.config.ingestion.chunk_overlap_tokens,
                 )
-                chunks_to_persist.append(chunk)
+                chunks_to_persist = []
+                for cd in chunks_data:
+                    chunk = models.Chunk(
+                        doc_id=doc.id,
+                        chunk_index=cd.chunk_index,
+                        text=cd.text,
+                        start_offset=cd.start_offset,
+                        end_offset=cd.end_offset,
+                        chunk_hash=compute_hash(cd.text),
+                        section_id=None,
+                    )
+                    chunks_to_persist.append(chunk)
 
             # 3. Store Chunks (Metadata)
             # First, delete old chunks? Or overwrite?
@@ -172,13 +297,14 @@ class IndexingService:
                 saved = self.metadata.upsert_chunk(chunk)
                 saved_chunks.append(saved)
 
-            # 4. Update Lexical Index
             self.lexical.upsert_chunks(saved_chunks)
 
-            # 5. Compute Embeddings & Update Vector Store
-            texts = [c.text for c in saved_chunks]
-            embeddings = self.embedding.embed_texts(texts)
-            self.vector.upsert_embeddings(saved_chunks, embeddings)
+            try:
+                texts = [c.text for c in saved_chunks]
+                embeddings = self.embedding.embed_texts(texts)
+                self.vector.upsert_embeddings(saved_chunks, embeddings)
+            except Exception as e:
+                print(f"Embedding error for {doc.uri}: {e}")
 
             doc.status = "indexed"
             self.metadata.upsert_document(doc)

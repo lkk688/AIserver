@@ -25,9 +25,25 @@ def load_config(config_path: str = "backend/config.yaml") -> AppConfig:
 
     try:
         config = AppConfig(**raw_config)
-        return config
     except Exception as e:
         raise ValueError(f"Configuration validation failed: {e}")
+
+    # Bridge text processing config into environment variables used by the
+    # text cleaning utilities. Environment variables (if set) still take
+    # precedence over config.yaml via os.environ.get checks.
+    tp = config.text_processing
+    if tp.kenlm_model_path and not os.getenv("KENLM_MODEL_PATH"):
+        os.environ["KENLM_MODEL_PATH"] = str(tp.kenlm_model_path)
+    if not os.getenv("APP_TEXT_USE_KENLM"):
+        os.environ["APP_TEXT_USE_KENLM"] = "true" if tp.use_kenlm else "false"
+    if not os.getenv("APP_TEXT_USE_SEQ2SEQ"):
+        os.environ["APP_TEXT_USE_SEQ2SEQ"] = "true" if tp.use_seq2seq else "false"
+    if tp.seq2seq_model and not os.getenv("APP_TEXT_SEQ2SEQ_MODEL"):
+        os.environ["APP_TEXT_SEQ2SEQ_MODEL"] = tp.seq2seq_model
+    if tp.seq2seq_prefix is not None and not os.getenv("APP_TEXT_SEQ2SEQ_PREFIX"):
+        os.environ["APP_TEXT_SEQ2SEQ_PREFIX"] = tp.seq2seq_prefix
+
+    return config
 
 def _apply_env_overrides(config: Dict[str, Any], prefix: str = "APP"):
     """

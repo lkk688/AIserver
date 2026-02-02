@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple, Any
 from uuid import UUID
-from backend.app.domain.models import Source, Document, Chunk, Job, ExtractedContent
+from backend.app.domain.models import Source, Document, Chunk, Job, ExtractedContent, Section
 
 class MetadataStore(ABC):
     @abstractmethod
@@ -24,6 +24,15 @@ class MetadataStore(ABC):
     
     @abstractmethod
     def mark_document_deleted(self, doc_id: UUID) -> None: ...
+
+    @abstractmethod
+    def delete_document(self, doc_id: UUID) -> None: ...
+
+    @abstractmethod
+    def upsert_section(self, section: Section) -> Section: ...
+
+    @abstractmethod
+    def list_sections(self, doc_id: UUID) -> List[Section]: ...
 
     @abstractmethod
     def upsert_chunk(self, chunk: Chunk) -> Chunk: ...

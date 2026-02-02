@@ -1,7 +1,10 @@
-cosyvoice/CosyVoice/
-cosyvoice/pretrained_models/
 .env
 */__pycache__/
 *.pyc
 data
-test_vibevoice_direct.wav
+*.wav
+Audio/cosyvoice
+Audio/vibevoice
+
+.pytest_cache
+docs

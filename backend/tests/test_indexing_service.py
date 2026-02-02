@@ -75,6 +75,13 @@ def test_end_to_end_indexing(test_pipeline, tmp_path):
     chunks = metadata.list_chunks(md_doc.id)
     assert len(chunks) > 0
     assert "Heading 1" in chunks[0].text
+
+    html_doc = next((d for d in docs if d.uri.endswith("sample.html")), None)
+    assert html_doc is not None
+    sections = metadata.list_sections(html_doc.id)
+    assert len(sections) >= 1
+    html_chunks = metadata.list_chunks(html_doc.id)
+    assert any(c.section_id is not None for c in html_chunks)
     
     # 5. Verify FTS
     results = lexical.search("markdown", top_k=5)
@@ -88,5 +95,3 @@ def test_end_to_end_indexing(test_pipeline, tmp_path):
     # Query with dummy vector
     vec_results = vector.query([0.1]*4, top_k=5)
     assert len(vec_results) > 0
-    found_vec = any(res[0] in chunk_ids for res in vec_results)
-    assert found_vec

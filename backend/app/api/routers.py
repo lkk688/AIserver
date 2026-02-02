@@ -1,17 +1,46 @@
 from typing import List, Optional, Dict
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException
+from datetime import datetime
+from pathlib import Path
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 from backend.app.domain import models
-from backend.app.domain.ports import MetadataStore
+from backend.app.domain.ports import MetadataStore, LexicalIndex, VectorStore
 from backend.app.services.indexing import IndexingService
 from backend.app.services.search import SearchService, SearchResult
 from backend.app.services.jobs import JobRunner
-from backend.app.dependencies import get_metadata_store, get_indexing_service, get_search_service, get_job_runner
+from backend.app.config.schema import AppConfig
+from backend.app.dependencies import (
+    get_metadata_store,
+    get_indexing_service,
+    get_search_service,
+    get_job_runner,
+    get_config,
+    get_lexical_index,
+    get_vector_store,
+)
 
 router = APIRouter()
 
-# --- Schemas ---
+UPLOADS_SOURCE_NAME = "My Documents"
+UPLOADS_DIR_NAME = "uploads"
+
+
+def _guess_mime(filename: str) -> str:
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if ext == "pdf":
+        return "application/pdf"
+    if ext in ("md", "markdown"):
+        return "text/markdown"
+    if ext in ("html", "htm"):
+        return "text/html"
+    if ext == "txt":
+        return "text/plain"
+    return "application/octet-stream"
+
+
+# Schemas
 
 class CreateSourceReq(BaseModel):
     name: str
@@ -39,14 +68,16 @@ def list_sources(store: MetadataStore = Depends(get_metadata_store)):
 @router.post("/sources/{source_id}/scan", response_model=models.Job)
 def scan_source(
     source_id: UUID,
-    runner: JobRunner = Depends(get_job_runner)
+    runner: JobRunner = Depends(get_job_runner),
 ):
     try:
-        # Enqueue job instead of running synchronously
-        return runner.enqueue_job(
-            type=models.JobType.SCAN_SOURCE, 
-            payload={"source_id": str(source_id)}
+        job = runner.enqueue_job(
+            type=models.JobType.SCAN_SOURCE,
+            payload={"source_id": str(source_id)},
         )
+        job_response = models.Job(**job.model_dump())
+        runner._process_job(job)
+        return job_response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -63,10 +94,15 @@ def get_job(job_id: UUID, store: MetadataStore = Depends(get_metadata_store)):
 
 @router.get("/documents", response_model=List[models.Document])
 def list_documents(
-    source_id: UUID,
+    source_id: Optional[UUID] = None,
     store: MetadataStore = Depends(get_metadata_store)
 ):
-    return store.list_documents_by_source(source_id)
+    if source_id:
+        return store.list_documents_by_source(source_id)
+    docs: List[models.Document] = []
+    for source in store.list_sources():
+        docs.extend(store.list_documents_by_source(source.id))
+    return docs
 
 @router.get("/documents/{doc_id}", response_model=models.Document)
 def get_document(doc_id: UUID, store: MetadataStore = Depends(get_metadata_store)):
@@ -75,9 +111,131 @@ def get_document(doc_id: UUID, store: MetadataStore = Depends(get_metadata_store
         raise HTTPException(status_code=404, detail="Document not found")
     return doc
 
+@router.delete("/documents/{doc_id}", status_code=204)
+def delete_document(
+    doc_id: UUID,
+    store: MetadataStore = Depends(get_metadata_store),
+    lexical: LexicalIndex = Depends(get_lexical_index),
+    vector: VectorStore = Depends(get_vector_store),
+    config: AppConfig = Depends(get_config),
+):
+    doc = store.get_document(doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    uri = doc.uri or ""
+    if uri.startswith("file://"):
+        uploads_root = (config.storage.data_dir / UPLOADS_DIR_NAME).resolve()
+        file_path = Path(uri.replace("file://", "", 1)).resolve()
+        try:
+            file_path.relative_to(uploads_root)
+        except ValueError:
+            pass
+        else:
+            if file_path.exists():
+                try:
+                    file_path.unlink()
+                except Exception:
+                    pass
+    lexical.delete_doc(doc_id)
+    vector.delete_doc(doc_id)
+    store.delete_document(doc_id)
+
+@router.get("/documents/{doc_id}/sections", response_model=List[models.Section])
+def list_doc_sections(doc_id: UUID, store: MetadataStore = Depends(get_metadata_store)):
+    return store.list_sections(doc_id)
+
 @router.get("/documents/{doc_id}/chunks", response_model=List[models.Chunk])
 def list_doc_chunks(doc_id: UUID, store: MetadataStore = Depends(get_metadata_store)):
     return store.list_chunks(doc_id)
+
+
+@router.get("/documents/{doc_id}/file")
+def get_document_file(
+    doc_id: UUID,
+    download: bool = Query(False),
+    store: MetadataStore = Depends(get_metadata_store),
+):
+    doc = store.get_document(doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    uri = doc.uri
+    if uri.startswith("file://"):
+        path = uri.replace("file://", "", 1)
+        file_path = Path(path)
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail="File not found on server")
+        media_type = doc.mime_type or "application/octet-stream"
+        disposition = "attachment" if download else "inline"
+        headers = {
+            "Content-Disposition": f'{disposition}; filename="{(doc.title or file_path.name)}"'
+        }
+        return FileResponse(
+            file_path,
+            media_type=media_type,
+            headers=headers,
+        )
+
+    if uri.startswith("http://") or uri.startswith("https://"):
+        return RedirectResponse(uri)
+
+    raise HTTPException(status_code=400, detail="Unsupported document URI scheme")
+
+
+@router.post("/documents/upload", response_model=models.Document)
+async def upload_document(
+    file: UploadFile = File(...),
+    store: MetadataStore = Depends(get_metadata_store),
+    indexing: IndexingService = Depends(get_indexing_service),
+    job_runner: JobRunner = Depends(get_job_runner),
+    config: AppConfig = Depends(get_config),
+):
+    contents = await file.read()
+    size_bytes = len(contents)
+    max_bytes = config.ingestion.max_file_mb * 1024 * 1024
+    if size_bytes > max_bytes:
+        raise HTTPException(status_code=400, detail="File too large")
+
+    uploads_root = Path(config.storage.data_dir) / UPLOADS_DIR_NAME
+    uploads_root.mkdir(parents=True, exist_ok=True)
+
+    original_name = file.filename or "document"
+    base = Path(original_name).stem
+    suffix = Path(original_name).suffix
+    candidate = uploads_root / original_name
+    index = 1
+    while candidate.exists():
+        candidate = uploads_root / f"{base}_{index}{suffix}"
+        index += 1
+
+    with open(candidate, "wb") as f:
+        f.write(contents)
+
+    sources = store.list_sources()
+    upload_source = next((s for s in sources if s.name == UPLOADS_SOURCE_NAME), None)
+    if upload_source is None:
+        upload_source = models.Source(
+            name=UPLOADS_SOURCE_NAME,
+            path=str(uploads_root),
+            config={},
+        )
+        upload_source = store.upsert_source(upload_source)
+
+    doc = models.Document(
+        source_id=upload_source.id,
+        uri=f"file://{candidate}",
+        title=original_name,
+        mime_type=_guess_mime(original_name),
+        size_bytes=size_bytes,
+        mtime=datetime.utcnow(),
+        status="pending",
+    )
+    saved = store.upsert_document(doc)
+    job_runner.enqueue_job(
+        type=models.JobType.INDEX_DOC,
+        payload={"doc_id": str(saved.id)},
+    )
+    return saved
 
 @router.post("/search", response_model=List[SearchResult])
 def search(

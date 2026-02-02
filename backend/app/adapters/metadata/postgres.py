@@ -34,6 +34,15 @@ class PostgresMetadataStore(MetadataStore):
     def mark_document_deleted(self, doc_id: UUID) -> None:
         raise NotImplementedError("Postgres backend not implemented yet")
 
+    def delete_document(self, doc_id: UUID) -> None:
+        raise NotImplementedError("Postgres backend not implemented yet")
+
+    def upsert_section(self, section: models.Section) -> models.Section:
+        raise NotImplementedError("Postgres backend not implemented yet")
+
+    def list_sections(self, doc_id: UUID) -> List[models.Section]:
+        raise NotImplementedError("Postgres backend not implemented yet")
+
     def upsert_chunk(self, chunk: models.Chunk) -> models.Chunk:
         raise NotImplementedError("Postgres backend not implemented yet")
 

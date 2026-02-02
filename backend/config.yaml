@@ -24,3 +24,10 @@ embedding:
   provider: "sentence-transformers"
   model_name: "all-MiniLM-L6-v2"
   dim: 384
+
+text_processing:
+  use_kenlm: true
+  kenlm_model_path: ./data/wiki_en_dep.arpa.bin
+  use_seq2seq: false
+  seq2seq_model: google/byt5-small
+  seq2seq_prefix: null

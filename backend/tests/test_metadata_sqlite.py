@@ -39,14 +39,26 @@ def test_sqlite_metadata_lifecycle(sqlite_store):
     assert saved_doc.id == doc.id
     assert saved_doc.source_id == source.id
     
-    # 3. Insert Chunks
+    # 3. Insert Section and Chunks
+    section = models.Section(
+        doc_id=doc.id,
+        title="Section 1",
+        level=1,
+    )
+    saved_section = sqlite_store.upsert_section(section)
+    assert saved_section.id == section.id
+    sections = sqlite_store.list_sections(doc.id)
+    assert len(sections) == 1
+    assert sections[0].title == "Section 1"
+
     chunk1 = models.Chunk(
         doc_id=doc.id,
         chunk_index=0,
         text="Hello world",
         start_offset=0,
         end_offset=11,
-        chunk_hash="h1"
+        chunk_hash="h1",
+        section_id=saved_section.id,
     )
     saved_chunk = sqlite_store.upsert_chunk(chunk1)
     assert saved_chunk.id == chunk1.id

@@ -1,3 +1,7 @@
 openai>=1.0.0
 requests
 pillow
+pdfplumber
+wordfreq
+kenlm
+transformers

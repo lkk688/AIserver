@@ -52,6 +52,18 @@ class Chunk(DomainModel):
     start_offset: int
     end_offset: int
     chunk_hash: str
+    section_id: Optional[UUID] = None
+
+    class Config:
+        from_attributes = True
+
+class Section(DomainModel):
+    doc_id: UUID
+    title: str
+    level: int
+    page_start: Optional[int] = None
+    page_end: Optional[int] = None
+    parent_section_id: Optional[UUID] = None
 
     class Config:
         from_attributes = True

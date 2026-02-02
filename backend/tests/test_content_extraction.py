@@ -55,3 +55,21 @@ def test_html_extraction(fixtures_dir, mock_config):
     assert "sample html page" in result.text
     # Scripts should be removed
     assert "console.log" not in result.text
+
+
+def test_qwen3_pdf_qc():
+    extractor = PDFExtractor()
+    pdf_path = Path("data/uploads/qwen3techniquepaper (1)_1.pdf").resolve()
+    result = extractor.extract(str(pdf_path))
+
+    assert result.title == "Qwen3 Technical Report"
+
+    sections = result.extra.get("sections")
+    assert isinstance(sections, list) and sections
+    titles = [s.get("title") for s in sections]
+    assert "1 Introduction" in titles
+
+    text = result.text or ""
+    assert "behaviortosuitspecifictasksefficiently" not in text
+    assert "behavior to suit specific tasks efficiently" in text
+    assert "better align foundation models with human preferences" in text

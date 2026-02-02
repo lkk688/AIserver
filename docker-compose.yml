@@ -45,6 +45,16 @@ services:
               count: 1
               capabilities: [gpu]
 
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    profiles: ["litellm", "all", "audio", "cosyvoice"]
+    container_name: litellm
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml
+    command: [ "--config", "/app/config.yaml", "--port", "4000", "--num_workers", "8" ]
+
   vllm-qwen3-vl:
     image: vllm/vllm-openai:latest
     profiles: ["vl", "all"]
@@ -84,7 +94,7 @@ services:
               capabilities: [gpu]
 
   audio-cosyvoice:
-    build: ./cosyvoice
+    build: ./Audio/cosyvoice
     profiles: ["cosyvoice", "audio"]
     container_name: audio-cosyvoice
     environment:
@@ -92,11 +102,12 @@ services:
       - PYTHONPATH=/app/CosyVoice:/app/CosyVoice/third_party/Matcha-TTS
     volumes:
       - ~/.cache/modelscope:/root/.cache/modelscope
-      - ./cosyvoice/CosyVoice:/app/CosyVoice
-      - ./cosyvoice/pretrained_models:/app/pretrained_models
+      - ./Audio/cosyvoice/CosyVoice:/app/CosyVoice
+      - ./Audio/cosyvoice/pretrained_models:/app/pretrained_models
     ports:
       - "50000:50000"
     ipc: host
+    entrypoint: ["python3", "server.py", "--port", "50000", "--model_dir", "pretrained_models/CosyVoice-300M-SFT"]
     deploy:
       resources:
         reservations:

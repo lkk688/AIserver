@@ -1,7 +1,7 @@
 from typing import List, Optional
 from uuid import UUID, uuid4
 from datetime import datetime
-from sqlalchemy import create_engine, Column, String, Integer, Float, ForeignKey, DateTime, JSON, Index, select, delete
+from sqlalchemy import create_engine, Column, String, Integer, Float, ForeignKey, DateTime, JSON, Index, select, delete, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, Session, sessionmaker
 from backend.app.domain import models
 from backend.app.domain.ports import MetadataStore
@@ -62,6 +62,32 @@ class DocumentORM(Base):
             updated_at=self.updated_at
         )
 
+class SectionORM(Base):
+    __tablename__ = "sections"
+    
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    doc_id: Mapped[str] = mapped_column(String, ForeignKey("documents.id"), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    level: Mapped[int] = mapped_column(Integer, nullable=False)
+    page_start: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    page_end: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    parent_section_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("sections.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_domain(self) -> models.Section:
+        return models.Section(
+            id=UUID(self.id),
+            doc_id=UUID(self.doc_id),
+            title=self.title,
+            level=self.level,
+            page_start=self.page_start,
+            page_end=self.page_end,
+            parent_section_id=UUID(self.parent_section_id) if self.parent_section_id else None,
+            created_at=self.created_at,
+            updated_at=self.updated_at
+        )
+
 class ChunkORM(Base):
     __tablename__ = "chunks"
     
@@ -72,6 +98,7 @@ class ChunkORM(Base):
     start_offset: Mapped[int] = mapped_column(Integer, nullable=False)
     end_offset: Mapped[int] = mapped_column(Integer, nullable=False)
     chunk_hash: Mapped[str] = mapped_column(String, nullable=False)
+    section_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("sections.id"), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -84,6 +111,7 @@ class ChunkORM(Base):
             start_offset=self.start_offset,
             end_offset=self.end_offset,
             chunk_hash=self.chunk_hash,
+            section_id=UUID(self.section_id) if self.section_id else None,
             created_at=self.created_at,
             updated_at=self.updated_at
         )
@@ -123,9 +151,15 @@ class SQLiteMetadataStore(MetadataStore):
         db_url = f"sqlite:///{self.db_path}"
         self.engine = create_engine(db_url, echo=False)
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
-        
-        # Simple schema initialization (no alembic for now per deliverables)
         Base.metadata.create_all(bind=self.engine)
+        self._ensure_schema()
+
+    def _ensure_schema(self) -> None:
+        inspector = inspect(self.engine)
+        columns = [c["name"] for c in inspector.get_columns("chunks")]
+        if "section_id" not in columns:
+            with self.engine.begin() as conn:
+                conn.execute(text("ALTER TABLE chunks ADD COLUMN section_id TEXT"))
 
     def upsert_source(self, source: models.Source) -> models.Source:
         with self.SessionLocal() as session:
@@ -174,6 +208,31 @@ class SQLiteMetadataStore(MetadataStore):
             session.refresh(orm)
             return orm.to_domain()
 
+    def upsert_section(self, section: models.Section) -> models.Section:
+        with self.SessionLocal() as session:
+            orm = session.get(SectionORM, str(section.id))
+            if not orm:
+                orm = SectionORM(id=str(section.id))
+                session.add(orm)
+
+            orm.doc_id = str(section.doc_id)
+            orm.title = section.title
+            orm.level = section.level
+            orm.page_start = section.page_start
+            orm.page_end = section.page_end
+            orm.parent_section_id = str(section.parent_section_id) if section.parent_section_id else None
+            orm.updated_at = datetime.utcnow()
+
+            session.commit()
+            session.refresh(orm)
+            return orm.to_domain()
+
+    def list_sections(self, doc_id: UUID) -> List[models.Section]:
+        with self.SessionLocal() as session:
+            stmt = select(SectionORM).where(SectionORM.doc_id == str(doc_id)).order_by(SectionORM.created_at)
+            orms = session.execute(stmt).scalars().all()
+            return [orm.to_domain() for orm in orms]
+
     def get_document(self, doc_id: UUID) -> Optional[models.Document]:
         with self.SessionLocal() as session:
             orm = session.get(DocumentORM, str(doc_id))
@@ -195,6 +254,15 @@ class SQLiteMetadataStore(MetadataStore):
                 orm.updated_at = datetime.utcnow()
                 session.commit()
 
+    def delete_document(self, doc_id: UUID) -> None:
+        with self.SessionLocal() as session:
+            session.execute(delete(ChunkORM).where(ChunkORM.doc_id == str(doc_id)))
+            session.execute(delete(SectionORM).where(SectionORM.doc_id == str(doc_id)))
+            orm = session.get(DocumentORM, str(doc_id))
+            if orm:
+                session.delete(orm)
+            session.commit()
+
     def upsert_chunk(self, chunk: models.Chunk) -> models.Chunk:
         with self.SessionLocal() as session:
             orm = session.get(ChunkORM, str(chunk.id))
@@ -208,6 +276,7 @@ class SQLiteMetadataStore(MetadataStore):
             orm.start_offset = chunk.start_offset
             orm.end_offset = chunk.end_offset
             orm.chunk_hash = chunk.chunk_hash
+            orm.section_id = str(chunk.section_id) if chunk.section_id else None
             orm.updated_at = datetime.utcnow()
             
             session.commit()

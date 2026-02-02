@@ -77,6 +77,56 @@ def test_source_lifecycle(test_client):
     # before it finishes or we'd need to sleep.
     # The unit test test_jobs.py covers the runner logic.
 
+def test_delete_document_endpoint(test_client, mock_embedding_provider):
+    fixtures_dir = Path(__file__).parent / "fixtures"
+    response = test_client.post(
+        "/api/v1/sources",
+        json={"name": "delete_test_source", "path": str(fixtures_dir), "config": {}},
+    )
+    assert response.status_code == 200, response.text
+    source = response.json()
+    source_id = source["id"]
+
+    response = test_client.post(f"/api/v1/sources/{source_id}/scan")
+    assert response.status_code == 200, response.text
+
+    response = test_client.get(f"/api/v1/documents?source_id={source_id}")
+    assert response.status_code == 200
+    docs = response.json()
+    assert len(docs) > 0
+    doc_id = docs[0]["id"]
+
+    response = test_client.get(f"/api/v1/documents/{doc_id}/chunks")
+    assert response.status_code == 200
+
+    response = test_client.delete(f"/api/v1/documents/{doc_id}")
+    assert response.status_code == 204
+
+    response = test_client.get(f"/api/v1/documents/{doc_id}")
+    assert response.status_code == 404
+
+    response = test_client.get(f"/api/v1/documents/{doc_id}/chunks")
+    assert response.status_code == 200
+    assert response.json() == []
+
+def test_documents_sections_endpoint(test_client, mock_embedding_provider):
+    fixtures_dir = Path(__file__).parent / "fixtures"
+    response = test_client.post(
+        "/api/v1/sources",
+        json={"name": "sections_test_source", "path": str(fixtures_dir), "config": {}},
+    )
+    assert response.status_code == 200, response.text
+    source = response.json()
+    source_id = source["id"]
+
+    response = test_client.post(f"/api/v1/sources/{source_id}/scan")
+    assert response.status_code == 200, response.text
+    job = response.json()
+    assert job["status"] == "pending"
+
+    response = test_client.get("/api/v1/documents")
+    assert response.status_code == 200
+
 @pytest.fixture
 def mock_embedding_provider(monkeypatch):
     from backend.app.adapters.embedding.litellm import LiteLLMEmbeddingProvider

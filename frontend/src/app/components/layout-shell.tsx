@@ -11,7 +11,8 @@ import {
   Search,
   Bell,
   User,
-  Settings
+  Settings,
+  Waves
 } from "lucide-react";
 import clsx from "clsx";
 
@@ -23,7 +24,7 @@ function Sidebar() {
     { icon: Upload, label: "Upload Documents", href: "/sources" },
     { icon: FileText, label: "My Documents", href: "/documents" },
     { icon: History, label: "History", href: "/jobs" },
-    { icon: Sparkles, label: "AI Enhancements", href: "#" },
+    { icon: Waves, label: "Audio Lab", href: "/audio" },
     { icon: Search, label: "Smart Search", href: "/search" },
   ];
 
