@@ -38,8 +38,8 @@ async def run_client():
         "type": "llm",
         "job_id": job_id,
         "user_id": user_id,
-        "model": "gpt-3.5-turbo", 
-        "messages": [{"role": "user", "content": "Hello from test_client!"}]
+        "model": "qwen3", 
+        "messages": [{"role": "user", "content": "Hello from test_client! Tell me a short joke."}]
     }
 
     # 3. Subscribe to result channel FIRST

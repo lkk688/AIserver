@@ -3,10 +3,17 @@
 *.pyc
 data
 *.wav
+Audio/vibevoice/
 Audio/cosyvoice
 Audio/vibevoice
 Audio/vibevoice/
 .pytest_cache
 docs
 Audio/vibevoice
+
+.agent/
+output
+*/output/
+output
+output_*/
  

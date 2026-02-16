@@ -185,6 +185,15 @@ The **HFserve** container hosts Gemma 3, TranslateGemma, and MedGemma models usi
 curl http://localhost:4000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
+    "model": "qwen3",
+    "messages": [
+      {"role": "user", "content": "Hello!"}
+    ]
+  }'
+
+curl http://localhost:4000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
     "model": "gemma",
     "messages": [
       {"role": "user", "content": "Hello!"}

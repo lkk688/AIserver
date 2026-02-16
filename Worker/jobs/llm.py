@@ -17,11 +17,14 @@ async def process_llm_job(job_id: str, model: str, messages: list, user_id: str)
     
     try:
         # 1. Call LLM
-        # Using litellm to abstract away provider details
+        # Using litellm.completion to abstract away provider details
+        # Since we use `litellm` Proxy (which is OpenAI compatible), we specify custom_llm_provider="openai"
         response = completion(
-            model=model,
+            model=model or "qwen3",
             messages=messages,
-            api_key=settings.OPENAI_API_KEY
+            api_base=settings.LITELLM_API_BASE,
+            api_key=settings.LITELLM_API_KEY,
+            custom_llm_provider="openai"
         )
         
         content = response.choices[0].message.content

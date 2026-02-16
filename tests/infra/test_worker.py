@@ -15,7 +15,8 @@ if worker_path not in sys.path:
 # Mock/Patch environment variables BEFORE importing settings
 os.environ["REDIS_HOST"] = "localhost"
 os.environ["REDIS_PORT"] = "6379"
-# os.environ["OPENAI_API_KEY"] = "sk-..." # Should use existing env or mock
+# Point to local litellm port
+os.environ["LITELLM_API_BASE"] = "http://localhost:4000" 
 
 try:
     from settings import settings
@@ -23,10 +24,6 @@ try:
     from jobs.llm import process_llm_job
     from db import db
     from worker_comm import comm
-    
-    # Patch the comm module to use our local redis manager if needed?
-    # Actually, comm.py uses settings.redis_url, which we just pointed to localhost via env.
-    # So it should work out of the box!
     
     IMPORT_SUCCESS = True
 except ImportError as e:
@@ -43,12 +40,9 @@ async def run_worker():
         return
 
     logger.info("Starting Test Worker (Local Simulation)...")
+    logger.info(f"LITELLM_API_BASE: {settings.LITELLM_API_BASE}")
     
     # 1. Initialize Resources
-    # We might skip DB connect if we don't have local postgres running/configured
-    # But user said "redis server is already running". Postgres status unknown.
-    # The logs showed "Container postgres Running". So we can try connecting!
-    
     settings.POSTGRES_HOST = "localhost" # Override for local test
     settings.POSTGRES_PORT = 5432
     
@@ -81,30 +75,17 @@ async def run_worker():
                 
                 # Process using REAL logic
                 try:
-                    # Mock completion if no API key
-                    if not settings.OPENAI_API_KEY:
-                        logger.warning("No OPENAI_API_KEY found. Mocking litellm completion.")
-                        # We can monkeypatch litellm.completion or just catch error
-                        # and emit a fake result to satisfy the test client.
-                        import jobs.llm
-                        original_completion = jobs.llm.completion
-                        
-                        def mock_completion(**kwargs):
-                            class MockResponse:
-                                class Choice:
-                                    class Message:
-                                        content = "Mocked LLM Response for Local Test"
-                                    message = Message()
-                                choices = [Choice()]
-                            return MockResponse()
-                        
-                        jobs.llm.completion = mock_completion
-                    
                     await process_llm_job(job_id, model, messages, user_id)
                     logger.info(f"Job {job_id} processed successfully.")
                     
                 except Exception as e:
                     logger.error(f"Error processing job: {e}")
+                    # Emit failure event
+                    await comm.emit_event(f"user_{user_id}", "llm_response", {
+                        "job_id": job_id,
+                        "status": "failed",
+                        "error": str(e)
+                    })
                     
         except asyncio.CancelledError:
             break

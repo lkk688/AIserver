@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     
     # API Keys
     OPENAI_API_KEY: Optional[str] = None
+    LITELLM_API_KEY: str = "sk-dummy-key"
+    LITELLM_API_BASE: str = "http://litellm:4000"
     
     # Queues
     TASK_QUEUE: str = "arq:queue"
