@@ -1,0 +1,7 @@
+arq
+redis
+python-socketio[asyncio_client]
+asyncpg
+pydantic-settings
+openai
+litellm

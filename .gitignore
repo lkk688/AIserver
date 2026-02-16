@@ -5,6 +5,6 @@ data
 *.wav
 Audio/cosyvoice
 Audio/vibevoice
-
+Audio/vibevoice/
 .pytest_cache
 docs
