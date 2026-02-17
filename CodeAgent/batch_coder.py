@@ -94,7 +94,7 @@ def run_single_task(task: dict, protocol: dict, output_dir: Path) -> dict:
 
     # Build the command
     cmd = [
-        sys.executable, "-m", "CodeAgent.mini_claude_code",
+        sys.executable, "-m", "CodeAgent.mini_claude_codev2",
         "--goal", goal,
         "--notes", notes,
         "--allowlist", str(task_file),
@@ -286,3 +286,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+python3 CodeAgent/batch_coder.py --task-id linreg_lvl3_regularization_optim --status-file output/batch_status.json
+"""

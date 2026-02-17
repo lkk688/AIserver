@@ -12,6 +12,8 @@ Usage:
     python3 tests/verify_agent_sklearn.py            # run all tests
     python3 tests/verify_agent_sklearn.py --test 1    # run only test 1
     python3 tests/verify_agent_sklearn.py --test 2    # run only test 2
+
+    python3 CodeAgent/batch_coder.py --task-id linreg_lvl3_regularization_optim --status-file output/batch_status.json
 """
 
 import sys
