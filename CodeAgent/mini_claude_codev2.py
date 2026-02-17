@@ -272,50 +272,162 @@ def extract_all_diffs(text: str) -> Optional[str]:
     
     return None
 
+
 def extract_write_file_actions(text: str) -> List[Tuple[str, str]]:
     """
-    Extract WRITE_FILE actions with robust regex to handle LLM typos
-    (e.g. missing > in closing tag, spacing issues).
+    Extract WRITE_FILE actions with high-robustness regex.
+    Handles:
+    - Merged headers (e.g. 'code...WRITE_FILE: path')
+    - Malformed closers (CONTENT>>, CONTENT]>>)
+    - Truncated output (EOF)
+    - Prose injection (stops at '## Reasoning')
+    - Diff artifacts (ignores '-WRITE_FILE' or '-<<<CONTENT')
     """
     results = []
     
-    # Strategy 1: Strict Match (Preferred)
-    # WRITE_FILE: path\n<<<CONTENT\n...\nCONTENT>>>
-    wf_pattern = re.compile(
-        r'WRITE_FILE:\s*(.+?)\s*\n<<<CONTENT\n(.*?)CONTENT>{2,3}', # Allow >> or >>>
+    # Regex Breakdown:
+    # 1. (?:^|\n)(?!\-).*?WRITE_FILE:
+    #    - Matches start of line OR new line.
+    #    - (?!\-) Negative lookahead: Ensure line does NOT start with '-' (diff removal).
+    #    - .*? Consumes garbage prefix (e.g. 'model = ...').
+    
+    # 2. \s*(\S+)
+    #    - Capture filepath (stops at whitespace).
+    
+    # 3. .*?\n
+    #    - Consume rest of the header line.
+    
+    # 4. \s*<<<CONTENT\n
+    #    - Match start tag. 
+    #    - \s* matches spaces but NOT hyphens (diff safety).
+    
+    # 5. (.*?)
+    #    - Capture content non-greedily.
+    
+    # 6. Terminator Group:
+    #    - CONTENT>{2,3}        -> Normal closer (>>> or >>)
+    #    - (?=\n.*?WRITE_FILE:) -> Lookahead: Next file starts
+    #    - (?=\ndiff --git)     -> Lookahead: Diff starts
+    #    - (?=\n\#\#\s)         -> Lookahead: Markdown header (e.g. ## Reasoning)
+    #    - (?=\n```)            -> Lookahead: Code block fence
+    #    - $                    -> EOF (Truncation)
+    
+    pattern = re.compile(
+        r'(?:^|\n)(?!\-).*?WRITE_FILE:\s*(\S+).*?\n'  # Header (safe from diffs)
+        r'\s*<<<CONTENT\n'                            # Start Tag
+        r'(.*?)'                                      # Content Capture
+        r'(?:CONTENT>{2,3}|(?=\n.*?WRITE_FILE:)|(?=\ndiff --git)|(?=\n\#\#\s)|(?=\n```)|$)', # Robust Terminator
         re.DOTALL
     )
-    for m in wf_pattern.finditer(text):
-        filepath = m.group(1).strip()
-        content = m.group(2)
-        if filepath and content:
-            results.append((filepath, content))
     
-    if results:
-        return results
-        
-    # Strategy 2: Fallback for "forgot to close" or "weird spacing"
-    # Looks for <<<CONTENT and just takes everything until the next likely block or EOF
-    # This captures cases where the model stops generating or messes up the closer completely.
-    fallback_pattern = re.compile(
-        r'WRITE_FILE:\s*(.+?)\s*\n<<<CONTENT\n(.*?)(?:(?=\nWRITE_FILE:)|(?=\n#)|$)',
-        re.DOTALL
-    )
-    
-    for m in fallback_pattern.finditer(text):
+    for m in pattern.finditer(text):
         filepath = m.group(1).strip()
         content = m.group(2)
         
-        # Clean up the end of content if it captured the broken closer
-        content = re.sub(r'CONTENT>+$', '', content).strip()
+        # Post-processing checks
         
-        # Validate: Don't accept if it's too short (likely a hallucination)
-        if filepath and len(content) > 10:
-             # Sanity check: ensure it doesn't look like a diff
-            if "diff --git" not in content[:50]:
-                results.append((filepath, content + "\n"))
-    
+        # 1. Diff Artifact check (double safety)
+        # If the path looks like a diff path (a/foo.py, b/foo.py), ignore it
+        if filepath.startswith("a/") or filepath.startswith("b/") or filepath == "/dev/null":
+            continue
+            
+        # 2. Content validation
+        # If content is extremely short (< 5 chars), it's likely a parsing artifact or hallucination
+        if len(content.strip()) < 5:
+            continue
+            
+        results.append((filepath, content))
+        
     return results
+# def extract_write_file_actions(text: str) -> List[Tuple[str, str]]:
+#     """
+#     Extract WRITE_FILE actions with robust regex to handle LLM artifacts:
+#     1. Merged lines (e.g., 'code...WRITE_FILE: path')
+#     2. Missing closers (truncated output)
+#     3. Typos in closers (CONTENT>> instead of CONTENT>>>)
+#     4. Safe ignores (doesn't match diff removals like '-<<<CONTENT')
+#     """
+#     results = []
+    
+#     # Regex Breakdown:
+#     # 1. (?:^|\n).*?WRITE_FILE: -> Start match anywhere on a line (consumes garbage prefix)
+#     # 2. \s*(\S+)               -> Capture the filepath (stops at whitespace)
+#     # 3. .*?\n                  -> Consume the rest of the header line
+#     # 4. \s*<<<CONTENT\n        -> Match start tag. STRICTLY requires newline before and after.
+#     #                              (Note: \s* matches spaces/tabs but NOT '-' or '+'. 
+#     #                               This safely ignores diff contexts like '-<<<CONTENT')
+#     # 5. (.*?)                  -> Capture content (DOTALL)
+#     # 6. Terminator             -> Stops at CONTENT>>, new WRITE_FILE, diff header, or EOF.
+    
+#     pattern = re.compile(
+#         r'(?:^|\n).*?WRITE_FILE:\s*(\S+).*?\n'   # Header (fuzzy start)
+#         r'\s*<<<CONTENT\n'                       # Start Tag (strict structure)
+#         r'(.*?)'                                 # Content Capture
+#         r'(?:CONTENT>{2,3}|(?=\n.*?WRITE_FILE:)|(?=\ndiff --git)|$)', # Robust Terminator
+#         re.DOTALL
+#     )
+    
+#     for m in pattern.finditer(text):
+#         filepath = m.group(1).strip()
+#         content = m.group(2)
+        
+#         # Sanity Checks
+#         # 1. Skip if filepath looks like a diff artifact
+#         if filepath.startswith("a/") or filepath.startswith("b/") or filepath == "/dev/null":
+#             continue
+            
+#         # 2. Skip if content is extremely short (likely parsing noise)
+#         if len(content.strip()) < 1:
+#             continue
+            
+#         results.append((filepath, content))
+        
+#     return results
+
+# def extract_write_file_actions(text: str) -> List[Tuple[str, str]]:
+#     """
+#     Extract WRITE_FILE actions with robust regex to handle LLM typos
+#     (e.g. missing > in closing tag, spacing issues).
+#     """
+#     results = []
+    
+#     # Strategy 1: Strict Match (Preferred)
+#     # WRITE_FILE: path\n<<<CONTENT\n...\nCONTENT>>>
+#     wf_pattern = re.compile(
+#         r'WRITE_FILE:\s*(.+?)\s*\n<<<CONTENT\n(.*?)CONTENT>{2,3}', # Allow >> or >>>
+#         re.DOTALL
+#     )
+#     for m in wf_pattern.finditer(text):
+#         filepath = m.group(1).strip()
+#         content = m.group(2)
+#         if filepath and content:
+#             results.append((filepath, content))
+    
+#     if results:
+#         return results
+        
+#     # Strategy 2: Fallback for "forgot to close" or "weird spacing"
+#     # Looks for <<<CONTENT and just takes everything until the next likely block or EOF
+#     # This captures cases where the model stops generating or messes up the closer completely.
+#     fallback_pattern = re.compile(
+#         r'WRITE_FILE:\s*(.+?)\s*\n<<<CONTENT\n(.*?)(?:(?=\nWRITE_FILE:)|(?=\n#)|$)',
+#         re.DOTALL
+#     )
+    
+#     for m in fallback_pattern.finditer(text):
+#         filepath = m.group(1).strip()
+#         content = m.group(2)
+        
+#         # Clean up the end of content if it captured the broken closer
+#         content = re.sub(r'CONTENT>+$', '', content).strip()
+        
+#         # Validate: Don't accept if it's too short (likely a hallucination)
+#         if filepath and len(content) > 10:
+#              # Sanity check: ensure it doesn't look like a diff
+#             if "diff --git" not in content[:50]:
+#                 results.append((filepath, content + "\n"))
+    
+#     return results
 
 # def extract_write_file_actions(text: str) -> List[Tuple[str, str]]:
 #     """
@@ -559,17 +671,117 @@ def apply_patch_guarded(diff_text: str, turn_dir: Path, auto_approve: bool = Fal
     
     return success
 
+def apply_fuzzy_patch(file_path: Path, diff_content: str) -> bool:
+    """
+    Applies a Unified Diff with 'fuzzy' matching logic.
+    1. Ignores line numbers (@@ -12,4 +12,5 @@).
+    2. Matches context by stripping whitespace (ignoring indentation changes).
+    3. Handles 'New File' creation via diff.
+    """
+    # 1. Handle New File Creation
+    if "new file mode" in diff_content or "--- /dev/null" in diff_content:
+         new_content = []
+         for line in diff_content.splitlines():
+             if line.startswith('+') and not line.startswith('+++'):
+                 new_content.append(line[1:]) # Remove '+'
+         
+         # Sanity check: verify it's not just an empty file or metadata
+         if len(new_content) > 0:
+             file_path.parent.mkdir(parents=True, exist_ok=True)
+             file_path.write_text("\n".join(new_content), encoding="utf-8")
+             console.print(f"[green]Created new file from diff: {file_path}[/green]")
+             return True
+         return False
+
+    if not file_path.exists():
+        console.print(f"[red]Target file {file_path} not found for diff.[/red]")
+        return False
+
+    original_lines = file_path.read_text(encoding="utf-8").splitlines()
+    # Work on a copy
+    modified_lines = list(original_lines)
+    
+    # 2. Parse Hunks
+    # Regex to split by @@ ... @@ header
+    hunks = re.split(r'^@@\s.*?\s@@', diff_content, flags=re.MULTILINE)
+    # The first part is the header (diff --git ...), skip it
+    hunks = hunks[1:]
+    
+    if not hunks:
+        console.print("[yellow]No hunks found in diff.[/yellow]")
+        return False
+        
+    for hunk in hunks:
+        hunk_lines = [l for l in hunk.splitlines() if l]
+        if not hunk_lines:
+            continue
+            
+        # 3. Identify the "Search Block" (Context + Removed lines)
+        search_block = []
+        replace_block = []
+        
+        for line in hunk_lines:
+            if line.startswith(' '): # Context
+                search_block.append(line[1:])
+                replace_block.append(line[1:])
+            elif line.startswith('-'): # Remove
+                search_block.append(line[1:])
+            elif line.startswith('+'): # Add
+                replace_block.append(line[1:])
+            # Ignore '\ No newline at end of file'
+        
+        if not search_block:
+            continue
+
+        # 4. Find where this block exists in the file
+        # We try strict match first, then whitespace-insensitive match
+        match_index = -1
+        n_search = len(search_block)
+        
+        # Strategy A: Exact Match
+        for i in range(len(modified_lines) - n_search + 1):
+            if modified_lines[i : i+n_search] == search_block:
+                match_index = i
+                break
+        
+        # Strategy B: Fuzzy Match (strip whitespace)
+        if match_index == -1:
+            search_stripped = [l.strip() for l in search_block]
+            for i in range(len(modified_lines) - n_search + 1):
+                file_subset = modified_lines[i : i+n_search]
+                file_stripped = [l.strip() for l in file_subset]
+                if file_stripped == search_stripped:
+                    match_index = i
+                    # CAUTION: We matched loosely. We must be careful not to delete 
+                    # wrong indentation, but typically replacing the whole block is safer.
+                    break
+        
+        if match_index != -1:
+            # 5. Apply the patch
+            # Remove old lines
+            del modified_lines[match_index : match_index + n_search]
+            # Insert new lines
+            for i, line in enumerate(replace_block):
+                modified_lines.insert(match_index + i, line)
+            console.print(f"[green]Applied hunk at line {match_index+1}[/green]")
+        else:
+            console.print(f"[red]Failed to find matching context for hunk:[/red]")
+            console.print(Panel("\n".join(search_block[:5]) + "\n...", title="Expected Context (First 5 lines)"))
+            return False # Fail the whole patch if one hunk fails (atomic apply)
+            
+    # Save result
+    file_path.write_text("\n".join(modified_lines), encoding="utf-8")
+    return True
 
 def extract_files_from_diff(diff_text: str) -> List[Tuple[str, str]]:
     """
-    Extract file contents from diff '+' lines.
-    When git apply fails, we can still reconstruct new files from
-    the diff by collecting all '+' lines (ignoring the leading '+').
+    Extract file contents from diff '+' lines — ONLY FOR NEW FILES.
     
-    For NEW files (--- /dev/null): extracts the full file content.
-    For EDIT diffs: extracts the intended final content by combining
-    context lines and '+' lines. This may fail for partial diffs,
-    so we check for indentation consistency.
+    SAFETY: This function ONLY extracts from diffs where `--- /dev/null`
+    (i.e., entirely new files). For EDIT diffs (partial patches), scraping
+    '+' lines would produce a tiny fragment and OVERWRITE the existing
+    file, destroying it. This was the root cause of the 'task.py destroyed'
+    bug in session 2026-02-16_215657.
     
     Returns list of (filepath, content) tuples.
     """
@@ -586,14 +798,18 @@ def extract_files_from_diff(diff_text: str) -> List[Tuple[str, str]]:
             continue
         filepath = fname_match.group(1)
         
-        # Determine if this is a new file
+        # CRITICAL SAFETY: Only extract from NEW FILE diffs
         is_new_file = ('new file mode' in single_diff or 
                        '--- /dev/null' in single_diff)
         
-        # Collect all '+' lines (content lines), skipping the diff headers
+        if not is_new_file:
+            console.print(f"[yellow]Skipping diff extraction for '{filepath}' "
+                          f"(edit diff — would destroy existing file)[/yellow]")
+            continue
+        
+        # Collect all '+' lines (for new files, every line is a '+' line)
         lines = single_diff.split('\n')
         content_lines = []
-        has_minus_lines = False
         in_hunk = False
         
         for line in lines:
@@ -609,38 +825,20 @@ def extract_files_from_diff(diff_text: str) -> List[Tuple[str, str]]:
             if in_hunk:
                 if line.startswith('+'):
                     content_lines.append(line[1:])  # Remove leading '+'
-                elif line.startswith('-'):
-                    has_minus_lines = True
-                    pass  # Skip removed lines
                 elif line.startswith(' '):
-                    content_lines.append(line[1:])  # Context line, remove leading space
+                    content_lines.append(line[1:])  # Context line
                 elif line == '':
-                    content_lines.append('')  # Empty line
+                    content_lines.append('')
         
         if not content_lines:
             continue
-            
-        # For edit diffs (has minus lines, not new file), validate the content
-        # Edit diffs may produce fragments with wrong base indentation
-        if has_minus_lines and not is_new_file:
-            # Check if the first non-empty line has suspicious indentation
-            first_code = next((l for l in content_lines if l.strip()), '')
-            if first_code and first_code != first_code.lstrip():
-                # First line is indented — this is likely a fragment, not full file
-                # Only accept if the content looks like a complete Python file
-                full_text = '\n'.join(content_lines)
-                if not (full_text.lstrip().startswith(('import ', 'from ', '#', '"""', "'''", '#!/'))): 
-                    console.print(f"[yellow]Skipping edit-diff fragment for {filepath} "
-                                  f"(starts with indented code, likely incomplete)[/yellow]")
-                    continue
         
         # Join with newlines, ensure trailing newline
         content = '\n'.join(content_lines)
         if not content.endswith('\n'):
             content += '\n'
         results.append((filepath, content))
-        console.print(f"[cyan]Extracted {filepath} from diff ({len(content)} bytes)"
-                      f"{' [new file]' if is_new_file else ' [edit]'}[/cyan]")
+        console.print(f"[cyan]Extracted NEW file '{filepath}' from diff ({len(content)} bytes)[/cyan]")
     
     return results
 
@@ -716,7 +914,6 @@ def apply_write_files(
 # ---------------------------
 # LLM Interaction
 # ---------------------------
-
 def complete_with_continuation(
     client: OpenAI,
     model: str,
@@ -728,14 +925,16 @@ def complete_with_continuation(
     """
     Calls the LLM. If finish_reason is 'length', appends the partial response
     to messages and asks it to continue, stitching the results.
-    Improved: diff-aware continuation prompting.
     
-    Adaptively caps max_tokens based on input size to avoid context overflow.
+    Robustness Features:
+    - Strips conversational filler from continuations ("Here is the rest...").
+    - Prevents hallucinated headers/markdown injection inside code blocks.
+    - Adaptively caps max_tokens to prevent context overflow.
     """
     full_content = ""
     current_messages = list(messages)
     
-    max_loops = 5  # Increased from 3 for complex multi-file tasks
+    max_loops = 5  # Max continuation loops
     
     for i in range(max_loops):
         console.print(f"[dim]Generation loop {i+1}/{max_loops}...[/dim]")
@@ -751,10 +950,9 @@ def complete_with_continuation(
         
         if safe_tokens < max_output_tokens:
             console.print(f"[yellow]Adaptive max_tokens: {safe_tokens} "
-                          f"(input≈{input_est}, limit={model_max_context}, "
-                          f"requested={max_output_tokens})[/yellow]")
+                          f"(input≈{input_est}, limit={model_max_context})[/yellow]")
         
-        # Retry with backoff on API errors (including context overflow)
+        # Retry with backoff on API errors
         resp = None
         for attempt in range(3):
             try:
@@ -767,11 +965,9 @@ def complete_with_continuation(
                 break
             except Exception as e:
                 err_str = str(e)
-                if 'max_tokens' in err_str or 'context length' in err_str or 'maximum context' in err_str:
-                    # Context overflow — reduce tokens further
+                if 'max_tokens' in err_str or 'context length' in err_str:
                     safe_tokens = max(1024, safe_tokens // 2)
-                    console.print(f"[red]Context overflow (attempt {attempt+1}). "
-                                  f"Retrying with max_tokens={safe_tokens}...[/red]")
+                    console.print(f"[red]Context overflow. Retrying with max_tokens={safe_tokens}...[/red]")
                     time.sleep(1)
                     continue
                 console.print(f"[red]LLM Call failed: {e}[/red]")
@@ -787,46 +983,173 @@ def complete_with_continuation(
         choice = resp.choices[0]
         console.print(f"[dim]Finish Reason: {choice.finish_reason}[/dim]")
         content = choice.message.content or ""
+        
+        # --- Robust Stitching Logic ---
+        # If this is a continuation (loop > 0), filter out conversational prefixes.
+        if i > 0:
+            original_len = len(content)
+            
+            # Check if we were inside a code block in the previous chunk
+            # (Odd number of triple-backticks implies we are inside a block)
+            prev_chunk_fences = full_content.count("```")
+            is_inside_code = (prev_chunk_fences % 2 == 1)
+            
+            if is_inside_code:
+                # 1. Strip re-opened code fences (e.g. "```python")
+                # Models often restart the block when continued
+                content = re.sub(r'^\s*```\w*\n', '', content)
+                
+                # 2. Strip "Here is the rest..." prose if it precedes code
+                # If the content starts with prose lines that end in a colon or look like chat
+                # (Heuristic: remove lines until we hit what looks like code)
+                # Be careful not to remove actual code comments.
+                if not content.strip().startswith(('#', 'def ', 'class ', 'print', 'import ')):
+                     # Remove first line if it looks like conversation
+                     content = re.sub(r'^(Here is the rest.*?|Sure.*?|Continuing.*?)\n', '', content, flags=re.IGNORECASE)
+
+            # 3. Strip hallucinated headers immediately (e.g. "## Reasoning")
+            # If we are inside code, a markdown header is almost always a hallucination
+            if is_inside_code and content.lstrip().startswith("## "):
+                # Stop processing here? Or strip the header? 
+                # Usually implies model switched context. We treat it as end of code.
+                console.print("[red]Detected hallucinated header in code block. Truncating.[/red]")
+                content = content.split("## ")[0]
+
+            if len(content) < original_len:
+                console.print(f"[dim]Stitched continuation (stripped {original_len - len(content)} chars)[/dim]")
+
         full_content += content
         
         if choice.finish_reason == "length":
             console.print("[yellow]Output truncated (limit reached). Continuing...[/yellow]")
             
-            # Detect what kind of output we're in the middle of
-            # and craft appropriate continuation prompt
-            if content.rstrip().endswith('```'):
-                # Cleanly ended a code block — can continue normally
-                cont_prompt = (
-                    "Continue. If there are more files to create, "
-                    "continue with the next WRITE_FILE block or diff. "
-                    "Do not repeat already-generated content."
-                )
-            elif 'WRITE_FILE:' in content or '<<<CONTENT' in content:
-                cont_prompt = (
-                    "You were truncated mid-output. Continue EXACTLY where you left off. "
-                    "You were in the middle of a WRITE_FILE block. "
-                    "Continue the file content, then close with CONTENT>>> "
-                    "and continue with remaining files."
-                )
-            elif 'diff --git' in content:
-                cont_prompt = (
-                    "You were truncated mid-output. Continue EXACTLY where you left off. "
-                    "You were in the middle of a unified diff. "
-                    "Continue the diff hunks. Do NOT repeat diff headers already generated. "
-                    "Do NOT restart the response."
-                )
-            else:
-                cont_prompt = (
-                    "You were truncated. Continue exactly where you left off. "
-                    "Do not repeat previous content."
-                )
-            
+            # Append partial content to history
             current_messages.append({"role": "assistant", "content": content})
+            
+            # Strict Continuation Prompt
+            cont_prompt = (
+                "You were cut off. "
+                "IMMEDIATELY continue the code/text exactly where you left off. "
+                "DO NOT repeat the last line. "
+                "DO NOT output conversational text (e.g. 'Here is the rest'). "
+                "DO NOT output markdown headers or code fences. "
+                "Just output the missing characters."
+            )
             current_messages.append({"role": "user", "content": cont_prompt})
         else:
             break
             
     return full_content
+# def complete_with_continuation(
+#     client: OpenAI,
+#     model: str,
+#     messages: List[Dict[str, str]],
+#     temperature: float = 0.2,
+#     max_output_tokens: int = 4096,
+#     model_max_context: int = 16384,
+# ) -> str:
+#     """
+#     Calls the LLM. If finish_reason is 'length', appends the partial response
+#     to messages and asks it to continue, stitching the results.
+#     Improved: diff-aware continuation prompting.
+    
+#     Adaptively caps max_tokens based on input size to avoid context overflow.
+#     """
+#     full_content = ""
+#     current_messages = list(messages)
+    
+#     max_loops = 5  # Increased from 3 for complex multi-file tasks
+    
+#     for i in range(max_loops):
+#         console.print(f"[dim]Generation loop {i+1}/{max_loops}...[/dim]")
+        
+#         # Adaptive max_tokens: estimate input and cap output accordingly
+#         input_text = "\n".join(m.get("content", "") for m in current_messages)
+#         input_est = estimate_tokens(input_text)
+#         safe_tokens = compute_safe_max_tokens(
+#             input_tokens=input_est,
+#             model_max_context=model_max_context,
+#             desired_max_output=max_output_tokens
+#         )
+        
+#         if safe_tokens < max_output_tokens:
+#             console.print(f"[yellow]Adaptive max_tokens: {safe_tokens} "
+#                           f"(input≈{input_est}, limit={model_max_context}, "
+#                           f"requested={max_output_tokens})[/yellow]")
+        
+#         # Retry with backoff on API errors (including context overflow)
+#         resp = None
+#         for attempt in range(3):
+#             try:
+#                 resp = client.chat.completions.create(
+#                     model=model,
+#                     messages=current_messages,
+#                     temperature=temperature,
+#                     max_tokens=safe_tokens
+#                 )
+#                 break
+#             except Exception as e:
+#                 err_str = str(e)
+#                 if 'max_tokens' in err_str or 'context length' in err_str or 'maximum context' in err_str:
+#                     # Context overflow — reduce tokens further
+#                     safe_tokens = max(1024, safe_tokens // 2)
+#                     console.print(f"[red]Context overflow (attempt {attempt+1}). "
+#                                   f"Retrying with max_tokens={safe_tokens}...[/red]")
+#                     time.sleep(1)
+#                     continue
+#                 console.print(f"[red]LLM Call failed: {e}[/red]")
+#                 if attempt < 2:
+#                     time.sleep(2 ** attempt)
+#                     continue
+#                 break
+        
+#         if resp is None:
+#             console.print(f"[red]All LLM retry attempts failed.[/red]")
+#             break
+            
+#         choice = resp.choices[0]
+#         console.print(f"[dim]Finish Reason: {choice.finish_reason}[/dim]")
+#         content = choice.message.content or ""
+#         full_content += content
+        
+#         if choice.finish_reason == "length":
+#             console.print("[yellow]Output truncated (limit reached). Continuing...[/yellow]")
+            
+#             # Detect what kind of output we're in the middle of
+#             # and craft appropriate continuation prompt
+#             if content.rstrip().endswith('```'):
+#                 # Cleanly ended a code block — can continue normally
+#                 cont_prompt = (
+#                     "Continue. If there are more files to create, "
+#                     "continue with the next WRITE_FILE block or diff. "
+#                     "Do not repeat already-generated content."
+#                 )
+#             elif 'WRITE_FILE:' in content or '<<<CONTENT' in content:
+#                 cont_prompt = (
+#                     "You were truncated mid-output. Continue EXACTLY where you left off. "
+#                     "You were in the middle of a WRITE_FILE block. "
+#                     "Continue the file content, then close with CONTENT>>> "
+#                     "and continue with remaining files."
+#                 )
+#             elif 'diff --git' in content:
+#                 cont_prompt = (
+#                     "You were truncated mid-output. Continue EXACTLY where you left off. "
+#                     "You were in the middle of a unified diff. "
+#                     "Continue the diff hunks. Do NOT repeat diff headers already generated. "
+#                     "Do NOT restart the response."
+#                 )
+#             else:
+#                 cont_prompt = (
+#                     "You were truncated. Continue exactly where you left off. "
+#                     "Do not repeat previous content."
+#                 )
+            
+#             current_messages.append({"role": "assistant", "content": content})
+#             current_messages.append({"role": "user", "content": cont_prompt})
+#         else:
+#             break
+            
+#     return full_content
 
 
 # ---------------------------
@@ -1007,52 +1330,184 @@ Output JSON: {"steps": ["step1", ...]}
 # ---------------------------
 # Sub-task Execution
 # ---------------------------
+def resolve_path(raw_path: str, allowlist: List[str], root_dir: Path = Path(".")) -> Optional[Path]:
+    """
+    Robustly resolves an LLM-generated path to a valid local file path.
+    Prioritizes:
+    1. Exact match in allowlist.
+    2. Basename match in allowlist (e.g. '/abs/path/task.py' -> 'task.py').
+    3. Relative path from root_dir.
+    """
+    # Clean up formatting artifacts
+    clean = raw_path.strip().strip("'").strip('"')
+    
+    # 1. Safety Check: Absolute paths are suspicious. Strip root.
+    # Logic: If model says /Developer/src/main.py, we only care about src/main.py relative to us.
+    if clean.startswith("/"):
+        clean = clean.lstrip("/")
+    
+    # 2. Check Allowlist (Highest Priority)
+    # This fixes the exact case you saw: 'Developer/AIserver/task.py' vs 'task.py'
+    target_name = Path(clean).name
+    for allowed in allowlist:
+        allowed_p = Path(allowed)
+        # If basenames match (e.g. task.py == task.py), map it!
+        if allowed_p.name == target_name:
+            # Optional: Check if the full suffix matches to be safer
+            # e.g. 'server/task.py' matches 'task.py' -> maybe unsafe?
+            # For a mini-agent, basename matching is usually the desired behavior.
+            return allowed_p
+
+    # 3. Direct resolution relative to CWD
+    candidate = root_dir / clean
+    if candidate.exists() or candidate.parent.exists():
+        return candidate
+
+    return None
 
 def _try_apply_content(content: str, allowlist: List[str], turn_dir: Path, 
                        config: AgentConfig) -> bool:
     """
     Try all methods to apply model output as file changes.
-    Order: git apply diff → WRITE_FILE → diff extraction.
-    
-    Key insight: when model outputs BOTH diffs and WRITE_FILE,
-    WRITE_FILE is more reliable (full file, no patch issues).
-    So we try WRITE_FILE before diff extraction.
+    Order: 
+    1. git apply (Strict Diff)
+    2. apply_fuzzy_patch (Loose Diff - handles line/whitespace errors)
+    3. WRITE_FILE (Full rewrite)
+    4. Diff Extraction (Last resort reconstruction)
     """
-    # --- TRY FORMAT A: Unified Diff ---
+    
+    # --- Extract Diff once ---
     diff = extract_all_diffs(content)
     changes_applied = False
     
+    # --- TRY FORMAT A: Unified Diff Strategies ---
     if diff:
         (turn_dir / "patch.diff").write_text(diff, encoding="utf-8")
+        
+        # Strategy 1: Strict Git Apply
         if is_git_repo():
             changes_applied = apply_patch_guarded(diff, turn_dir, auto_approve=config.auto_approve)
         else:
-            console.print("[red]Not a git repo, skipping diff apply.[/red]")
-    
-    # --- TRY FORMAT B: WRITE_FILE (try BEFORE diff extraction — more reliable) ---
+            console.print("[red]Not a git repo, skipping strict diff apply.[/red]")
+        
+        # Strategy 2: Fuzzy Patch
+        if not changes_applied:
+            console.print("[yellow]Strict apply failed. Attempting fuzzy patch...[/yellow]")
+            file_diffs = re.split(r'(?=^diff --git )', diff, flags=re.MULTILINE)
+            fuzzy_successes = 0
+            fuzzy_total = 0
+            
+            for fd in file_diffs:
+                if not fd.strip().startswith("diff --git"): continue
+                fuzzy_total += 1
+                
+                # Extract raw path from header
+                match = re.search(r'diff --git a/\S+ b/(\S+)', fd)
+                if match:
+                    raw_path = match.group(1)
+                    
+                    # Resolve Path
+                    target_path = resolve_path(raw_path, allowlist)
+                    
+                    if target_path:
+                        if target_path != Path(raw_path):
+                            console.print(f"[dim]Redirecting '{raw_path}' -> '{target_path}'[/dim]")
+                        
+                        if apply_fuzzy_patch(target_path, fd):
+                            fuzzy_successes += 1
+                    else:
+                        console.print(f"[red]Skipping diff for unresolved path: {raw_path}[/red]")
+            
+            # Mark success if at least one file was patched
+            if fuzzy_successes > 0:
+                changes_applied = True
+                console.print(f"[green]Fuzzy patch applied ({fuzzy_successes}/{fuzzy_total} files).[/green]")
+
+    # --- TRY FORMAT B: WRITE_FILE (Try if diffs failed or didn't exist) ---
     if not changes_applied:
         write_actions = extract_write_file_actions(content)
         if write_actions:
-            console.print(f"[cyan]Found {len(write_actions)} WRITE_FILE action(s). Applying...[/cyan]")
-            changes_applied = apply_write_files(write_actions, allowlist, turn_dir)
-            if changes_applied:
-                console.print("[green]Applied via WRITE_FILE.[/green]")
+            valid_actions = []
+            for path, text in write_actions:
+                # Resolve Path
+                target_path = resolve_path(path, allowlist)
+                if target_path:
+                    valid_actions.append((str(target_path), text))
+                else:
+                    console.print(f"[red]Skipping WRITE_FILE for unresolved path: {path}[/red]")
+            
+            if valid_actions:
+                changes_applied = apply_write_files(valid_actions, allowlist, turn_dir)
     
-    # --- TRY FORMAT A.5: Extract files from diff (last resort) ---
+    # --- TRY FORMAT C: Extract NEW files from diff (Last resort) ---
+    # SAFETY: extract_files_from_diff ONLY extracts new files (--- /dev/null).
+    # For edit diffs, it safely skips to avoid overwriting existing files
+    # with tiny fragments (the session 2026-02-16_215657 bug).
     if not changes_applied and diff:
-        console.print("[yellow]Diff + WRITE_FILE failed. Extracting from diff lines...[/yellow]")
+        console.print("[yellow]All patch methods failed. Checking for extractable new files in diff...[/yellow]")
         diff_files = extract_files_from_diff(diff)
         if diff_files:
             changes_applied = apply_write_files(diff_files, allowlist, turn_dir)
             if changes_applied:
-                console.print("[green]Wrote files extracted from diff.[/green]")
+                console.print("[green]Wrote new files extracted from diff.[/green]")
+        else:
+            console.print("[red]No new files to extract. Edit diffs cannot be safely applied as rewrites.[/red]")
     
-    if not changes_applied and not diff:
-        write_actions = extract_write_file_actions(content)
-        if not write_actions:
-            console.print("[red]No valid diff or WRITE_FILE actions found.[/red]")
+    # --- Final Failure Check ---
+    if not changes_applied:
+        # Check if we missed a WRITE_FILE due to bad formatting (optional check)
+        if "WRITE_FILE:" in content and "CONTENT" in content:
+             console.print("[red]Potential malformed WRITE_FILE block detected but extraction failed.[/red]")
+        
+        if not diff and not extract_write_file_actions(content):
+            console.print("[red]No valid diff or WRITE_FILE actions found in response.[/red]")
     
     return changes_applied
+# def _try_apply_content(content: str, allowlist: List[str], turn_dir: Path, 
+#                        config: AgentConfig) -> bool:
+#     """
+#     Try all methods to apply model output as file changes.
+#     Order: git apply diff → WRITE_FILE → diff extraction.
+    
+#     Key insight: when model outputs BOTH diffs and WRITE_FILE,
+#     WRITE_FILE is more reliable (full file, no patch issues).
+#     So we try WRITE_FILE before diff extraction.
+#     """
+#     # --- TRY FORMAT A: Unified Diff ---
+#     diff = extract_all_diffs(content)
+#     changes_applied = False
+    
+#     if diff:
+#         (turn_dir / "patch.diff").write_text(diff, encoding="utf-8")
+#         if is_git_repo():
+#             changes_applied = apply_patch_guarded(diff, turn_dir, auto_approve=config.auto_approve)
+#         else:
+#             console.print("[red]Not a git repo, skipping diff apply.[/red]")
+    
+#     # --- TRY FORMAT B: WRITE_FILE (try BEFORE diff extraction — more reliable) ---
+#     if not changes_applied:
+#         write_actions = extract_write_file_actions(content)
+#         if write_actions:
+#             console.print(f"[cyan]Found {len(write_actions)} WRITE_FILE action(s). Applying...[/cyan]")
+#             changes_applied = apply_write_files(write_actions, allowlist, turn_dir)
+#             if changes_applied:
+#                 console.print("[green]Applied via WRITE_FILE.[/green]")
+    
+#     # --- TRY FORMAT A.5: Extract files from diff (last resort) ---
+#     if not changes_applied and diff:
+#         console.print("[yellow]Diff + WRITE_FILE failed. Extracting from diff lines...[/yellow]")
+#         diff_files = extract_files_from_diff(diff)
+#         if diff_files:
+#             changes_applied = apply_write_files(diff_files, allowlist, turn_dir)
+#             if changes_applied:
+#                 console.print("[green]Wrote files extracted from diff.[/green]")
+    
+#     if not changes_applied and not diff:
+#         write_actions = extract_write_file_actions(content)
+#         if not write_actions:
+#             console.print("[red]No valid diff or WRITE_FILE actions found.[/red]")
+    
+#     return changes_applied
 
 
 def _determine_verify_cmd(
@@ -1220,10 +1675,22 @@ class PromptRegistry:
                 "\n> **IMPORTANT**: Use **Format B (WRITE_FILE)** to create all files. "
                 "This avoids diff truncation issues and is more reliable for new files.\n"
             )
+        
+        # Get current relative context
+        cwd = Path.cwd().name
+        
+        # Explicit Workspace Instruction
+        workspace_block = (
+            f"## Workspace Context\n"
+            f"You are working in the directory: `./` (inside `{cwd}/`)\n"
+            f"Use ONLY relative paths (e.g. `task.py` or `src/utils.py`).\n"
+            f"DO NOT use absolute paths (e.g. `/home/user/...`).\n"
+        )
 
         base_md = (
             f"# Turn Prompt\n\n"
             f"## Goal\n{goal}\n\n"
+            f"{workspace_block}\n"  # <--- Added here
             f"## Target Files (Allowlist)\n{allow_txt}\n"
             f"{format_hint}\n"
             f"{skills if skills else ''}\n"
@@ -1336,23 +1803,25 @@ class PromptRegistry:
         )
 
     @staticmethod
-    def format_fix_rewrite(file_path: str, error_history: str) -> str:
+    def format_fix_rewrite(file_path: str, current_code: str, error_history: str) -> str:
         """
         Prompt for Strategy 2: Full Rewrite.
+        Ensures the model sees the broken code so it can recover logic.
         """
         return (
             f"# Rewrite Required (Fresh Start)\n\n"
-            f"Diff-based fixes have failed multiple times. "
-            f"We need a clean rewrite of `{file_path}`.\n\n"
+            f"Diff-based fixes have failed. We need a clean rewrite of `{file_path}`.\n\n"
+            f"## Context: Current File Content (Broken)\n"
+            f"```python\n{current_code}\n```\n\n"
             f"## Failure History\n```\n{error_history[-4000:]}\n```\n\n"
             f"## Instructions\n"
-            f"1. **Format**: Output the **COMPLETE** file using **Format B (WRITE_FILE)**.\n"
-            f"2. **Constraint**: Do NOT use diffs.\n"
-            f"3. **Requirement**: Ensure ALL errors listed above are resolved.\n"
-            f"4. **Completeness**: Do not use placeholders. Output every line.\n\n"
+            f"1. **Recover**: Use the logic from the 'Current File' above, but fix the errors.\n"
+            f"2. **Format**: Output the **COMPLETE** file using **Format B (WRITE_FILE)**.\n"
+            f"3. **Constraint**: Do NOT use diffs. Do NOT use placeholders.\n"
+            f"4. **Completeness**: You must output every single line of code.\n\n"
             f"WRITE_FILE: {file_path}\n"
             f"<<<CONTENT\n"
-            f"... your complete corrected file here ...\n"
+            f"... complete fixed code ...\n"
             f"CONTENT>>>\n"
         )
 # class PromptRegistry:
@@ -1718,7 +2187,9 @@ def run_subtask_loop(
             # STRATEGY 2: FULL REWRITE
             console.print("[yellow]Attempting Fix 2: Full Rewrite (Accumulated Errors)...[/yellow]")
             full_history = "\n".join(error_history)
-            fix_prompt = PromptRegistry.format_fix_rewrite(target_file, full_history)
+            # UPDATE: Pass current_code here
+            fix_prompt = PromptRegistry.format_fix_rewrite(target_file, current_code, full_history)
+            #fix_prompt = PromptRegistry.format_fix_rewrite(target_file, full_history)
 
         (turn_dir / "prompt.md").write_text(fix_prompt, encoding="utf-8")
 
@@ -2058,3 +2529,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+
+python CodeAgent//mini_claude_codev2.py --goal "Implement Univariate Linear Regression using ONLY PyTorch tensors. Do NOT use torch.nn, torch.optim, or autograd. Write everything in a single task.py file with a complete main() that trains, evaluates, and validates."
+
+python CodeAgent/mini_claude_codev2.py --goal "Implement ML Task: SVM (Score Calibration + ROC/PR). Description: Calibrate decision scores; produce ROC/PR curves and AUC. Write a SINGLE self-contained Python file (task.py) with these functions: get_task_metadata, set_seed, get_device, make_dataloaders, build_model, train, evaluate, predict, save_artifacts."
+"""
