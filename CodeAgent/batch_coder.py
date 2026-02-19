@@ -32,7 +32,7 @@ DEFAULT_STATUS_FILE = Path("output/batch_status.json")
 
 # Inherit from env or use defaults
 BASE_URL = os.environ.get("VLLM_BASE_URL", "https://w0wqtv67-8000.usw3.devtunnels.ms/v1")
-API_KEY = os.environ.get("VLLM_API_KEY", "myhpcvllmqwen")
+API_KEY = os.environ.get("VLLM_API_KEY", "myhpcvllmqwen123")
 MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-Coder-Next-FP8")
 
 
@@ -76,7 +76,7 @@ def build_goal_and_notes(task: dict, protocol: dict) -> tuple:
     return goal, notes
 
 
-def run_single_task(task: dict, protocol: dict, output_dir: Path) -> dict:
+def run_single_task(task: dict, protocol: dict, output_dir: Path, verbose: bool = False) -> dict:
     """
     Run the mini_claude_code agent for a single task.
     Returns a status dict with success/failure, timing, and details.
@@ -94,7 +94,7 @@ def run_single_task(task: dict, protocol: dict, output_dir: Path) -> dict:
 
     # Build the command
     cmd = [
-        sys.executable, "-m", "CodeAgent.mini_claude_codev2",
+        sys.executable, "-m", "CodeAgent.mini_claude_codev4",
         "--goal", goal,
         "--notes", notes,
         "--allowlist", str(task_file),
@@ -102,6 +102,7 @@ def run_single_task(task: dict, protocol: dict, output_dir: Path) -> dict:
         "--base-url", BASE_URL,
         "--api-key", API_KEY,
         "--model", MODEL,
+        "--artifacts-dir", str(task_dir),  # Save artifacts directly to task folder
     ]
 
     start_time = time.time()
@@ -117,6 +118,7 @@ def run_single_task(task: dict, protocol: dict, output_dir: Path) -> dict:
         "verification_passed": False,
         "error": None,
         "output_snippet": "",
+        "log_path": None,  # New field
     }
 
     try:
@@ -126,17 +128,46 @@ def run_single_task(task: dict, protocol: dict, output_dir: Path) -> dict:
         print(f"{'='*70}\n")
 
         # Run the agent as a subprocess
-        proc = subprocess.run(
+        env = os.environ.copy()
+        if verbose:
+            env["FORCE_COLOR"] = "1"
+
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, # Merge stderr into stdout
             text=True,
-            timeout=600,  # 10 minute timeout per task
             cwd=str(Path.cwd()),
+            env=env,
+            bufsize=1, # Line buffered
         )
 
+        captured_lines = []
+        try:
+            # Stream output
+            for line in proc.stdout:
+                captured_lines.append(line)
+                if verbose:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+            
+            proc.wait(timeout=800)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise
+
+        full_output = "".join(captured_lines)
         elapsed = time.time() - start_time
         result["duration_sec"] = round(elapsed, 1)
-        result["output_snippet"] = (proc.stdout or "")[-1000:]
+        result["output_snippet"] = full_output[-1000:]
+        
+        # Capture Log Path from stdout metadata
+        # Look for: [METADATA] LOG_PATH: /path/to/logs
+        import re
+        m_log = re.search(r'\[METADATA\] LOG_PATH:\s*(.+)', full_output)
+        if m_log:
+            result["log_path"] = m_log.group(1).strip()
+            print(f"  Logs: {result['log_path']}")
 
         # Check if task.py was created
         result["task_file_exists"] = task_file.exists()
@@ -154,15 +185,31 @@ def run_single_task(task: dict, protocol: dict, output_dir: Path) -> dict:
             if verify_result.returncode == 0:
                 result["status"] = "success"
                 result["output_snippet"] = (verify_result.stdout or "")[-500:]
+                
+                # Cleanup: Delete everything in task_dir except task.py
+                try:
+                    cleaned_count = 0
+                    for item in task_dir.iterdir():
+                        if item.name != "task.py":
+                            if item.is_dir():
+                                shutil.rmtree(item)
+                            else:
+                                item.unlink()
+                            cleaned_count += 1
+                    if verbose and cleaned_count > 0:
+                        print(f"  Cleanup: Removed {cleaned_count} artifacts, kept only task.py")
+                except Exception as e:
+                    print(f"  [WARNING] Cleanup Failed: {e}")
+
             else:
                 result["status"] = "verify_failed"
                 result["error"] = (verify_result.stderr or verify_result.stdout or "")[-500:]
         elif task_file.exists():
             result["status"] = "agent_failed_file_exists"
-            result["error"] = (proc.stderr or "")[-500:]
+            result["error"] = full_output[-500:]
         else:
             result["status"] = "agent_failed_no_file"
-            result["error"] = (proc.stderr or "")[-500:]
+            result["error"] = full_output[-500:]
 
     except subprocess.TimeoutExpired:
         result["status"] = "timeout"
@@ -208,10 +255,14 @@ def main():
                         help="Maximum number of tasks to run")
     parser.add_argument("--task-id", type=str, default=None,
                         help="Run only this specific task ID")
+    parser.add_argument("--redo-failed", action="store_true",
+                        help="Retry all tasks that failed in the previous run")
     parser.add_argument("--status-file", type=str, default=str(DEFAULT_STATUS_FILE),
                         help="Path to save status JSON")
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR),
                         help="Base output directory")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Show detailed output from code agent")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -240,17 +291,73 @@ def main():
     print(f"  Status: {status_file}")
     print(f"{'#'*70}")
 
-    # Load existing results if resuming
+    # Load existing results if resuming or redoing
     results = []
-    if status_file.exists() and not args.task_id:
+    if status_file.exists():
         try:
             existing = json.loads(status_file.read_text())
             results = existing.get("tasks", [])
-            existing_ids = {r["task_id"] for r in results}
-            tasks = [t for t in tasks if t["id"] not in existing_ids]
-            print(f"  Resuming: {len(results)} completed, {len(tasks)} remaining")
         except Exception:
             pass
+
+    # Filter tasks based on args
+    # Pre-check for missing files:
+    # If a task is marked success but task.py is missing, mark it failed so redo picks it up
+    for r in results:
+        t_id = r["task_id"]
+        t_dir = output_dir / "tasks" / t_id
+        t_file = t_dir / "task.py"
+        if not t_file.exists() and r["status"] == "success":
+            print(f"  [WARNING] Task {t_id} marked success but task.py missing. Marking for redo.")
+            r["status"] = "missing_file"
+        elif not t_file.exists() and r["status"] not in ("success", "missing_file"):
+             # Ensure failures with empty dirs are also caught if needed
+             pass
+
+    if args.task_id:
+        tasks = [t for t in tasks if t["id"] == args.task_id]
+        if not tasks:
+            print(f"Error: task '{args.task_id}' not found in {TASKS_JSON}")
+            sys.exit(1)
+    elif args.redo_failed:
+        # Find failed task IDs from existing results
+        failed_ids = {r["task_id"] for r in results if r["status"] != "success"}
+        
+        # Also check for ORPHANED tasks (folder exists but missing from results, likely crashed)
+        existing_ids = {r["task_id"] for r in results}
+        for t in tasks:
+            t_id = t["id"]
+            if t_id not in existing_ids:
+                t_dir = output_dir / "tasks" / t_id
+                # If folder exists, assume we tried to run passing, or crashed.
+                # If empty (no task.py), treat as failed.
+                t_file = t_dir / "task.py"
+                if t_dir.exists() and not t_file.exists():
+                     print(f"  [WARNING] Task {t_id} folder exists but no result/task.py. Marking as orphaned failure.")
+                     failed_ids.add(t_id)
+
+        if not failed_ids:
+            print("No failed tasks found in status file (or orphans). Nothing to redo.")
+            sys.exit(0)
+        
+        # Filter tasks to only those that failed
+        tasks = [t for t in tasks if t["id"] in failed_ids]
+        print(f"  Redo Mode: Retrying {len(tasks)} failed tasks...")
+        
+        # Remove failed tasks from 'results' so we don't duplicate entries
+        # ONLY remove those present in results. Orphans are already missing.
+        results = [r for r in results if r["task_id"] not in failed_ids]
+    else:
+        # Normal run (resume mode)
+        # Skip tasks that are already in results (success OR failure)
+        # unless user explicitly asked to redo them? Default behavior is resume.
+        if not args.start_from and status_file.exists():
+            existing_ids = {r["task_id"] for r in results}
+            tasks = [t for t in tasks if t["id"] not in existing_ids]
+
+        tasks = tasks[args.start_from:]
+        if args.max_tasks:
+            tasks = tasks[:args.max_tasks]
 
     # Run each task
     for i, task in enumerate(tasks):
@@ -260,7 +367,7 @@ def main():
 
         print(f"\n[{i+1}/{len(tasks)}] Starting {task_id}...")
 
-        result = run_single_task(task, protocol, output_dir)
+        result = run_single_task(task, protocol, output_dir, verbose=args.verbose)
         results.append(result)
 
         # Save after each task (in case of crash)
@@ -289,4 +396,7 @@ if __name__ == "__main__":
 
 """
 python3 CodeAgent/batch_coder.py --task-id linreg_lvl3_regularization_optim --status-file output/batch_status.json
+
+python3 CodeAgent/batch_coder.py --task-id linreg_lvl4_sklearn_production --status-file output/batch_status.json
+
 """

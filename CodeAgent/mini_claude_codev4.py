@@ -14,6 +14,8 @@ A minimal, non-interactive "Claude Code"-like coding agent with:
 Requirements:
   pip install openai rich tiktoken
 
+python CodeAgent/qwen_coder_evalv4_1.py   --model_source remote_vllm   --remote_vllm_url "https://w0wqtv67-8000.usw3.devtunnels.ms/v1"   --models "Qwen/Qwen3-Coder-Next-FP8"   --run_all --out_dir ./eval_results_remote
+
 Env (overridden by CLI args):
   VLLM_BASE_URL (default https://w0wqtv67-8000.usw3.devtunnels.ms/v1)
   VLLM_API_KEY  (default myhpcvllmqwen)
@@ -26,7 +28,7 @@ import json
 import time
 import hashlib
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -52,6 +54,7 @@ SKILL_DIR = AGENT_DIR / "skilldb"
 SKILL_SUCCESS = SKILL_DIR / "successes.jsonl"
 SKILL_FAIL = SKILL_DIR / "failures.jsonl"
 RUNS_LOG = AGENT_DIR / "runs.jsonl"
+SKILL_TEACHER = SKILL_DIR / "teacher.jsonl"
 
 # DEFAULT_SYSTEM is now centralized in PromptRegistry.SYSTEM (see below)
 
@@ -97,6 +100,51 @@ def truncate_to_tokens(text: str, max_tokens: int) -> str:
         return text
     target_chars = int(max_tokens * 3.5)
     return text[:target_chars] + "\n...[TRUNCATED]..."
+
+def _handle_missing_modules(error_output: str) -> Optional[str]:
+    """
+    Detects ModuleNotFoundError and installs the missing package.
+    Returns the installation log if an installation occurred, else None.
+    """
+    # Regex for "ModuleNotFoundError: No module named 'xyz'"
+    # Also handle "ImportError: No module named xyz" (older python)
+    match = re.search(r"ModuleNotFoundError: No module named '(.+?)'", error_output)
+    if not match:
+        match = re.search(r"ImportError: No module named '(.+?)'", error_output)
+    
+    if not match:
+        return None
+        
+    module_name = match.group(1)
+    
+    # Map common imports to package names
+    # This is a heuristic mapping.
+    package_map = {
+        "sklearn": "scikit-learn",
+        "PIL": "Pillow",
+        "cv2": "opencv-python",
+        "yaml": "PyYAML",
+        "bs4": "beautifulsoup4",
+        "dotenv": "python-dotenv",
+        "dateutil": "python-dateutil"
+    }
+    
+    package_name = package_map.get(module_name, module_name)
+    
+    console.print(f"[yellow]Detected missing module: '{module_name}'. Attempting auto-install of '{package_name}'...[/yellow]")
+    
+    # Use --no-input to prevent hanging on prompts
+    cmd = f"pip install --no-input {package_name}"
+    code, out = run_shell(cmd)
+    
+    log = f"\n[Auto-Install: {cmd}]\nExit Code: {code}\nOutput:\n{out}\n"
+    
+    if code == 0:
+        console.print(f"[green]Successfully installed '{package_name}'.[/green]")
+    else:
+        console.print(f"[red]Failed to install '{package_name}'.[/red]")
+        
+    return log
 
 
 def query_model_context_length(client: OpenAI, model_name: str) -> int:
@@ -171,7 +219,7 @@ def git_diff() -> str:
     code, out = run_shell("git diff")
     return out if code == 0 else ""
 
-def read_file(path: str, max_chars: int = 16000) -> str:
+def read_file(path: str, max_chars: int = 64000) -> str:
     p = Path(path)
     if not p.exists():
         return f"[MISSING FILE] {path}"
@@ -205,23 +253,92 @@ def sanitize_diff_text(diff_text: str) -> str:
     """
     Clean up a diff block extracted from LLM output.
     Removes common LLM artifacts that corrupt patches:
-    - Stray ``` fence markers embedded in diff body
-    - HTML tags (<details>, etc.)
-    - Trailing prose after last hunk
+    - Stray ``` fence markers (but NOT inside diff hunk content)
+    - ALL 'index' lines (never converts them to --- headers)
+    - Missing ---/+++ headers (injects them from diff --git header)
+    - Enforces strict --- before +++ order
     """
     lines = diff_text.split("\n")
     cleaned = []
+    
+    # State tracking for header repair
+    current_file_a = None
+    current_file_b = None
+    seen_header_a = False
+    seen_header_b = False
+    in_hunk = False  # Track if we're inside a @@ hunk
+    
     for line in lines:
-        # Skip stray fence markers
-        if re.match(r'^```', line.strip()):
+        stripped = line.strip()
+        
+        # 1. Skip stray fence markers — BUT ONLY if they are NOT diff content.
+        #    Lines like '-    #```python' are valid diff removals and must be kept.
+        #    A fence is "stray" only if it's a bare fence line (not prefixed by +/-/space).
+        if re.match(r'^```', stripped):
+            # Check: is this a diff content line? (starts with +, -, or space)
+            if not (line.startswith('+') or line.startswith('-') or line.startswith(' ')):
+                continue  # Bare fence — skip it
+            # Otherwise it's diff content like '-    #```python' — keep it
+            
+        # 2. Skip HTML tags (only bare ones, not diff content)
+        if re.match(r'^</?(?:details|summary|br|hr)', stripped, re.IGNORECASE):
+            if not (line.startswith('+') or line.startswith('-') or line.startswith(' ')):
+                continue
+        
+        # 3. Handle 'diff --git' header to reset state
+        if line.startswith('diff --git'):
+            m = re.match(r'^diff --git a/(\S+) b/(\S+)', line)
+            if m:
+                current_file_a = m.group(1)
+                current_file_b = m.group(2)
+            else:
+                current_file_a = None
+                current_file_b = None
+            seen_header_a = False
+            seen_header_b = False
+            in_hunk = False
+            cleaned.append(line)
             continue
-        # Skip HTML tags
-        if re.match(r'^</?(?:details|summary|br|hr)', line.strip(), re.IGNORECASE):
+            
+        # 4. Handle ALL 'index' lines — always skip.
+        #    This includes 'index abc123..def456' and malformed 'index --- a/foo'.
+        #    Never convert to --- headers (causes duplicate headers).
+        if line.startswith('index '):
             continue
+            
+        # 5. Handle --- (Original file)
+        if line.startswith('--- '):
+            seen_header_a = True
+            in_hunk = False
+            cleaned.append(line)
+            continue
+            
+        # 6. Handle +++ (New file)
+        if line.startswith('+++ '):
+            # CRITICAL: If we see +++ but missed ---, inject --- NOW to preserve order
+            if not seen_header_a and current_file_a:
+                cleaned.append(f"--- a/{current_file_a}")
+                seen_header_a = True
+                
+            seen_header_b = True
+            in_hunk = False
+            cleaned.append(line)
+            continue
+            
+        # 7. Handle Hunk Header @@
+        # If we hit @@ and missed headers, inject them (respecting order)
+        if line.startswith('@@ ') and current_file_a and current_file_b:
+            if not seen_header_a:
+                cleaned.append(f"--- a/{current_file_a}")
+                seen_header_a = True
+            if not seen_header_b:
+                cleaned.append(f"+++ b/{current_file_b}")
+                seen_header_b = True
+            in_hunk = True
+                
         cleaned.append(line)
     
     result = "\n".join(cleaned)
-    # Ensure trailing newline
     if not result.endswith("\n"):
         result += "\n"
     return result
@@ -238,14 +355,28 @@ def extract_all_diffs(text: str) -> Optional[str]:
       - Multiple diffs inside a single fenced ```diff block
       - Multiple separate fenced blocks each containing a diff
       - Raw diffs starting with 'diff --git' (unfenced)
+      - Mixed format: 'diff --git' header OUTSIDE a fenced block with hunks inside
     Returns the last (most likely correct) diff text or None.
     """
     t = text.strip()
     
+    # --- Pre-processing: Merge split diffs ---
+    # LLMs sometimes put 'diff --git ...' on a line BEFORE ```diff,
+    # with the actual hunks inside the fenced block. Merge them.
+    # Pattern: diff --git a/X b/X\n```diff\n@@ ...\n```
+    t = re.sub(
+        r'^(diff --git [^\n]+)\n\s*```(?:diff|python|python3)?\s*\n',
+        r'\1\n',
+        t,
+        flags=re.MULTILINE
+    )
+    
     # Strategy 1: Look for fenced ```diff blocks and extract content
     fenced_diffs = []
     # Match all ```diff ... ``` blocks (or just ``` blocks containing diffs)
-    fence_pattern = re.compile(r'```(?:diff)?\s*\n(.*?)```', re.DOTALL)
+    # CRITICAL: Use line-anchored closing fence (^```\s*$) to avoid matching
+    # backticks inside diff content lines like '-    #```python'
+    fence_pattern = re.compile(r'```(?:diff)?\s*\n(.*?)^```\s*$', re.DOTALL | re.MULTILINE)
     for m in fence_pattern.finditer(t):
         block = m.group(1).strip()
         if 'diff --git' in block:
@@ -264,7 +395,34 @@ def extract_all_diffs(text: str) -> Optional[str]:
     for part in parts:
         part = part.strip()
         if part.startswith('diff --git'):
-            raw_diffs.append(part)
+            # Clean trailing prose — stop at blank line followed by non-diff text
+            # Keep everything that looks like diff content (lines starting with
+            # diff, ---, +++, @@, +, -, space, or 'new file mode', backslash)
+            diff_lines = []
+            for line in part.split('\n'):
+                # Lines that are valid diff content
+                if (line.startswith('diff --git') or
+                    line.startswith('---') or
+                    line.startswith('+++') or
+                    line.startswith('@@') or
+                    line.startswith('+') or
+                    line.startswith('-') or
+                    line.startswith(' ') or
+                    line.startswith('\\') or
+                    line.startswith('index ') or
+                    line.startswith('new file') or
+                    line.startswith('old mode') or
+                    line.startswith('new mode') or
+                    line.startswith('deleted file') or
+                    line.startswith('similarity') or
+                    line.startswith('rename') or
+                    line == ''):
+                    diff_lines.append(line)
+                else:
+                    # Non-diff line (prose, markdown, etc.) — stop
+                    break
+            if diff_lines:
+                raw_diffs.append('\n'.join(diff_lines))
     
     if raw_diffs:
         # For raw diffs, use the last complete diff block
@@ -324,6 +482,10 @@ def extract_write_file_actions(text: str) -> List[Tuple[str, str]]:
         filepath = m.group(1).strip()
         content = m.group(2)
         
+        # Post-processing: Strip "CONTENT>>>" manually if regex captured it due to whitespace
+        if "CONTENT>>>" in content:
+            content = content.replace("CONTENT>>>", "")
+        
         # Post-processing checks
         
         # 1. Diff Artifact check (double safety)
@@ -332,174 +494,14 @@ def extract_write_file_actions(text: str) -> List[Tuple[str, str]]:
             continue
             
         # 2. Content validation
-        # If content is extremely short (< 5 chars), it's likely a parsing artifact or hallucination
-        if len(content.strip()) < 5:
+        # If content is extremely short (< 15 chars), it's likely a parsing artifact or hallucination
+        if len(content.strip()) < 15:
             continue
             
         results.append((filepath, content))
         
     return results
-# def extract_write_file_actions(text: str) -> List[Tuple[str, str]]:
-#     """
-#     Extract WRITE_FILE actions with robust regex to handle LLM artifacts:
-#     1. Merged lines (e.g., 'code...WRITE_FILE: path')
-#     2. Missing closers (truncated output)
-#     3. Typos in closers (CONTENT>> instead of CONTENT>>>)
-#     4. Safe ignores (doesn't match diff removals like '-<<<CONTENT')
-#     """
-#     results = []
-    
-#     # Regex Breakdown:
-#     # 1. (?:^|\n).*?WRITE_FILE: -> Start match anywhere on a line (consumes garbage prefix)
-#     # 2. \s*(\S+)               -> Capture the filepath (stops at whitespace)
-#     # 3. .*?\n                  -> Consume the rest of the header line
-#     # 4. \s*<<<CONTENT\n        -> Match start tag. STRICTLY requires newline before and after.
-#     #                              (Note: \s* matches spaces/tabs but NOT '-' or '+'. 
-#     #                               This safely ignores diff contexts like '-<<<CONTENT')
-#     # 5. (.*?)                  -> Capture content (DOTALL)
-#     # 6. Terminator             -> Stops at CONTENT>>, new WRITE_FILE, diff header, or EOF.
-    
-#     pattern = re.compile(
-#         r'(?:^|\n).*?WRITE_FILE:\s*(\S+).*?\n'   # Header (fuzzy start)
-#         r'\s*<<<CONTENT\n'                       # Start Tag (strict structure)
-#         r'(.*?)'                                 # Content Capture
-#         r'(?:CONTENT>{2,3}|(?=\n.*?WRITE_FILE:)|(?=\ndiff --git)|$)', # Robust Terminator
-#         re.DOTALL
-#     )
-    
-#     for m in pattern.finditer(text):
-#         filepath = m.group(1).strip()
-#         content = m.group(2)
-        
-#         # Sanity Checks
-#         # 1. Skip if filepath looks like a diff artifact
-#         if filepath.startswith("a/") or filepath.startswith("b/") or filepath == "/dev/null":
-#             continue
-            
-#         # 2. Skip if content is extremely short (likely parsing noise)
-#         if len(content.strip()) < 1:
-#             continue
-            
-#         results.append((filepath, content))
-        
-#     return results
 
-# def extract_write_file_actions(text: str) -> List[Tuple[str, str]]:
-#     """
-#     Extract WRITE_FILE actions with robust regex to handle LLM typos
-#     (e.g. missing > in closing tag, spacing issues).
-#     """
-#     results = []
-    
-#     # Strategy 1: Strict Match (Preferred)
-#     # WRITE_FILE: path\n<<<CONTENT\n...\nCONTENT>>>
-#     wf_pattern = re.compile(
-#         r'WRITE_FILE:\s*(.+?)\s*\n<<<CONTENT\n(.*?)CONTENT>{2,3}', # Allow >> or >>>
-#         re.DOTALL
-#     )
-#     for m in wf_pattern.finditer(text):
-#         filepath = m.group(1).strip()
-#         content = m.group(2)
-#         if filepath and content:
-#             results.append((filepath, content))
-    
-#     if results:
-#         return results
-        
-#     # Strategy 2: Fallback for "forgot to close" or "weird spacing"
-#     # Looks for <<<CONTENT and just takes everything until the next likely block or EOF
-#     # This captures cases where the model stops generating or messes up the closer completely.
-#     fallback_pattern = re.compile(
-#         r'WRITE_FILE:\s*(.+?)\s*\n<<<CONTENT\n(.*?)(?:(?=\nWRITE_FILE:)|(?=\n#)|$)',
-#         re.DOTALL
-#     )
-    
-#     for m in fallback_pattern.finditer(text):
-#         filepath = m.group(1).strip()
-#         content = m.group(2)
-        
-#         # Clean up the end of content if it captured the broken closer
-#         content = re.sub(r'CONTENT>+$', '', content).strip()
-        
-#         # Validate: Don't accept if it's too short (likely a hallucination)
-#         if filepath and len(content) > 10:
-#              # Sanity check: ensure it doesn't look like a diff
-#             if "diff --git" not in content[:50]:
-#                 results.append((filepath, content + "\n"))
-    
-#     return results
-
-# def extract_write_file_actions(text: str) -> List[Tuple[str, str]]:
-#     """
-#     Extract WRITE_FILE actions from model output.
-#     Supports multiple formats the model might use:
-    
-#     Format 1 (preferred): WRITE_FILE: path
-#                           <<<CONTENT
-#                           ... content ...
-#                           CONTENT>>>
-    
-#     Format 2 (tool_call XML): <tool_call><function=write_file>
-#                               <parameter=file_path>path</parameter>
-#                               <parameter=content>...</parameter>
-#                               </function></tool_call>
-    
-#     Format 3 (implicit): ## File: path/to/file.py
-#                          ```python
-#                          ... content ...
-#                          ```
-    
-#     Returns list of (filepath, content) tuples.
-#     """
-#     results = []
-    
-#     # Format 1: WRITE_FILE: path\n<<<CONTENT\n...\nCONTENT>>>
-#     wf_pattern = re.compile(
-#         r'WRITE_FILE:\s*(.+?)\s*\n<<<CONTENT\n(.*?)CONTENT>>>',
-#         re.DOTALL
-#     )
-#     for m in wf_pattern.finditer(text):
-#         filepath = m.group(1).strip()
-#         content = m.group(2)
-#         if filepath and content:
-#             results.append((filepath, content))
-    
-#     if results:
-#         return results
-    
-#     # Format 2: <tool_call> XML style
-#     tc_pattern = re.compile(
-#         r'<(?:tool_call|function)[^>]*>.*?'
-#         r'<parameter[= ]+(?:file_path|path)[^>]*>\s*(.+?)\s*</parameter>'
-#         r'.*?<parameter[= ]+content[^>]*>\s*(.*?)\s*</parameter>',
-#         re.DOTALL
-#     )
-#     for m in tc_pattern.finditer(text):
-#         filepath = m.group(1).strip()
-#         content = m.group(2)
-#         if filepath and content:
-#             results.append((filepath, content))
-    
-#     if results:
-#         return results
-    
-#     # Format 3: Implicit file path + code block
-#     # Look for patterns like:
-#     #   # File: path/to/file.py  (or ## File: or ### or just path followed by ```)
-#     implicit_pattern = re.compile(
-#         r'(?:^#+\s*(?:File:\s*)?|^(?:Create|Writing|Output)\s+(?:file\s+)?)'
-#         r'[`]*([^\n`]+?\.\w{1,5})[`]*\s*\n'
-#         r'```\w*\n(.*?)```',
-#         re.MULTILINE | re.DOTALL
-#     )
-#     for m in implicit_pattern.finditer(text):
-#         filepath = m.group(1).strip().strip('`').strip()
-#         content = m.group(2)
-#         # Validate it looks like a real path
-#         if filepath and '/' in filepath and content and len(content) > 10:
-#             results.append((filepath, content))
-    
-#     return results
 
 
 # ---------------------------
@@ -508,34 +510,52 @@ def extract_write_file_actions(text: str) -> List[Tuple[str, str]]:
 
 @dataclass
 class Skill:
-    tag: str
-    kind: str  # "success" or "failure"
-    text: str  # short guidance
-    pattern: str  # keyword/pattern
-    evidence: str  # session/turn summary
-    created_at: str
+    category: str      # e.g., "PyTorch", "Syntax", "Logic", "API"
+    pattern: str       # Trigger keywords (e.g., "conv2d", "plot")
+    insight: str       # The lesson (e.g. "Do not use .cuda() on inputs...")
+    evidence: str      # Short snippet or original output
+    count: int = 1     # Dedup counter
+    created_at: str = ""
 
 def load_skills(skill_dir: Path) -> List[Skill]:
     skills: List[Skill] = []
-    for kind, filename in [("success", "successes.jsonl"), ("failure", "failures.jsonl")]:
-        path = skill_dir / filename
-        if not path.exists():
-            continue
+    # Load separate success/failure logs or a unified DB
+    # For v2, we can just load all jsonl files in skilldb
+    if not skill_dir.exists():
+        return []
+        
+    for path in skill_dir.glob("*.jsonl"):
         try:
             for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
                 line = line.strip()
-                if not line:
-                    continue
+                if not line: continue
                 try:
                     obj = json.loads(line)
-                    skills.append(Skill(
-                        tag=obj.get("tag", ""),
-                        kind=kind,
-                        text=obj.get("text", ""),
-                        pattern=obj.get("pattern", ""),
-                        evidence=obj.get("evidence", ""),
-                        created_at=obj.get("created_at", ""),
-                    ))
+                    # Migration: Handle legacy format
+                    if "insight" not in obj:
+                        # Legacy skill
+                        tag = obj.get("tag", "general")
+                        kind = obj.get("kind", "unknown")
+                        text = obj.get("text", "")
+                        evidence = obj.get("evidence", "")
+                        # Construct a basic migration
+                        skills.append(Skill(
+                            category="Legacy",
+                            pattern=obj.get("pattern", "general"),
+                            insight=f"Legacy {kind}: {text[:100]}...",
+                            evidence=evidence[:200],  # Truncate legacy evidence
+                            created_at=obj.get("created_at", "")
+                        ))
+                    else:
+                        # New format
+                        skills.append(Skill(
+                            category=obj.get("category", "Uncategorized"),
+                            pattern=obj.get("pattern", ""),
+                            insight=obj.get("insight", ""),
+                            evidence=obj.get("evidence", ""),
+                            count=obj.get("count", 1),
+                            created_at=obj.get("created_at", "")
+                        ))
                 except Exception:
                     continue
         except Exception:
@@ -544,41 +564,58 @@ def load_skills(skill_dir: Path) -> List[Skill]:
 
 def score_skill(skill: Skill, query: str) -> int:
     """
-    Simple lexical scoring:
-    - +2 if pattern token appears in query
-    - +1 for each word from skill.text appearing in query (cap)
+    Scoring Strategy v2:
+    - High match on Pattern
+    - Medium match on Insight words
     """
     q = query.lower()
     s = 0
+    
+    # 1. Pattern Match (Strong signal)
     patt = (skill.pattern or "").lower().strip()
     if patt and patt in q:
-        s += 2
-    words = re.findall(r"[a-zA-Z0-9_]{3,}", (skill.text or "").lower())
+        s += 5
+        
+    # 2. Insight Match (Contextual signal)
+    # Tokenize insight
+    words = re.findall(r"[a-zA-Z0-9_]{3,}", (skill.insight or "").lower())
     hits = 0
     for w in set(words):
         if w in q:
             hits += 1
-    s += min(hits, 3)
+    s += min(hits, 5)  # Cap at 5 points
+    
     return s
 
 def select_relevant_skills(goal_and_notes: str, skill_dir: Path, topk: int = SKILL_INJECT_TOPK) -> List[Skill]:
     skills = load_skills(skill_dir)
     scored = [(score_skill(sk, goal_and_notes), sk) for sk in skills]
+    # Sort by score desc
     scored.sort(key=lambda x: x[0], reverse=True)
-    picked = [sk for sc, sk in scored if sc > 0][:topk]
+    # Filter only relevant ones (score > 2)
+    picked = [sk for sc, sk in scored if sc >= 2][:topk]
     return picked
 
 def format_skill_injection(skills: List[Skill]) -> str:
     if not skills:
         return ""
-    lines = ["## History-based guardrails (SkillDB)"]
+    
+    # Group by category
+    by_cat = {}
     for sk in skills:
-        prefix = "✅" if sk.kind == "success" else "⛔"
-        text = sk.text.strip().replace("\n", " ")
-        evidence = sk.evidence.strip().replace("\n", " ")
-        lines.append(f"- {prefix} [{sk.tag}] {text} (evidence: {evidence})")
-    if len(lines) > SKILL_INJECT_MAX_LINES:
-        lines = lines[:SKILL_INJECT_MAX_LINES] + ["- (truncated)"]
+        by_cat.setdefault(sk.category, []).append(sk)
+    
+    lines = ["## Teacher Guidelines (From Experience)"]
+    for cat, sk_list in by_cat.items():
+        if cat == "Legacy": continue # Skip legacy unless very relevant?
+        lines.append(f"### {cat}")
+        for sk in sk_list:
+            # Format: "- [Pattern] Insight"
+            lines.append(f"- [{sk.pattern}] {sk.insight}")
+            
+    if len(lines) == 1: # Only header
+        return ""
+        
     return "\n".join(lines).strip() + "\n"
 
 
@@ -671,13 +708,19 @@ def apply_patch_guarded(diff_text: str, turn_dir: Path, auto_approve: bool = Fal
     
     return success
 
-def apply_fuzzy_patch(file_path: Path, diff_content: str) -> bool:
+def apply_fuzzy_patch(file_path: Path, diff_content: str, log_buffer: list = None) -> bool:
     """
     Applies a Unified Diff with 'fuzzy' matching logic.
     1. Ignores line numbers (@@ -12,4 +12,5 @@).
     2. Matches context by stripping whitespace (ignoring indentation changes).
-    3. Handles 'New File' creation via diff.
+    3. Falls back to anchor-based matching (first+last lines of search block).
+    4. Handles 'New File' creation via diff.
+    5. Preserves trailing newline state from original file.
     """
+    def log(msg: str):
+        if log_buffer is not None:
+            log_buffer.append(msg)
+
     # 1. Handle New File Creation
     if "new file mode" in diff_content or "--- /dev/null" in diff_content:
          new_content = []
@@ -688,31 +731,47 @@ def apply_fuzzy_patch(file_path: Path, diff_content: str) -> bool:
          # Sanity check: verify it's not just an empty file or metadata
          if len(new_content) > 0:
              file_path.parent.mkdir(parents=True, exist_ok=True)
-             file_path.write_text("\n".join(new_content), encoding="utf-8")
-             console.print(f"[green]Created new file from diff: {file_path}[/green]")
+             file_path.write_text("\n".join(new_content) + "\n", encoding="utf-8")
+             msg = f"[green]Created new file from diff: {file_path}[/green]"
+             console.print(msg)
+             log(msg)
              return True
+         log(f"New file creation failed: content empty for {file_path}")
          return False
 
     if not file_path.exists():
-        console.print(f"[red]Target file {file_path} not found for diff.[/red]")
+        msg = f"[red]Target file {file_path} not found for diff.[/red]"
+        console.print(msg)
+        log(msg)
         return False
 
-    original_lines = file_path.read_text(encoding="utf-8").splitlines()
+
+    original_text = file_path.read_text(encoding="utf-8")
+    had_trailing_newline = original_text.endswith("\n")
+    original_lines = original_text.splitlines()
     # Work on a copy
     modified_lines = list(original_lines)
     
     # 2. Parse Hunks
-    # Regex to split by @@ ... @@ header
-    hunks = re.split(r'^@@\s.*?\s@@', diff_content, flags=re.MULTILINE)
+    # Regex to split by @@ ... @@ header, consuming the rest of the line (e.g. function context)
+    hunks = re.split(r'^@@\s.*?\s@@.*$', diff_content, flags=re.MULTILINE)
     # The first part is the header (diff --git ...), skip it
     hunks = hunks[1:]
     
     if not hunks:
-        console.print("[yellow]No hunks found in diff.[/yellow]")
+        msg = "[yellow]No hunks found in diff.[/yellow]"
+        console.print(msg)
+        log(msg)
         return False
-        
+    
+    applied_hunks = 0
     for hunk in hunks:
-        hunk_lines = [l for l in hunk.splitlines() if l]
+        # IMPORTANT: Don't filter out empty lines — they are valid context!
+        # An empty line in a hunk (no leading +/-/space) is a context line.
+        hunk_lines = hunk.splitlines()
+        # Skip the very first element if it's empty (artifact from split)
+        if hunk_lines and hunk_lines[0] == '':
+            hunk_lines = hunk_lines[1:]
         if not hunk_lines:
             continue
             
@@ -721,20 +780,57 @@ def apply_fuzzy_patch(file_path: Path, diff_content: str) -> bool:
         replace_block = []
         
         for line in hunk_lines:
-            if line.startswith(' '): # Context
+            if line.startswith(' '): # Context — remove leading space
                 search_block.append(line[1:])
                 replace_block.append(line[1:])
             elif line.startswith('-'): # Remove
                 search_block.append(line[1:])
             elif line.startswith('+'): # Add
                 replace_block.append(line[1:])
-            # Ignore '\ No newline at end of file'
+            elif line.startswith('\\'): # '\ No newline at end of file'
+                pass
+            elif line == '': # Empty context line (common in diffs)
+                search_block.append('')
+                replace_block.append('')
+            # Any other line (shouldn't happen) — treat as context
+            else:
+                search_block.append(line)
+                replace_block.append(line)
         
         if not search_block:
+            # Pure addition hunk — no context. Insert at beginning if first hunk.
+            if replace_block:
+                for i, rl in enumerate(replace_block):
+                    modified_lines.insert(i, rl)
+                msg = f"[green]Applied pure-addition hunk ({len(replace_block)} lines)[/green]"
+                console.print(msg)
+                log(msg)
+                applied_hunks += 1
             continue
 
+        # Strategy 0: Already Applied?
+        # If the *result* (replace_block) is already in the file, we can skip this hunk.
+        # This handles cases where the file was partially updated or the model is repetitive.
+        if replace_block:
+            replace_stripped = [l.strip() for l in replace_block]
+            n_replace = len(replace_block)
+            found_already = -1
+            
+            # Fuzzy match (strip whitespace) for replace block
+            for i in range(len(modified_lines) - n_replace + 1):
+                file_subset = modified_lines[i : i+n_replace]
+                if [l.strip() for l in file_subset] == replace_stripped:
+                    found_already = i
+                    break
+            
+            if found_already != -1:
+                msg = f"[green]Hunk already applied (found replacement at line {found_already+1})[/green]"
+                console.print(msg)
+                log(msg)
+                applied_hunks += 1
+                continue
+
         # 4. Find where this block exists in the file
-        # We try strict match first, then whitespace-insensitive match
         match_index = -1
         n_search = len(search_block)
         
@@ -742,6 +838,7 @@ def apply_fuzzy_patch(file_path: Path, diff_content: str) -> bool:
         for i in range(len(modified_lines) - n_search + 1):
             if modified_lines[i : i+n_search] == search_block:
                 match_index = i
+                log(f"Strategy A (Exact) match at line {i+1}")
                 break
         
         # Strategy B: Fuzzy Match (strip whitespace)
@@ -752,27 +849,137 @@ def apply_fuzzy_patch(file_path: Path, diff_content: str) -> bool:
                 file_stripped = [l.strip() for l in file_subset]
                 if file_stripped == search_stripped:
                     match_index = i
-                    # CAUTION: We matched loosely. We must be careful not to delete 
-                    # wrong indentation, but typically replacing the whole block is safer.
+                    msg = f"[green]Fuzzy-matched hunk at line {match_index+1} (whitespace-insensitive)[/green]"
+                    console.print(msg)
+                    log(msg)
                     break
         
+        # Strategy C: Anchor Match (first + last non-empty lines)
+        # When context has drifted or the file has extra/missing lines,
+        # match using boundary lines as anchors. Search for the last
+        # anchor independently within a window after the first anchor.
+        n_delete = n_search  # Default: delete same number of lines as search block
+        if match_index == -1 and n_search >= 2:
+            # Find first and last non-empty search lines
+            anchors = [(idx, l) for idx, l in enumerate(search_block) if l.strip()]
+            if len(anchors) >= 2:
+                first_idx, first_line = anchors[0]
+                last_idx, last_line = anchors[-1]
+                expected_span = last_idx - first_idx
+                first_stripped = first_line.strip()
+                last_stripped = last_line.strip()
+                
+                # Search for the first anchor
+                for i in range(len(modified_lines)):
+                    if modified_lines[i].strip() != first_stripped:
+                        continue
+                    
+                    # Search for the last anchor within 2x expected span
+                    max_end = min(len(modified_lines), i + expected_span * 2 + 2)
+                    found_last = -1
+                    # Allow search to start immediately after first anchor (handle missing/hallucinated context lines)
+                    for j in range(i + 1, max_end):
+                        if j < len(modified_lines) and modified_lines[j].strip() == last_stripped:
+                            found_last = j
+                            break
+                    
+                    if found_last != -1:
+                        # Found both anchors!
+                        match_index = i - first_idx
+                        # Calculate how many lines to actually delete from the file
+                        # This bridges the gap between where the first anchor matched and where the last matched.
+                        # The 'last' anchor in the file is at index 'found_last'.
+                        # The 'last' anchor in the search block is at index 'last_idx'.
+                        # The match starts at `i - first_idx`.
+                        # So the theoretical end of the match block is `i - first_idx + n_search`.
+                        # But in the file, the end is at `found_last + (len(search_block) - last_idx - 1)`.
+                        # Actually simpler: we are deleting from `match_index` to `found_last + <lines after last anchor>`.
+                        
+                        lines_after_last_anchor = len(search_block) - last_idx - 1
+                        actual_end = found_last + lines_after_last_anchor + 1
+                        n_delete = actual_end - match_index
+                        
+                        msg = f"[cyan]Anchor-matched hunk at line {match_index+1} (anchors at {match_index+1}..{actual_end}, deleting {n_delete} lines)[/cyan]"
+                        console.print(msg)
+                        log(msg)
+                        break
+
+        # Strategy D: Sliding Window Fuzzy Match
+        if match_index == -1 and n_search >= 4:
+            # Try to match a significant subset of lines (e.g. 60%) in sequence
+            search_stripped = [l.strip() for l in search_block]
+            best_ratio = 0
+            best_pos = -1
+            best_wsize = 0
+            
+            # Use a slightly smaller window to allow for missing lines
+            min_window = max(3, int(n_search * 0.5))
+            
+            for wsize in range(n_search, min_window - 1, -1):
+                # If we found a good match already, stop shrinking
+                if best_ratio > 0.8: break
+                
+                window_stripped = search_stripped[:wsize]
+                for i in range(len(modified_lines) - wsize + 1):
+                    file_subset = [l.strip() for l in modified_lines[i : i+wsize]]
+                    # Calculate similarity ratio
+                    matches = sum(1 for a, b in zip(file_subset, window_stripped) if a == b)
+                    ratio = matches / wsize
+                    
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        best_pos = i
+                        best_wsize = wsize
+            
+            if best_ratio >= 0.5 and best_pos >= 0:
+                match_index = best_pos
+                n_delete = best_wsize
+                msg = f"[cyan]Partial-matched hunk at line {best_pos+1} ({best_ratio:.0%} match, window={best_wsize})[/cyan]"
+                console.print(msg)
+                log(msg)
+
         if match_index != -1:
-            # 5. Apply the patch
-            # Remove old lines
-            del modified_lines[match_index : match_index + n_search]
-            # Insert new lines
+            # Apply replacement
+            # Remove n_delete lines starting from match_index
+            # Insert replace_block
+            
+            # Handles index out of bounds if match is near end?
+            # List slicing is forgiving.
+            del modified_lines[match_index : match_index + n_delete]
+            
             for i, line in enumerate(replace_block):
                 modified_lines.insert(match_index + i, line)
-            console.print(f"[green]Applied hunk at line {match_index+1}[/green]")
-        else:
-            console.print(f"[red]Failed to find matching context for hunk:[/red]")
-            console.print(Panel("\n".join(search_block[:5]) + "\n...", title="Expected Context (First 5 lines)"))
-            return False # Fail the whole patch if one hunk fails (atomic apply)
             
-    # Save result
-    file_path.write_text("\n".join(modified_lines), encoding="utf-8")
-    return True
-
+            msg = f"[green]Applied hunk at line {match_index+1}[/green]"
+            console.print(msg)
+            log(msg)
+            applied_hunks += 1
+        else:
+            msg = "[red]Failed to find matching context for hunk:[/red]"
+            console.print(msg)
+            log(msg)
+            
+            # Print context for debugging
+            ctx_head = search_block[:5]
+            ctx_box = Panel("\n".join(ctx_head) + ("\n..." if len(search_block) > 5 else ""), title="Expected Context (First 5 lines)")
+            console.print(ctx_box)
+            # Log expected context
+            log("Expected Context snippet:")
+            for l in ctx_head:
+                log(f"| {l}")
+    
+    if applied_hunks == len(hunks):
+        # Success! Write back
+        new_text = "\n".join(modified_lines)
+        if had_trailing_newline and not new_text.endswith("\n"):
+            new_text += "\n"
+        elif not had_trailing_newline and new_text.endswith("\n"):
+            new_text = new_text[:-1]
+            
+        file_path.write_text(new_text, encoding="utf-8")
+        return True
+    
+    return False
 def extract_files_from_diff(diff_text: str) -> List[Tuple[str, str]]:
     """
     Extract file contents from diff '+' lines — ONLY FOR NEW FILES.
@@ -980,6 +1187,12 @@ def complete_with_continuation(
             console.print(f"[red]All LLM retry attempts failed.[/red]")
             break
             
+        
+        # Custom Environment Handling: If client returns a string, use it directly
+        if isinstance(resp, str):
+            full_content += resp
+            break
+
         choice = resp.choices[0]
         console.print(f"[dim]Finish Reason: {choice.finish_reason}[/dim]")
         content = choice.message.content or ""
@@ -994,7 +1207,12 @@ def complete_with_continuation(
             prev_chunk_fences = full_content.count("```")
             is_inside_code = (prev_chunk_fences % 2 == 1)
             
-            if is_inside_code:
+            # Check if we are inside a WRITE_FILE block (<<<CONTENT without CONTENT>>>)
+            open_tags = len(re.findall(r'<<<CONTENT', full_content))
+            close_tags = len(re.findall(r'CONTENT>{2,3}', full_content))
+            is_inside_write_file = (open_tags > close_tags)
+            
+            if is_inside_code or is_inside_write_file:
                 # 1. Strip re-opened code fences (e.g. "```python")
                 # Models often restart the block when continued
                 content = re.sub(r'^\s*```\w*\n', '', content)
@@ -1040,116 +1258,7 @@ def complete_with_continuation(
             break
             
     return full_content
-# def complete_with_continuation(
-#     client: OpenAI,
-#     model: str,
-#     messages: List[Dict[str, str]],
-#     temperature: float = 0.2,
-#     max_output_tokens: int = 4096,
-#     model_max_context: int = 16384,
-# ) -> str:
-#     """
-#     Calls the LLM. If finish_reason is 'length', appends the partial response
-#     to messages and asks it to continue, stitching the results.
-#     Improved: diff-aware continuation prompting.
-    
-#     Adaptively caps max_tokens based on input size to avoid context overflow.
-#     """
-#     full_content = ""
-#     current_messages = list(messages)
-    
-#     max_loops = 5  # Increased from 3 for complex multi-file tasks
-    
-#     for i in range(max_loops):
-#         console.print(f"[dim]Generation loop {i+1}/{max_loops}...[/dim]")
-        
-#         # Adaptive max_tokens: estimate input and cap output accordingly
-#         input_text = "\n".join(m.get("content", "") for m in current_messages)
-#         input_est = estimate_tokens(input_text)
-#         safe_tokens = compute_safe_max_tokens(
-#             input_tokens=input_est,
-#             model_max_context=model_max_context,
-#             desired_max_output=max_output_tokens
-#         )
-        
-#         if safe_tokens < max_output_tokens:
-#             console.print(f"[yellow]Adaptive max_tokens: {safe_tokens} "
-#                           f"(input≈{input_est}, limit={model_max_context}, "
-#                           f"requested={max_output_tokens})[/yellow]")
-        
-#         # Retry with backoff on API errors (including context overflow)
-#         resp = None
-#         for attempt in range(3):
-#             try:
-#                 resp = client.chat.completions.create(
-#                     model=model,
-#                     messages=current_messages,
-#                     temperature=temperature,
-#                     max_tokens=safe_tokens
-#                 )
-#                 break
-#             except Exception as e:
-#                 err_str = str(e)
-#                 if 'max_tokens' in err_str or 'context length' in err_str or 'maximum context' in err_str:
-#                     # Context overflow — reduce tokens further
-#                     safe_tokens = max(1024, safe_tokens // 2)
-#                     console.print(f"[red]Context overflow (attempt {attempt+1}). "
-#                                   f"Retrying with max_tokens={safe_tokens}...[/red]")
-#                     time.sleep(1)
-#                     continue
-#                 console.print(f"[red]LLM Call failed: {e}[/red]")
-#                 if attempt < 2:
-#                     time.sleep(2 ** attempt)
-#                     continue
-#                 break
-        
-#         if resp is None:
-#             console.print(f"[red]All LLM retry attempts failed.[/red]")
-#             break
-            
-#         choice = resp.choices[0]
-#         console.print(f"[dim]Finish Reason: {choice.finish_reason}[/dim]")
-#         content = choice.message.content or ""
-#         full_content += content
-        
-#         if choice.finish_reason == "length":
-#             console.print("[yellow]Output truncated (limit reached). Continuing...[/yellow]")
-            
-#             # Detect what kind of output we're in the middle of
-#             # and craft appropriate continuation prompt
-#             if content.rstrip().endswith('```'):
-#                 # Cleanly ended a code block — can continue normally
-#                 cont_prompt = (
-#                     "Continue. If there are more files to create, "
-#                     "continue with the next WRITE_FILE block or diff. "
-#                     "Do not repeat already-generated content."
-#                 )
-#             elif 'WRITE_FILE:' in content or '<<<CONTENT' in content:
-#                 cont_prompt = (
-#                     "You were truncated mid-output. Continue EXACTLY where you left off. "
-#                     "You were in the middle of a WRITE_FILE block. "
-#                     "Continue the file content, then close with CONTENT>>> "
-#                     "and continue with remaining files."
-#                 )
-#             elif 'diff --git' in content:
-#                 cont_prompt = (
-#                     "You were truncated mid-output. Continue EXACTLY where you left off. "
-#                     "You were in the middle of a unified diff. "
-#                     "Continue the diff hunks. Do NOT repeat diff headers already generated. "
-#                     "Do NOT restart the response."
-#                 )
-#             else:
-#                 cont_prompt = (
-#                     "You were truncated. Continue exactly where you left off. "
-#                     "Do not repeat previous content."
-#                 )
-            
-#             current_messages.append({"role": "assistant", "content": content})
-#             current_messages.append({"role": "user", "content": cont_prompt})
-#         else:
-#             break
-            
-#     return full_content
+
 
 
 # ---------------------------
@@ -1249,7 +1358,11 @@ def plan_tasks(config: AgentConfig, goal: str, notes: str, allowlist: List[str])
     # Regex looks for "Create task.py", "Write script.py", etc.
     if not allowlist:
         # Check for explicit file creation intent in goal
-        m = re.search(r"(?:create|write|implement)\s+(\S+\.py)", goal, re.IGNORECASE)
+        # m = re.search(r"(?:create|write|implement)\s+(\S+\.py)", goal, re.IGNORECASE)
+        
+        # NEW: allows words in between (e.g. "Write a new test.py")
+        # We use dotall to match across newlines and \b to ensure clean filename start
+        m = re.search(r"(?:create|write|implement).*?\b([a-zA-Z0-9_]+\.py)", goal, re.IGNORECASE | re.DOTALL)
         if m:
             filename = m.group(1)
             console.print(f"[green]Goal targets single file ({filename}). Skipping planner.[/green]")
@@ -1342,7 +1455,7 @@ def resolve_path(raw_path: str, allowlist: List[str], root_dir: Path = Path(".")
     clean = raw_path.strip().strip("'").strip('"')
     
     # 1. Safety Check: Absolute paths are suspicious. Strip root.
-    # Logic: If model says /Developer/src/main.py, we only care about src/main.py relative to us.
+    # Logic: If model says /Developer/AIserver/task.py, we only care about src/main.py relative to us.
     if clean.startswith("/"):
         clean = clean.lstrip("/")
     
@@ -1372,13 +1485,14 @@ def _try_apply_content(content: str, allowlist: List[str], turn_dir: Path,
     Order: 
     1. git apply (Strict Diff)
     2. apply_fuzzy_patch (Loose Diff - handles line/whitespace errors)
-    3. WRITE_FILE (Full rewrite)
-    4. Diff Extraction (Last resort reconstruction)
+    3. WRITE_FILE (Full rewrite) — tried even if diff was found
+    4. Diff Extraction (Last resort reconstruction for new files)
     """
     
     # --- Extract Diff once ---
     diff = extract_all_diffs(content)
     changes_applied = False
+    apply_method = None
     
     # --- TRY FORMAT A: Unified Diff Strategies ---
     if diff:
@@ -1387,6 +1501,8 @@ def _try_apply_content(content: str, allowlist: List[str], turn_dir: Path,
         # Strategy 1: Strict Git Apply
         if is_git_repo():
             changes_applied = apply_patch_guarded(diff, turn_dir, auto_approve=config.auto_approve)
+            if changes_applied:
+                apply_method = "git_apply"
         else:
             console.print("[red]Not a git repo, skipping strict diff apply.[/red]")
         
@@ -1397,6 +1513,8 @@ def _try_apply_content(content: str, allowlist: List[str], turn_dir: Path,
             fuzzy_successes = 0
             fuzzy_total = 0
             
+            fuzzy_logs = ["\n--- Fuzzy Patch Attempt ---"]
+            
             for fd in file_diffs:
                 if not fd.strip().startswith("diff --git"): continue
                 fuzzy_total += 1
@@ -1405,25 +1523,45 @@ def _try_apply_content(content: str, allowlist: List[str], turn_dir: Path,
                 match = re.search(r'diff --git a/\S+ b/(\S+)', fd)
                 if match:
                     raw_path = match.group(1)
+                    fuzzy_logs.append(f"Processing diff for: {raw_path}")
                     
                     # Resolve Path
                     target_path = resolve_path(raw_path, allowlist)
                     
                     if target_path:
                         if target_path != Path(raw_path):
-                            console.print(f"[dim]Redirecting '{raw_path}' -> '{target_path}'[/dim]")
+                            msg = f"[dim]Redirecting '{raw_path}' -> '{target_path}'[/dim]"
+                            console.print(msg)
+                            fuzzy_logs.append(msg)
                         
-                        if apply_fuzzy_patch(target_path, fd):
+                        if apply_fuzzy_patch(target_path, fd, log_buffer=fuzzy_logs):
                             fuzzy_successes += 1
+                            fuzzy_logs.append(">> Success")
+                        else:
+                            fuzzy_logs.append(">> Failed")
                     else:
-                        console.print(f"[red]Skipping diff for unresolved path: {raw_path}[/red]")
+                        msg = f"[red]Skipping diff for unresolved path: {raw_path}[/red]"
+                        console.print(msg)
+                        fuzzy_logs.append(msg)
             
+            # Append logs to apply.log
+            try:
+                with open(turn_dir / "apply.log", "a", encoding="utf-8") as f:
+                    f.write("\n".join(fuzzy_logs) + "\n")
+            except Exception as e:
+                console.print(f"Failed to append to apply.log: {e}")
+
             # Mark success if at least one file was patched
             if fuzzy_successes > 0:
                 changes_applied = True
+                apply_method = "fuzzy_patch"
                 console.print(f"[green]Fuzzy patch applied ({fuzzy_successes}/{fuzzy_total} files).[/green]")
 
-    # --- TRY FORMAT B: WRITE_FILE (Try if diffs failed or didn't exist) ---
+
+    # --- TRY FORMAT B: WRITE_FILE ---
+    # Try WRITE_FILE regardless of whether a diff was found — some responses
+    # contain both a diff AND a WRITE_FILE block. If the diff failed, the
+    # WRITE_FILE may still work.
     if not changes_applied:
         write_actions = extract_write_file_actions(content)
         if write_actions:
@@ -1438,6 +1576,8 @@ def _try_apply_content(content: str, allowlist: List[str], turn_dir: Path,
             
             if valid_actions:
                 changes_applied = apply_write_files(valid_actions, allowlist, turn_dir)
+                if changes_applied:
+                    apply_method = "write_file"
     
     # --- TRY FORMAT C: Extract NEW files from diff (Last resort) ---
     # SAFETY: extract_files_from_diff ONLY extracts new files (--- /dev/null).
@@ -1449,65 +1589,65 @@ def _try_apply_content(content: str, allowlist: List[str], turn_dir: Path,
         if diff_files:
             changes_applied = apply_write_files(diff_files, allowlist, turn_dir)
             if changes_applied:
+                apply_method = "diff_extraction"
                 console.print("[green]Wrote new files extracted from diff.[/green]")
         else:
             console.print("[red]No new files to extract. Edit diffs cannot be safely applied as rewrites.[/red]")
     
-    # --- Final Failure Check ---
-    if not changes_applied:
-        # Check if we missed a WRITE_FILE due to bad formatting (optional check)
+    # --- Log result ---
+    if apply_method:
+        console.print(f"[green]Changes applied via: {apply_method}[/green]")
+    elif not changes_applied:
+        # Check if we missed a WRITE_FILE due to bad formatting
         if "WRITE_FILE:" in content and "CONTENT" in content:
              console.print("[red]Potential malformed WRITE_FILE block detected but extraction failed.[/red]")
         
         if not diff and not extract_write_file_actions(content):
             console.print("[red]No valid diff or WRITE_FILE actions found in response.[/red]")
+            
+            # --- TRY FORMAT E: Fenced Block Fallback (Session 213156 fix) ---
+            # If model wraps code in markdown fences but forgets WRITE_FILE
+            if len(allowlist) == 1 and not changes_applied:
+                # Look for ```python ... ``` or just ``` ... ```
+                # We want EXACTLY ONE code block to be safe
+                code_blocks = re.findall(r'```(?:python)?\s*(.*?)```', content, re.DOTALL)
+                
+                if len(code_blocks) == 1:
+                    target_file = Path(allowlist[0])
+                    block_content = code_blocks[0].strip()
+                    
+                    # Heuristic: does it look like Python code?
+                    if "def " in block_content or "import " in block_content:
+                        console.print(f"[yellow]Fallback E: Extracting single fenced block for {target_file}[/yellow]")
+                        target_file.parent.mkdir(parents=True, exist_ok=True)
+                        target_file.write_text(block_content + "\n", encoding="utf-8")
+                        apply_method = "fenced_fallback"
+                        changes_applied = True
+            
+            # --- TRY FORMAT D: Raw Code Fallback (Session 153128 fix) ---
+            # If the model outputs *just* the code without formatting, and we expect 1 file.
+            if len(allowlist) == 1 and not changes_applied:
+                target_file = Path(allowlist[0])
+                # Heuristic: does it look like Python code?
+                if "def " in content or "import " in content:
+                    console.print(f"[yellow]Fallback D: Treating entire response as content for {target_file}[/yellow]")
+                    
+                    # Sanitize: Remove markdown fences if they wrap the whole content
+                    clean_content = content.strip()
+                    if clean_content.startswith("```python"):
+                        clean_content = clean_content[len("```python"):].strip()
+                    elif clean_content.startswith("```"):
+                        clean_content = clean_content[3:].strip()
+                    
+                    if clean_content.endswith("```"):
+                        clean_content = clean_content[:-3].strip()
+                        
+                    target_file.parent.mkdir(parents=True, exist_ok=True)
+                    target_file.write_text(clean_content + "\n", encoding="utf-8")
+                    apply_method = "raw_fallback"
+                    changes_applied = True
     
     return changes_applied
-# def _try_apply_content(content: str, allowlist: List[str], turn_dir: Path, 
-#                        config: AgentConfig) -> bool:
-#     """
-#     Try all methods to apply model output as file changes.
-#     Order: git apply diff → WRITE_FILE → diff extraction.
-    
-#     Key insight: when model outputs BOTH diffs and WRITE_FILE,
-#     WRITE_FILE is more reliable (full file, no patch issues).
-#     So we try WRITE_FILE before diff extraction.
-#     """
-#     # --- TRY FORMAT A: Unified Diff ---
-#     diff = extract_all_diffs(content)
-#     changes_applied = False
-    
-#     if diff:
-#         (turn_dir / "patch.diff").write_text(diff, encoding="utf-8")
-#         if is_git_repo():
-#             changes_applied = apply_patch_guarded(diff, turn_dir, auto_approve=config.auto_approve)
-#         else:
-#             console.print("[red]Not a git repo, skipping diff apply.[/red]")
-    
-#     # --- TRY FORMAT B: WRITE_FILE (try BEFORE diff extraction — more reliable) ---
-#     if not changes_applied:
-#         write_actions = extract_write_file_actions(content)
-#         if write_actions:
-#             console.print(f"[cyan]Found {len(write_actions)} WRITE_FILE action(s). Applying...[/cyan]")
-#             changes_applied = apply_write_files(write_actions, allowlist, turn_dir)
-#             if changes_applied:
-#                 console.print("[green]Applied via WRITE_FILE.[/green]")
-    
-#     # --- TRY FORMAT A.5: Extract files from diff (last resort) ---
-#     if not changes_applied and diff:
-#         console.print("[yellow]Diff + WRITE_FILE failed. Extracting from diff lines...[/yellow]")
-#         diff_files = extract_files_from_diff(diff)
-#         if diff_files:
-#             changes_applied = apply_write_files(diff_files, allowlist, turn_dir)
-#             if changes_applied:
-#                 console.print("[green]Wrote files extracted from diff.[/green]")
-    
-#     if not changes_applied and not diff:
-#         write_actions = extract_write_file_actions(content)
-#         if not write_actions:
-#             console.print("[red]No valid diff or WRITE_FILE actions found.[/red]")
-    
-#     return changes_applied
 
 
 def _determine_verify_cmd(
@@ -1548,30 +1688,6 @@ def _determine_verify_cmd(
 
     # Auto Mode
     return candidate or ""
-# def _determine_verify_cmd(allowlist: List[str], auto_verify_cmd: str, 
-#                           config: AgentConfig) -> str:
-#     """
-#     Determine the verification command to run.
-#     """
-#     cmd_to_run = ""
-#     if auto_verify_cmd:
-#         if config.auto_approve:
-#             cmd_to_run = auto_verify_cmd
-#         elif Confirm.ask(f"Run parsed verification: [bold]{auto_verify_cmd}[/bold]?"):
-#             cmd_to_run = auto_verify_cmd
-    
-#     # Auto-detect: if no verification command, infer from allowlist
-#     if not cmd_to_run and config.auto_approve:
-#         py_files = [str(f) for f in allowlist if str(f).endswith('.py')]
-#         if py_files:
-#             cmd_to_run = f"python3 {py_files[0]}"
-#             console.print(f"[cyan]Auto-detected verification: {cmd_to_run}[/cyan]")
-    
-#     if not cmd_to_run and not config.auto_approve:
-#         if Confirm.ask("Run verification command?"):
-#             cmd_to_run = Prompt.ask("Command", default="")
-    
-#     return cmd_to_run
 
 def run_linter(files: List[str]) -> Optional[str]:
     """
@@ -1591,20 +1707,113 @@ def run_linter(files: List[str]) -> Optional[str]:
         return f"STATIC ANALYSIS FAILED (Ruff):\n{out}\n(Fix these syntax/name errors first!)"
     return None
 
-def save_skill(config: AgentConfig, goal: str, notes: str, success: bool, evidence: str):
-    """Save the session outcome to the SkillDB."""
-    kind = "success" if success else "failure"
-    filename = "successes.jsonl" if success else "failures.jsonl"
+def extract_skill_insight(
+    client: OpenAI, 
+    model: str, 
+    goal: str, 
+    success: bool, 
+    evidence: str
+) -> Skill:
+    """
+    Uses the LLM to distill the execution result into a concise Skill.
+    """
+    outcome = "SUCCESS" if success else "FAILURE"
+    prompt = (
+        f"Analyze this CodeAgent execution ({outcome}).\n"
+        f"Goal: {goal}\n"
+        f"Evidence/Output:\n{evidence[:2000]}\n\n"
+        f"Extract a SINGLE, concise 'Skill' or 'Insight' to help future agents avoid this failure or repeat this success.\n"
+        f"Return ONLY a JSON object with these keys:\n"
+        f"- category: One of [PyTorch, NumPy, Syntax, Logic, API, General]\n"
+        f"- pattern: A short trigger keyword/phrase (e.g. 'conv2d', 'plot', 'json.load')\n"
+        f"- insight: A concise rule (max 15 words). E.g. 'Use .detach().cpu() before plotting tensors.'\n"
+    )
     
-    skill = {
-        "tag": "execution",
-        "kind": kind,
-        "text": f"Goal: {goal[:100]}",
-        "pattern": goal.split()[0].lower() if goal else "general",
-        "evidence": evidence[-1000:] if evidence else "No output",
-        "created_at": now_stamp()
-    }
-    write_jsonl(config.agent_dir / "skilldb" / filename, skill)
+    try:
+        # Use valid messages format for complete_with_continuation
+        messages = [
+            {"role": "system", "content": "You are an expert developer extracting coding insights."},
+            {"role": "user", "content": prompt}
+        ]
+        
+        # Use the robust completion helper
+        content = complete_with_continuation(
+            client, model, messages, 
+            max_output_tokens=200,
+            model_max_context=4000
+        )
+        
+        # Strip markdown fences if present
+        content = content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```json\s*|```$", "", content).strip()
+            
+        # JSON extraction heuristic (find first { and last })
+        json_start = content.find('{')
+        json_end = content.rfind('}')
+        if json_start != -1 and json_end != -1:
+             content = content[json_start:json_end+1]
+
+        data = json.loads(content)
+        return Skill(
+            category=data.get("category", "General"),
+            pattern=data.get("pattern", "general"),
+            insight=data.get("insight", "Always check outputs."),
+            evidence=evidence[:500],
+            created_at=now_stamp()
+        )
+    except Exception as e:
+        console.print(f"[yellow]Failed to extract insight: {e}[/yellow]")
+        console.print(f"[dim]Raw content: {content[:200]}...[/dim]")
+        # Fallback
+        return Skill(
+            category="General",
+            pattern="general",
+            insight=f"Review output for {outcome} details.",
+            evidence=evidence[:500],
+            created_at=now_stamp()
+        )
+
+def save_skill(config: AgentConfig, goal: str, notes: str, success: bool, evidence: str):
+    """Save the session outcome to the SkillDB (new structured format)."""
+    # Only save if there's meaningful evidence
+    if not evidence.strip():
+        return
+
+    # Use a unified skills file for v2
+    skill_file = config.agent_dir / "skilldb" / "skills.jsonl"
+    
+    # 1. Extract Insight
+    console.print("[cyan]Extracting experience insight...[/cyan]")
+    skill = extract_skill_insight(config.client, config.model, goal, success, evidence)
+    
+    # 2. Load existing to deduplicate
+    current_skills = []
+    if skill_file.exists():
+        for line in skill_file.read_text(errors="ignore").splitlines():
+            try: current_skills.append(json.loads(line))
+            except: pass
+            
+    # 3. Check for duplicates (same insight + category)
+    found = False
+    for existing in current_skills:
+        if (existing.get("category") == skill.category and 
+            existing.get("insight") == skill.insight):
+            existing["count"] = existing.get("count", 1) + 1
+            existing["evidence"] = skill.evidence # Update with latest evidence
+            existing["created_at"] = now_stamp()
+            found = True
+            console.print(f"[green]Updated existing skill: [{skill.category}] {skill.insight}[/green]")
+            break
+            
+    if not found:
+        current_skills.append(asdict(skill))
+        console.print(f"[green]Saved new skill: [{skill.category}] {skill.insight}[/green]")
+        
+    # 4. Write back
+    with open(skill_file, "w", encoding="utf-8") as f:
+        for s in current_skills:
+            f.write(json.dumps(s) + "\n")
 
 class PromptRegistry:
     """
@@ -1786,7 +1995,7 @@ class PromptRegistry:
         )
 
     @staticmethod
-    def format_fix_diff(file_path: str, code_content: str, error_log: str) -> str:
+    def format_fix_diff(file_path: str, code_content: str, error_log: str, teacher_guidelines: str = "") -> str:
         """
         Prompt for Strategy 1: Quick Fix via Diff.
         """
@@ -1798,12 +2007,13 @@ class PromptRegistry:
             f"1. **Analyze**: Look at the error and the code below.\n"
             f"2. **Scope**: Fix ONLY the specific error.\n"
             f"3. **Consistency**: Check the *entire function* for related issues.\n"
-            f"4. **Output**: Use **Format A (Unified Diff)**.\n\n"
+            f"4. **Output**: Use **Format A (Unified Diff)**.\n"
+            f"{teacher_guidelines}\n\n"
             f"## Current Code: {file_path}\n```python\n{code_content}\n```\n"
         )
 
     @staticmethod
-    def format_fix_rewrite(file_path: str, current_code: str, error_history: str) -> str:
+    def format_fix_rewrite(file_path: str, current_code: str, error_history: str, teacher_guidelines: str = "") -> str:
         """
         Prompt for Strategy 2: Full Rewrite.
         Ensures the model sees the broken code so it can recover logic.
@@ -1818,235 +2028,13 @@ class PromptRegistry:
             f"1. **Recover**: Use the logic from the 'Current File' above, but fix the errors.\n"
             f"2. **Format**: Output the **COMPLETE** file using **Format B (WRITE_FILE)**.\n"
             f"3. **Constraint**: Do NOT use diffs. Do NOT use placeholders.\n"
-            f"4. **Completeness**: You must output every single line of code.\n\n"
+            f"4. **Completeness**: You must output every single line of code.\n"
+            f"{teacher_guidelines}\n\n"
             f"WRITE_FILE: {file_path}\n"
             f"<<<CONTENT\n"
             f"... complete fixed code ...\n"
             f"CONTENT>>>\n"
         )
-# class PromptRegistry:
-#     """
-#     Centralized manager for all LLM prompts.
-#     Handles token budgeting, context prioritization, and format enforcement.
-#     """
-
-#     # Use a raw string + concatenation to avoid f-string/backtick issues
-#     SYSTEM = (
-#         "You are an advanced AI coding agent. Your ONLY job is to produce file changes.\n"
-#         "\n"
-#         "## Output Format (STRICT)\n"
-#         "You MUST output in ONE of these two formats per response. Never mix them.\n"
-#         "\n"
-#         "### Format A: Unified Diff (For small edits)\n"
-#         "1. Start with a brief `## Reasoning` section (plain text, keep short).\n"
-#         "2. Then output `## Action` followed by a SINGLE fenced diff code block.\n"
-#         "3. Each file diff starts with `diff --git a/<path> b/<path>`.\n"
-#         "4. For NEW files use `--- /dev/null` and `+++ b/<path>`.\n"
-#         "5. Make sure hunk line-counts are correct (@@ -X,Y +A,B @@).\n"
-#         "6. Do NOT put prose between diffs inside the block.\n"
-#         "\n"
-#         "### Format B: WRITE_FILE (For new files or full rewrites)\n"
-#         "Use when creating new files or when diffs are too complex.\n"
-#         "\n"
-#         "WRITE_FILE: path/to/file.py\n"
-#         "<<<CONTENT\n"
-#         "... file content here ...\n"
-#         "CONTENT>>>\n"
-#         "\n"
-#         "## Rules\n"
-#         "- NEVER embed triple-backtick fences inside a diff block.\n"
-#         "- NEVER mix Format A and Format B in the same response.\n"
-#         "- If output will be very long, prefer Format B (WRITE_FILE) to avoid truncation.\n"
-#         "- Always include `Verification: <command>` on its own line if you know how to verify.\n"
-#         "\n"
-#         "## Teacher Guidelines (CRITICAL)\n"
-#         "If provided, you MUST follow the language-specific guidelines in the User Prompt.\n"
-#     )
-
-#     @staticmethod
-#     def format_task(
-#         goal: str,
-#         allowlist: List[str],
-#         context_files: List[str],
-#         notes: str,
-#         skills: str,
-#         max_context: int,
-#         max_output: int = 4096,
-#     ) -> str:
-#         """
-#         Builds the main Turn Prompt with dynamic context management.
-#         Prioritizes context usage:
-#           1. Essential Instructions & Goal (Base)
-#           2. Git Status/Diff (for existing repos)
-#           3. File Contents (read-only context + allowlist)
-#           4. Directory Tree (if space permits)
-#         """
-#         allow_txt = "\n".join(f"- {p}" for p in allowlist) if allowlist else "- (none)"
-
-#         # Detect if ALL files are new (don't exist yet)
-#         all_new_files = all(not Path(f).exists() for f in allowlist) if allowlist else False
-
-#         # Suggest WRITE_FILE for new or multi-file tasks
-#         format_hint = ""
-#         if len(allowlist) > 1 or all_new_files:
-#             format_hint = (
-#                 "\n> **IMPORTANT**: Use **Format B (WRITE_FILE)** to create all files. "
-#                 "This avoids diff truncation issues and is more reliable for new files.\n"
-#             )
-
-#         base_md = (
-#             f"# Turn Prompt\n\n"
-#             f"## Goal\n{goal}\n\n"
-#             f"## Target Files (Allowlist)\n{allow_txt}\n"
-#             f"{format_hint}\n"
-#             f"{skills if skills else ''}\n"
-#             f"## Constraints / Teacher Guidelines\n"
-#             f"{notes.strip() if notes.strip() else '(none)'}\n\n"
-#             f"## Output Contract\n"
-#             f"1. Return changes using EITHER Format A (Diff) OR Format B (WRITE_FILE).\n"
-#             f"2. ALL files in the Target Files list must be addressed.\n"
-#             f"3. (Optional) Include: \"Verification: <command>\" before the changes.\n"
-#         )
-
-#         # --- Token Budgeting ---
-#         safety_margin = 1000
-#         usable_context = max_context - max_output - safety_margin
-#         used_tokens = estimate_tokens(base_md) + estimate_tokens(PromptRegistry.SYSTEM)
-#         remaining = usable_context - used_tokens
-
-#         if remaining < 500:
-#             console.print("[red]Critical Warning: Goal + Constraints exceed context limit![/red]")
-#             base_md += "\n> **CRITICAL**: Input too long. Context truncated.\n"
-#             return base_md
-
-#         if remaining < 2000:
-#             base_md += "\n> **OUTPUT HINT**: Context budget is tight. Use WRITE_FILE format and keep code concise.\n"
-
-#         context_sections = []
-
-#         # --- Priority 1: Git Status/Diff (skip for new files) ---
-#         if not all_new_files and is_git_repo():
-#             st = git_status()
-#             df = git_diff()
-#             git_block = ""
-#             if st:
-#                 rel_lines = [line for line in st.split('\n')
-#                              if line.strip().startswith('##') or any(str(a) in line for a in allowlist)]
-#                 if rel_lines:
-#                     status_text = '\n'.join(rel_lines)
-#                     git_block += f"### git status (relevant)\n```\n{status_text}\n```\n"
-#             if df.strip():
-#                 if estimate_tokens(df) > 2000:
-#                     df = truncate_to_tokens(df, 2000)
-#                 git_block += f"### git diff\n```diff\n{df}\n```\n"
-#             git_cost = estimate_tokens(git_block)
-#             if git_block and git_cost < remaining:
-#                 context_sections.append("## Repo Snapshot\n" + git_block)
-#                 remaining -= git_cost
-#         elif all_new_files:
-#             console.print("[dim]Skipping git context (new files mode)[/dim]")
-
-#         # --- Priority 2: File Contents ---
-#         # Ensure allowlist files come first
-#         priority_files = list(dict.fromkeys(list(allowlist) + list(context_files)))
-#         files_md = ""
-#         for f in priority_files:
-#             content = read_file(str(f))
-#             if not content or content.startswith("[MISSING FILE]"):
-#                 continue
-#             if estimate_tokens(content) > 6000:
-#                 content = truncate_to_tokens(content, 6000)
-#             file_block = f"## File: {f}\n```python\n{content}\n```\n"
-#             block_cost = estimate_tokens(file_block)
-#             if block_cost < remaining:
-#                 files_md += file_block
-#                 remaining -= block_cost
-#             else:
-#                 files_md += f"## File: {f}\n[Content Omitted - Context Limit Reached]\n"
-#         if files_md:
-#             context_sections.append(files_md)
-
-#         # --- Priority 3: Directory Tree (least important) ---
-#         if not all_new_files and remaining > 500:
-#             tree = top_level_tree()
-#             if estimate_tokens(tree) < remaining:
-#                 context_sections.append(f"### File Tree\n{tree}\n")
-
-#         if context_sections:
-#             base_md += "\n## Context\n" + "\n".join(context_sections)
-
-#         return base_md
-
-#     @staticmethod
-#     def format_bugfix(file_path: str, error_output: str, original_goal: str = "") -> str:
-#         """
-#         Focused bug-fix prompt. Much shorter than format_task.
-#         Forces WRITE_FILE output to avoid broken diffs in fix responses.
-#         """
-#         content = read_file(str(file_path))
-#         if not content:
-#             content = "[FILE NOT FOUND]"
-
-#         return (
-#             f"# Bug Fix Required\n\n"
-#             f"## Original Goal\n{original_goal if original_goal else '(see previous context)'}\n\n"
-#             f"## Current File: {file_path}\n```python\n{content}\n```\n\n"
-#             f"## Error Output\n```\n{error_output[-3000:]}\n```\n\n"
-#             f"## STRICT Instructions\n"
-#             f"1. Analyze the Traceback to find the failing function.\n"
-#             f"2. Fix the specific error shown.\n"
-#             f"3. **CRITICAL: Scan the rest of that function for similar issues.**\n"
-#             f"   (e.g., if you change a variable from Tensor to Numpy, ensure ALL subsequent usages handle Numpy).\n"
-#             f"4. Output the COMPLETE corrected file using WRITE_FILE format.\n"
-#             f"5. Do NOT use diffs. Do NOT include reasoning diff examples.\n"
-#             f"6. Output EXACTLY one WRITE_FILE block, nothing else after it.\n\n"
-#             f"WRITE_FILE: {file_path}\n"
-#             f"<<<CONTENT\n"
-#             f"... your complete corrected file here ...\n"
-#             f"CONTENT>>>\n"
-#         )
-
-#     @staticmethod
-#     def format_fix_diff(file_path: str, code_content: str, error_log: str) -> str:
-#         """
-#         Prompt for Strategy 1: Quick Fix via Diff.
-#         Focuses on specific error location.
-#         """
-#         return (
-#             f"# Bug Fix Required (Diff Strategy)\n\n"
-#             f"The previous code for `{file_path}` failed verification.\n\n"
-#             f"## Error Output\n```\n{error_log[-3000:]}\n```\n\n"
-#             f"## Instructions\n"
-#             f"1. **Analyze**: Look at the error and the code below.\n"
-#             f"2. **Scope**: Fix ONLY the specific error.\n"
-#             f"3. **Consistency**: Check the *entire function* for related issues "
-#             f"(e.g. if changing variable type, update all usages).\n"
-#             f"4. **Output**: Use **Format A (Unified Diff)**.\n\n"
-#             f"## Current Code: {file_path}\n```python\n{code_content}\n```\n"
-#         )
-
-#     @staticmethod
-#     def format_fix_rewrite(file_path: str, error_history: str) -> str:
-#         """
-#         Prompt for Strategy 2: Full Rewrite.
-#         Used when diffs fail repeatedly. Force clean slate.
-#         """
-#         return (
-#             f"# Rewrite Required (Fresh Start)\n\n"
-#             f"Diff-based fixes have failed multiple times. "
-#             f"We need a clean rewrite of `{file_path}`.\n\n"
-#             f"## Failure History\n```\n{error_history[-4000:]}\n```\n\n"
-#             f"## Instructions\n"
-#             f"1. **Format**: Output the **COMPLETE** file using **Format B (WRITE_FILE)**.\n"
-#             f"2. **Constraint**: Do NOT use diffs.\n"
-#             f"3. **Requirement**: Ensure ALL errors listed above are resolved.\n"
-#             f"4. **Completeness**: Do not use placeholders. Output every line.\n\n"
-#             f"WRITE_FILE: {file_path}\n"
-#             f"<<<CONTENT\n"
-#             f"... your complete corrected file here ...\n"
-#             f"CONTENT>>>\n"
-#         )
-
 
 def run_subtask_loop(
     config: AgentConfig,
@@ -2075,7 +2063,12 @@ def run_subtask_loop(
     turn_dir = get_turn_dir(0)
     
     # 1. Prepare Prompt
-    inject = format_skill_injection(select_relevant_skills(subtask, skill_dir))
+    # Enhanced Selection: Include global_notes (tech stack) in the query
+    skill_query = f"{subtask}\n{global_notes}"
+    inject = format_skill_injection(select_relevant_skills(skill_query, skill_dir))
+    
+    combined_guidelines = f"{global_notes}\n\n{inject}".strip()
+    
     prompt_md = PromptRegistry.format_task(
         subtask, allowlist, context_files, global_notes, inject, 
         config.max_context, config.max_output
@@ -2146,10 +2139,24 @@ def run_subtask_loop(
     # --- Verification Loop ---
     error_history = []
     
-    for fix_stage in range(3): # 0=Initial, 1=Diff Fix, 2=Rewrite Fix
+    # Increase from 3 to 4 attempts (0=Initial, 1=Diff, 2=Rewrite, 3=Final Rewrite)
+    MAX_RETRIES = 4
+    
+    for fix_stage in range(MAX_RETRIES): 
         
         console.print(f"[blue]Running verification (Stage {fix_stage})...[/blue]")
         code, out = run_shell(verify_cmd, cap=20000)
+        
+        # --- Auto-Install Missing Modules ---
+        if code != 0:
+            install_log = _handle_missing_modules(out)
+            if install_log:
+                out += install_log
+                # Retry verification immediately
+                console.print("[blue]Retrying verification after installation...[/blue]")
+                code, out_retry = run_shell(verify_cmd, cap=20000)
+                out += f"\n[Post-Install Verification]\n{out_retry}\n"
+        
         (turn_dir / "verify_stdout.txt").write_text(out, encoding='utf-8')
         
         if code == 0:
@@ -2160,7 +2167,7 @@ def run_subtask_loop(
         console.print(f"[red]Verification Failed (exit={code})[/red]")
         error_history.append(f"Stage {fix_stage} Output:\n{out}\n{'-'*20}")
         
-        if fix_stage == 2:
+        if fix_stage == MAX_RETRIES - 1:
             console.print("[bold red]All fix attempts failed. Exiting subtask.[/bold red]")
             save_skill(config, subtask, global_notes, False, out)
             return False
@@ -2182,13 +2189,19 @@ def run_subtask_loop(
         if fix_stage == 0:
             # STRATEGY 1: DIFF FIX
             console.print("[yellow]Attempting Fix 1: Targeted Diff...[/yellow]")
-            fix_prompt = PromptRegistry.format_fix_diff(target_file, current_code, out)
+            fix_prompt = PromptRegistry.format_fix_diff(
+                target_file, current_code, out,
+                teacher_guidelines=combined_guidelines
+            )
         else:
             # STRATEGY 2: FULL REWRITE
             console.print("[yellow]Attempting Fix 2: Full Rewrite (Accumulated Errors)...[/yellow]")
             full_history = "\n".join(error_history)
             # UPDATE: Pass current_code here
-            fix_prompt = PromptRegistry.format_fix_rewrite(target_file, current_code, full_history)
+            fix_prompt = PromptRegistry.format_fix_rewrite(
+                target_file, current_code, full_history,
+                teacher_guidelines=combined_guidelines
+            )
             #fix_prompt = PromptRegistry.format_fix_rewrite(target_file, full_history)
 
         (turn_dir / "prompt.md").write_text(fix_prompt, encoding="utf-8")
@@ -2211,188 +2224,50 @@ def run_subtask_loop(
     
     return False
 
-# def run_subtask_loop(
-#     config: AgentConfig,
-#     subtask: str,
-#     subtask_idx: int,
-#     allowlist: List[str],
-#     context_files: List[str],
-#     global_notes: str,
-# ) -> bool:
-#     """
-#     Modular execution loop: Generate -> Verify -> Fix(Diff) -> Fix(Rewrite) -> Exit
-    
-#     Flow:
-#       1. Generate code (single attempt with continuation for long output)
-#       2. Verify (run test/check command)
-#       3. If fail: Fix 1 — targeted diff fix
-#       4. If fail: Fix 2 — full file rewrite
-#       5. If fail: Stop
-#     """
-#     skill_dir = config.agent_dir / "skilldb"
-#     turn_base = subtask_idx * 10
-#     console.rule(f"Executing Sub-task {subtask_idx+1}: {subtask}")
-
-#     # Helper to get turn directory
-#     def get_turn_dir(offset: int) -> Path:
-#         d = config.session_dir / f"{turn_base + offset:04d}"
-#         d.mkdir(parents=True, exist_ok=True)
-#         return d
-
-#     # =========================================================================
-#     # PHASE 1: GENERATION
-#     # =========================================================================
-#     console.print("[bold cyan]Phase 1: Generating Code[/bold cyan]")
-#     turn_dir = get_turn_dir(0)
-    
-#     # 1. Prepare Prompt (format_task handles file context + token budgeting)
-#     inject = format_skill_injection(select_relevant_skills(subtask, skill_dir))
-#     prompt_md = PromptRegistry.format_task(
-#         goal=subtask,
-#         allowlist=allowlist,
-#         context_files=context_files,
-#         notes=global_notes,
-#         skills=inject,
-#         max_context=config.model_max_context or config.max_context,
-#         max_output=config.max_output,
-#     )
-
-#     (turn_dir / "prompt.md").write_text(prompt_md, encoding="utf-8")
-
-#     # 2. Call Model (Internal loop handles truncation/continuation)
-#     console.print("[cyan]Generating solution...[/cyan]")
-#     content = complete_with_continuation(
-#         config.client, config.model,
-#         [{"role": "system", "content": PromptRegistry.SYSTEM}, 
-#          {"role": "user", "content": prompt_md}],
-#         max_output_tokens=config.max_output,
-#         model_max_context=config.model_max_context
-#     )
-#     (turn_dir / "response.md").write_text(content, encoding="utf-8")
-
-#     # 3. Apply
-#     if not _try_apply_content(content, allowlist, turn_dir, config):
-#         console.print("[red]Failed to apply generated code. Stopping.[/red]")
-#         return False
-#     console.print("[green]Code generated and applied.[/green]")
-
-#     # =========================================================================
-#     # PHASE 2: VERIFICATION & FIX
-#     # =========================================================================
-#     console.print("[bold cyan]Phase 2: Verification[/bold cyan]")
-    
-#     # Determine Verify Command
-#     # If no explicit command found, default to running the python file (main block)
-#     verify_cmd = None
-#     v_match = re.search(r"^Verification:\s*(.+)$", content, re.MULTILINE)
-#     if v_match:
-#         verify_cmd = v_match.group(1).strip()
-    
-#     verify_cmd = _determine_verify_cmd(allowlist, verify_cmd, config)
-    
-#     # Fallback: Just run the file if it's python
-#     if not verify_cmd:
-#         py_files = [f for f in allowlist if str(f).endswith('.py')]
-#         if py_files:
-#             verify_cmd = f"python3 {py_files[0]}"
-#             console.print(f"[dim]No verify cmd found. Defaulting to: {verify_cmd}[/dim]")
-
-#     if not verify_cmd:
-#         console.print("[yellow]No verification possible. Assuming success.[/yellow]")
-#         return True
-
-#     # --- Verification Loop ---
-#     # Attempt 0: Initial Verification
-#     # Attempt 1: Fix using Diff
-#     # Attempt 2: Fix using Full Rewrite
-    
-#     error_history = []
-    
-#     for fix_stage in range(3): # 0=Initial, 1=Diff Fix, 2=Rewrite Fix
-        
-#         # Run Verification
-#         console.print(f"[blue]Running verification (Stage {fix_stage})...[/blue]")
-#         code, out = run_shell(verify_cmd, cap=20000)
-        
-#         if code == 0:
-#             console.print(f"[green]Verification PASSED at Stage {fix_stage}![/green]")
-#             return True
-        
-#         console.print(f"[red]Verification Failed (exit={code})[/red]")
-#         error_history.append(f"Stage {fix_stage} Output:\n{out}\n{'-'*20}")
-        
-#         # If we just failed the final rewrite stage, give up.
-#         if fix_stage == 2:
-#             console.print("[bold red]All fix attempts (Diff & Rewrite) failed. Exiting subtask.[/bold red]")
-#             return False
-
-#         # --- PREPARE FIX ---
-#         turn_dir = get_turn_dir(fix_stage + 1)
-#         target_file = next((f for f in allowlist if str(f).endswith('.py')), allowlist[0])
-#         current_code = read_file(str(target_file))
-
-#         if fix_stage == 0:
-#             # STRATEGY 1: DIFF FIX
-#             console.print("[yellow]Attempting Fix 1: Targeted Diff...[/yellow]")
-#             fix_prompt = PromptRegistry.format_fix_diff(target_file, current_code, out)
-#         else:
-#             # STRATEGY 2: FULL REWRITE
-#             console.print("[yellow]Attempting Fix 2: Full Rewrite (Accumulated Errors)...[/yellow]")
-#             full_history = "\n".join(error_history)
-#             fix_prompt = PromptRegistry.format_fix_rewrite(target_file, full_history)
-
-#         (turn_dir / "prompt.md").write_text(fix_prompt, encoding="utf-8")
-
-#         # Generate Fix
-#         fix_content = complete_with_continuation(
-#             config.client, config.model,
-#             [{"role": "system", "content": PromptRegistry.SYSTEM}, 
-#              {"role": "user", "content": fix_prompt}],
-#             max_output_tokens=config.max_output,
-#             model_max_context=config.model_max_context
-#         )
-#         (turn_dir / "response.md").write_text(fix_content, encoding="utf-8")
-
-#         # Apply Fix
-#         if not _try_apply_content(fix_content, allowlist, turn_dir, config):
-#             console.print("[red]Failed to apply fix. Moving to next strategy...[/red]")
-#             # If diff failed to apply, the loop continues to 'Rewrite' stage naturally
-#             # because verify will fail (code didn't change)
-    
-#     return False
-
 
 def detect_tech_stack(goal: str, allowlist: List[str]) -> str:
     """
     Heuristics to detect the tech stack (PyTorch, NumPy, etc.) 
     and return strict 'Teacher Guidelines' to prevent common runtime errors.
+    Loads guidelines from SKILL_TEACHER (teacher.jsonl).
     """
+    if not SKILL_TEACHER.exists():
+        return ""
+
     goal_lower = goal.lower()
     combined_text = goal_lower + " ".join(str(x).lower() for x in allowlist)
     
     guidelines = []
-
-    # --- PYTORCH TEACHER ---
-    if any(k in combined_text for k in ["torch", "pytorch", "neural", "train", "model", "nn.linear"]):
-        guidelines.append("**PYTORCH CRITICAL RULES (Strict Compliance Required):**")
-        guidelines.append("1. **Device Safety**: Always move input tensors to `model.device` or `device` before forward pass.")
-        guidelines.append("2. **Type Safety**: NEVER pass Numpy arrays to `model()`. Always wrap in `torch.FloatTensor(X).to(device)`.")
-        guidelines.append("3. **Shape Safety**: Check shapes before MatMul! `nn.Linear` expects (N, Din), not (N). Use `.unsqueeze(1)` for targets if needed.")
-        guidelines.append("4. **Numpy Conversion**: To convert a Tensor to Numpy, YOU MUST chain: `.detach().cpu().numpy()`.")
-        guidelines.append("5. **Eval Mode**: Always call `model.eval()` and use `with torch.no_grad():` during evaluation.")
     
-    # --- NUMPY TEACHER ---
-    elif any(k in combined_text for k in ["numpy", "matrix", "array", "pandas"]):
-        guidelines.append("**NUMPY/DATA RULES:**")
-        guidelines.append("1. Check for `NaN` or `Inf` in data generation.")
-        guidelines.append("2. Ensure matrix dimensions match for dot products (`@`).")
-
-    # --- GENERAL PYTHON ---
-    if any(str(f).endswith(".py") for f in allowlist):
-        guidelines.append("3. **Reproducibility**: Set `torch.manual_seed(42)` and `np.random.seed(42)` at start.")
+    try:
+        # Load teacher guidelines from JSONL
+        # Format: {"category": "...", "triggers": [...], "header": "...", "guidelines": [...]}
+        with open(SKILL_TEACHER, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip(): continue
+                try:
+                    entry = json.loads(line)
+                    triggers = entry.get("triggers", [])
+                    
+                    # Check if any trigger matches the context
+                    if any(t.lower() in combined_text for t in triggers):
+                        header = entry.get("header")
+                        if header:
+                            guidelines.append(header)
+                        
+                        rules = entry.get("guidelines", [])
+                        guidelines.extend(rules)
+                        guidelines.append("") # Spacer
+                        
+                except json.JSONDecodeError:
+                    continue
+                    
+    except Exception as e:
+        console.print(f"[yellow]Failed to load teacher guidelines: {e}[/yellow]")
+        return ""
 
     if guidelines:
-        return "\n".join(guidelines)
+        return "\n".join(guidelines).strip()
     return ""
 # ---------------------------
 # Main Orchestrator
@@ -2417,6 +2292,9 @@ def main():
     parser.add_argument("--max-context", type=int, default=16000, help="Max context length")
     parser.add_argument("--max-output", type=int, default=4096, help="Max output tokens")
     
+    parser.add_argument("--migrate-skills", action="store_true", help="Migrate legacy skill DB to new format")
+    parser.add_argument("--artifacts-dir", help="Directory where the agent should save task artifacts (plots, models)")
+    
     args = parser.parse_args()
 
     agent_dir = Path(args.agent_dir)
@@ -2424,6 +2302,38 @@ def main():
 
     # Initialize Client
     client = OpenAI(base_url=args.base_url, api_key=args.api_key)
+    
+    # Migration Mode
+    if args.migrate_skills:
+        skill_dir = agent_dir / "skilldb"
+        console.print("[bold yellow]Starting Skill DB Migration...[/bold yellow]")
+        
+        # Load legacy skills
+        legacy_skills = []
+        for kind, filename in [("success", "successes.jsonl"), ("failure", "failures.jsonl")]:
+            path = skill_dir / filename
+            if path.exists():
+                for line in path.read_text(errors="ignore").splitlines():
+                    if line.strip(): legacy_skills.append((kind == "success", json.loads(line)))
+        
+        console.print(f"Found {len(legacy_skills)} legacy records.")
+        
+        # Process each
+        new_db = skill_dir / "skills.jsonl"
+        for i, (success, obj) in enumerate(legacy_skills):
+            console.print(f"[{i+1}/{len(legacy_skills)}] Extracting insight...")
+            goal = obj.get("text", "").split("\n")[0].replace("Goal: ", "")
+            evidence = obj.get("evidence", "")
+            
+            # Use the extraction logic
+            skill = extract_skill_insight(client, args.model, goal, success, evidence)
+            
+            # Save (append to new DB)
+            with open(new_db, "a", encoding="utf-8") as f:
+                f.write(json.dumps(asdict(skill)) + "\n")
+                
+        console.print("[green]Migration Complete![/green]")
+        return
 
     # 1. Auto-detect model context
     detected_ctx = query_model_context_length(client, args.model)
@@ -2502,6 +2412,23 @@ def main():
         # Append to extra_notes so it persists through Planning AND Execution
         extra_notes = f"{extra_notes}\n\n{teacher_guidelines}"
 
+    # --- ARTIFACTS DIR INJECTION ---
+    if args.artifacts_dir:
+        abs_artifacts = Path(args.artifacts_dir).resolve()
+        abs_artifacts.mkdir(parents=True, exist_ok=True)
+        artifact_instr = (
+            f"\n\n**ARTIFACT MANAGMENT RULE**:\n"
+            f"You MUST save ALL generated assets (plots, models, logs, images) to this directory:\n"
+            f"`{abs_artifacts}`\n"
+            f"Example: `plt.savefig('{abs_artifacts}/plot.png')`\n"
+            f"DO NOT save to `./` or `output/` unless explicitly asked."
+        )
+        extra_notes += artifact_instr
+        console.print(f"[cyan]Artifacts directory set: {abs_artifacts}[/cyan]")
+
+    # Print Machine-Readable Log Path for Batch Coder
+    print(f"[METADATA] LOG_PATH: {session_dir.resolve()}")
+
     # 6. Plan (Optimized: Skips LLM for single file tasks)
     # The 'extra_notes' now contains the Teacher Guidelines, so the planner sees them too!
     subtasks = plan_tasks(config, goal, extra_notes, allowlist)
@@ -2532,10 +2459,10 @@ if __name__ == "__main__":
 
 """
 
-python CodeAgent//mini_claude_codev2.py --goal "Implement Univariate Linear Regression using ONLY PyTorch tensors. Do NOT use torch.nn, torch.optim, or autograd. Write everything in a single task.py file with a complete main() that trains, evaluates, and validates."
+python CodeAgent//mini_claude_codev4.py --goal "Implement Univariate Linear Regression using ONLY PyTorch tensors. Do NOT use torch.nn, torch.optim, or autograd. Write everything in a single task.py file with a complete main() that trains, evaluates, and validates."
 
-python CodeAgent/mini_claude_codev2.py --goal "Implement ML Task: SVM (Score Calibration + ROC/PR). Description: Calibrate decision scores; produce ROC/PR curves and AUC. Write a SINGLE self-contained Python file (task.py) with these functions: get_task_metadata, set_seed, get_device, make_dataloaders, build_model, train, evaluate, predict, save_artifacts."
+python CodeAgent/mini_claude_codev4.py --goal "Implement ML Task: SVM (Score Calibration + ROC/PR). Description: Calibrate decision scores; produce ROC/PR curves and AUC. Write a SINGLE self-contained Python file (task.py) with these functions: get_task_metadata, set_seed, get_device, make_dataloaders, build_model, train, evaluate, predict, save_artifacts."
 
-python CodeAgent/mini_claude_codev2.py --goal "Implement Multivariate Linear Regression using torch.autograd. Visualize training. Description: Calibrate decision scores; produce ROC/PR curves and AUC. Write a SINGLE self-contained Python file (task.py) with these functions: get_task_metadata, set_seed, get_device, make_dataloaders, build_model, train, evaluate, predict, save_artifacts."
+python CodeAgent/mini_claude_codev4.py --api-key "myhpcvllmqwen123" --goal "Implement Multivariate Linear Regression using torch.autograd. Visualize training. Description: Calibrate decision scores; produce ROC/PR curves and AUC. Write a SINGLE self-contained Python file (task.py) with these functions: get_task_metadata, set_seed, get_device, make_dataloaders, build_model, train, evaluate, predict, save_artifacts."
 
 """

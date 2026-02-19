@@ -206,22 +206,86 @@ def sanitize_diff_text(diff_text: str) -> str:
     Clean up a diff block extracted from LLM output.
     Removes common LLM artifacts that corrupt patches:
     - Stray ``` fence markers embedded in diff body
-    - HTML tags (<details>, etc.)
-    - Trailing prose after last hunk
+    - Malformed 'index' lines or missing ---/+++ headers
+    - Enforces strict --- before +++ order
     """
     lines = diff_text.split("\n")
     cleaned = []
+    
+    # State tracking for header repair
+    current_file_a = None
+    current_file_b = None
+    seen_header_a = False
+    seen_header_b = False
+    
     for line in lines:
-        # Skip stray fence markers
-        if re.match(r'^```', line.strip()):
+        stripped = line.strip()
+        
+        # 1. Skip stray fence markers
+        if re.match(r'^```', stripped):
             continue
-        # Skip HTML tags
-        if re.match(r'^</?(?:details|summary|br|hr)', line.strip(), re.IGNORECASE):
+            
+        # 2. Skip HTML tags
+        if re.match(r'^</?(?:details|summary|br|hr)', stripped, re.IGNORECASE):
             continue
+        
+        # 3. Handle 'diff --git' header to reset state
+        if line.startswith('diff --git'):
+            m = re.match(r'^diff --git a/(\S+) b/(\S+)', line)
+            if m:
+                current_file_a = m.group(1)
+                current_file_b = m.group(2)
+            else:
+                current_file_a = None
+                current_file_b = None
+            seen_header_a = False
+            seen_header_b = False
+            cleaned.append(line)
+            continue
+            
+        # 4. Handle 'index' lines
+        # Rescuing "index --- a/foo" -> "--- a/foo"
+        if line.startswith('index ---'):
+            line = line.replace('index ---', '---')
+            # Fallthrough to step 5 to process it as a '---' line
+            
+        elif line.startswith('index '):
+            # Just a regular index line (hash..hash), skip it
+            continue
+            
+        # 5. Handle --- (Original file)
+        if line.startswith('--- '):
+            seen_header_a = True
+            m = re.match(r'^--- (?:a/)?(\S+)', line)
+            # If we see a "---" line but it looks like standard text, just keep it.
+            # But usually it is the header.
+            cleaned.append(line)
+            continue
+            
+        # 6. Handle +++ (New file)
+        if line.startswith('+++ '):
+            # CRITICAL: If we see +++ but missed ---, inject --- NOW to preserve order
+            if not seen_header_a and current_file_a:
+                cleaned.append(f"--- a/{current_file_a}")
+                seen_header_a = True
+                
+            seen_header_b = True
+            cleaned.append(line)
+            continue
+            
+        # 7. Handle Hunk Header @@
+        # If we hit @@ and missed headers, inject them (respecting order)
+        if line.startswith('@@ ') and current_file_a and current_file_b:
+            if not seen_header_a:
+                cleaned.append(f"--- a/{current_file_a}")
+                seen_header_a = True
+            if not seen_header_b:
+                cleaned.append(f"+++ b/{current_file_b}")
+                seen_header_b = True
+                
         cleaned.append(line)
     
     result = "\n".join(cleaned)
-    # Ensure trailing newline
     if not result.endswith("\n"):
         result += "\n"
     return result
@@ -1249,7 +1313,11 @@ def plan_tasks(config: AgentConfig, goal: str, notes: str, allowlist: List[str])
     # Regex looks for "Create task.py", "Write script.py", etc.
     if not allowlist:
         # Check for explicit file creation intent in goal
-        m = re.search(r"(?:create|write|implement)\s+(\S+\.py)", goal, re.IGNORECASE)
+        # m = re.search(r"(?:create|write|implement)\s+(\S+\.py)", goal, re.IGNORECASE)
+        
+        # NEW: allows words in between (e.g. "Write a new test.py")
+        # We use dotall to match across newlines and \b to ensure clean filename start
+        m = re.search(r"(?:create|write|implement).*?\b([a-zA-Z0-9_]+\.py)", goal, re.IGNORECASE | re.DOTALL)
         if m:
             filename = m.group(1)
             console.print(f"[green]Goal targets single file ({filename}). Skipping planner.[/green]")
@@ -2146,7 +2214,10 @@ def run_subtask_loop(
     # --- Verification Loop ---
     error_history = []
     
-    for fix_stage in range(3): # 0=Initial, 1=Diff Fix, 2=Rewrite Fix
+    # Increase from 3 to 4 attempts (0=Initial, 1=Diff, 2=Rewrite, 3=Final Rewrite)
+    MAX_RETRIES = 4
+    
+    for fix_stage in range(MAX_RETRIES): 
         
         console.print(f"[blue]Running verification (Stage {fix_stage})...[/blue]")
         code, out = run_shell(verify_cmd, cap=20000)
@@ -2160,7 +2231,7 @@ def run_subtask_loop(
         console.print(f"[red]Verification Failed (exit={code})[/red]")
         error_history.append(f"Stage {fix_stage} Output:\n{out}\n{'-'*20}")
         
-        if fix_stage == 2:
+        if fix_stage == MAX_RETRIES - 1:
             console.print("[bold red]All fix attempts failed. Exiting subtask.[/bold red]")
             save_skill(config, subtask, global_notes, False, out)
             return False
@@ -2532,10 +2603,10 @@ if __name__ == "__main__":
 
 """
 
-python CodeAgent//mini_claude_codev2.py --goal "Implement Univariate Linear Regression using ONLY PyTorch tensors. Do NOT use torch.nn, torch.optim, or autograd. Write everything in a single task.py file with a complete main() that trains, evaluates, and validates."
+python CodeAgent//mini_claude_codev3.py --goal "Implement Univariate Linear Regression using ONLY PyTorch tensors. Do NOT use torch.nn, torch.optim, or autograd. Write everything in a single task.py file with a complete main() that trains, evaluates, and validates."
 
-python CodeAgent/mini_claude_codev2.py --goal "Implement ML Task: SVM (Score Calibration + ROC/PR). Description: Calibrate decision scores; produce ROC/PR curves and AUC. Write a SINGLE self-contained Python file (task.py) with these functions: get_task_metadata, set_seed, get_device, make_dataloaders, build_model, train, evaluate, predict, save_artifacts."
+python CodeAgent/mini_claude_codev3.py --goal "Implement ML Task: SVM (Score Calibration + ROC/PR). Description: Calibrate decision scores; produce ROC/PR curves and AUC. Write a SINGLE self-contained Python file (task.py) with these functions: get_task_metadata, set_seed, get_device, make_dataloaders, build_model, train, evaluate, predict, save_artifacts."
 
-python CodeAgent/mini_claude_codev2.py --goal "Implement Multivariate Linear Regression using torch.autograd. Visualize training. Description: Calibrate decision scores; produce ROC/PR curves and AUC. Write a SINGLE self-contained Python file (task.py) with these functions: get_task_metadata, set_seed, get_device, make_dataloaders, build_model, train, evaluate, predict, save_artifacts."
+python CodeAgent/mini_claude_codev3.py --goal "Implement Multivariate Linear Regression using torch.autograd. Visualize training. Description: Calibrate decision scores; produce ROC/PR curves and AUC. Write a SINGLE self-contained Python file (task.py) with these functions: get_task_metadata, set_seed, get_device, make_dataloaders, build_model, train, evaluate, predict, save_artifacts."
 
 """
