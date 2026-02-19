@@ -19,7 +19,7 @@ torch.manual_seed(42)
 np.random.seed(42)
 
 # Constants
-OUTPUT_DIR = '/Developer/AIserver/output/tasks/mlp_lvl4_hparam_sweep'
+OUTPUT_DIR = 'output/tasks/mlp_lvl4_hparam_sweep'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
@@ -31,7 +31,7 @@ def get_task_metadata() -> Dict[str, Any]:
         'output_dim': 1,
         'description': 'MLP hyperparameter search for regression task',
         'metrics': ['mse', 'r2', 'mae'],
-        'hyperparameters': ['depth', 'width', 'learning_rate', 'weight_decay']
+        'hyperparameters': ['depth', 'width', 'learning_rate', 'weight_decay', 'dropout']
     }
 
 
@@ -53,15 +53,19 @@ def make_dataloaders(
     train_ratio: float = 0.7,
     val_ratio: float = 0.15,
     batch_size: int = 32,
-    noise_std: float = 0.1
+    noise_std: float = 0.05,
+    seed: int | None = 42
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create dataloaders for the regression task.
     Uses a sine wave with noise as the target function.
     """
-    # Generate synthetic data
+    rng = np.random.default_rng(seed)
     X = np.linspace(-3, 3, n_samples)
-    y = np.sin(X) + np.random.randn(n_samples) * noise_std
+    y = np.sin(X) + rng.standard_normal(n_samples) * noise_std
+    indices = rng.permutation(n_samples)
+    X = X[indices]
+    y = y[indices]
     
     # Split data
     n_train = int(n_samples * train_ratio)
@@ -70,6 +74,17 @@ def make_dataloaders(
     X_train, y_train = X[:n_train], y[:n_train]
     X_val, y_val = X[n_train:n_train + n_val], y[n_train:n_train + n_val]
     X_test, y_test = X[n_train + n_val:], y[n_train + n_val:]
+    
+    x_mean, x_std = X_train.mean(), X_train.std() + 1e-8
+    y_mean, y_std = y_train.mean(), y_train.std() + 1e-8
+    
+    X_train = (X_train - x_mean) / x_std
+    X_val = (X_val - x_mean) / x_std
+    X_test = (X_test - x_mean) / x_std
+    
+    y_train = (y_train - y_mean) / y_std
+    y_val = (y_val - y_mean) / y_std
+    y_test = (y_test - y_mean) / y_std
     
     # Convert to tensors
     X_train_t = torch.FloatTensor(X_train).unsqueeze(1)
@@ -304,6 +319,18 @@ def predict(
     
     return outputs.cpu().numpy()
 
+def to_jsonable(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [to_jsonable(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [to_jsonable(v) for v in obj]
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().tolist()
+    return obj
 
 def save_artifacts(
     model: nn.Module,
@@ -322,17 +349,17 @@ def save_artifacts(
     # Save history
     history_path = os.path.join(output_dir, 'history.json')
     with open(history_path, 'w') as f:
-        json.dump(history, f, indent=2)
+        json.dump(to_jsonable(history), f, indent=2)
     
     # Save metrics
     metrics_path = os.path.join(output_dir, 'metrics.json')
     with open(metrics_path, 'w') as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(to_jsonable(metrics), f, indent=2)
     
     # Save best config
     config_path = os.path.join(output_dir, 'config.json')
     with open(config_path, 'w') as f:
-        json.dump(best_config, f, indent=2)
+        json.dump(to_jsonable(best_config), f, indent=2)
     
     # Save training plot
     plot_path = os.path.join(output_dir, 'training_plot.png')
@@ -364,7 +391,7 @@ def hyperparameter_search(
     search_type: str = 'grid',
     n_iterations: int = 10,
     device: torch.device = None
-) -> Tuple[Dict[str, Any], Dict[str, Any], nn.Module]:
+) -> Tuple[Dict[str, Any], Dict[str, Any], nn.Module, Dict[str, List[float]]]:
     """
     Perform hyperparameter search over depth, width, learning_rate, weight_decay.
     Returns best config, metrics, and model.
@@ -376,10 +403,11 @@ def hyperparameter_search(
     depth_options = [2, 3, 4]
     width_options = [32, 64, 128]
     lr_options = [0.001, 0.01]
-    weight_decay_options = [0.0, 0.0001, 0.001]
+    weight_decay_options = [0.0, 0.0001, 0.001, 0.01]
+    dropout_options = [0.0, 0.1, 0.2]
     
     # Create dataloaders
-    train_loader, val_loader, _ = make_dataloaders(n_samples=800, batch_size=32)
+    train_loader, val_loader, _ = make_dataloaders(n_samples=800, batch_size=32, seed=42)
     
     best_config = None
     best_val_r2 = float('-inf')
@@ -394,12 +422,14 @@ def hyperparameter_search(
             for width in width_options:
                 for lr in lr_options:
                     for wd in weight_decay_options:
-                        configs.append({
-                            'depth': depth,
-                            'width': width,
-                            'learning_rate': lr,
-                            'weight_decay': wd
-                        })
+                        for dropout in dropout_options:
+                            configs.append({
+                                'depth': depth,
+                                'width': width,
+                                'learning_rate': lr,
+                                'weight_decay': wd,
+                                'dropout': dropout
+                            })
     else:
         # Random search
         np.random.seed(42)
@@ -409,7 +439,8 @@ def hyperparameter_search(
                 'depth': np.random.choice(depth_options),
                 'width': np.random.choice(width_options),
                 'learning_rate': np.random.choice(lr_options),
-                'weight_decay': np.random.choice(weight_decay_options)
+                'weight_decay': np.random.choice(weight_decay_options),
+                'dropout': np.random.choice(dropout_options)
             })
     
     print(f"Searching over {len(configs)} configurations...")
@@ -422,7 +453,8 @@ def hyperparameter_search(
             input_dim=1,
             output_dim=1,
             depth=config['depth'],
-            width=config['width']
+            width=config['width'],
+            dropout=config['dropout']
         )
         
         # Train
@@ -465,6 +497,7 @@ def hyperparameter_search(
             'width': config['width'],
             'learning_rate': config['learning_rate'],
             'weight_decay': config['weight_decay'],
+            'dropout': config['dropout'],
             'val_mse': metrics['mse'],
             'val_r2': metrics['r2'],
             'val_mae': metrics['mae']
@@ -479,7 +512,7 @@ def hyperparameter_search(
         'best_val_r2': best_val_r2
     }
     
-    return best_config, metrics, best_model
+    return best_config, metrics, best_model, best_history
 
 
 def main():
@@ -497,7 +530,7 @@ def main():
     print("Starting Hyperparameter Search...")
     print("-" * 60)
     
-    best_config, metrics, best_model = hyperparameter_search(
+    best_config, metrics, best_model, best_history = hyperparameter_search(
         search_type='grid',
         device=device
     )
@@ -509,7 +542,7 @@ def main():
     print(f"Best Validation R2: {metrics['best_val_r2']:.4f}")
     
     # Create dataloaders for final evaluation
-    train_loader, val_loader, test_loader = make_dataloaders(n_samples=1000, batch_size=32)
+    train_loader, val_loader, test_loader = make_dataloaders(n_samples=1000, batch_size=32, seed=42)
     
     # Evaluate on train set
     print("\n" + "-" * 60)
@@ -526,8 +559,8 @@ def main():
     print("-" * 60)
     val_metrics = evaluate(best_model, val_loader, device)
     print(f"Val MSE: {val_metrics['mse']:.6f}")
-   ```python
-print(f"Val R2: {val_metrics['r2']:.4f}")
+
+    print(f"Val R2: {val_metrics['r2']:.4f}")
     print(f"Val MAE: {val_metrics['mae']:.6f}")
     
     # Evaluate on test set
@@ -546,5 +579,54 @@ print(f"Val R2: {val_metrics['r2']:.4f}")
     save_artifacts(best_model, best_history, best_config, metrics)
     
     print("\n" + "=" * 60)
-    print("Task Complete!")
+    print("FINAL RESULTS")
     print("=" * 60)
+    print(f"\nTrain MSE: {train_metrics['mse']:.4f}")
+    print(f"Val MSE:   {val_metrics['mse']:.4f}")
+    print(f"Test MSE:  {test_metrics['mse']:.4f}")
+    print(f"Train R²:  {train_metrics['r2']:.4f}")
+    print(f"Val R²:    {val_metrics['r2']:.4f}")
+    print(f"Test R²:   {test_metrics['r2']:.4f}")
+    
+    print("\nQuality Checks:")
+    checks_passed = True
+    
+    check1 = train_metrics['r2'] > 0.8
+    print(f"  {'✓' if check1 else '✗'} Train R² > 0.8: {train_metrics['r2']:.4f}")
+    checks_passed = checks_passed and check1
+    
+    check2 = val_metrics['r2'] > 0.7
+    print(f"  {'✓' if check2 else '✗'} Val R² > 0.7: {val_metrics['r2']:.4f}")
+    checks_passed = checks_passed and check2
+    
+    check3 = test_metrics['r2'] > 0.7
+    print(f"  {'✓' if check3 else '✗'} Test R² > 0.7: {test_metrics['r2']:.4f}")
+    checks_passed = checks_passed and check3
+    
+    check4 = val_metrics['mse'] < 1.0
+    print(f"  {'✓' if check4 else '✗'} Val MSE < 1.0: {val_metrics['mse']:.4f}")
+    checks_passed = checks_passed and check4
+    
+    r2_diff = abs(train_metrics['r2'] - val_metrics['r2'])
+    check5 = r2_diff < 0.15
+    print(f"  {'✓' if check5 else '✗'} R² difference < 0.15: {r2_diff:.4f}")
+    checks_passed = checks_passed and check5
+    
+    loss_decreased = best_history['train_loss'][-1] < best_history['train_loss'][0]
+    check6 = loss_decreased
+    print(f"  {'✓' if check6 else '✗'} Loss decreased: {best_history['train_loss'][0]:.4f} -> {best_history['train_loss'][-1]:.4f}")
+    checks_passed = checks_passed and check6
+    
+    print("\n" + "=" * 60)
+    if checks_passed:
+        print("PASS: All quality checks passed!")
+        print("=" * 60)
+        return 0
+    else:
+        print("FAIL: Some quality checks failed!")
+        print("=" * 60)
+        return 1
+
+if __name__ == '__main__':
+    exit_code = main()
+    sys.exit(exit_code)
