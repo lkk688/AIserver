@@ -580,12 +580,10 @@ def main():
     print("Training Complete!")
     print("=" * 60)
     
-    return {
-        'train_metrics': train_metrics,
-        'val_metrics': val_metrics,
-        'quality_passed': quality_passed
-    }
+    if quality_passed:
+        return 0
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
