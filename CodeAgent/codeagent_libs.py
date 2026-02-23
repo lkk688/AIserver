@@ -117,7 +117,7 @@ def query_model_context_length(client: OpenAI, model_name: str) -> int:
 
 
 def compute_safe_max_tokens(input_tokens: int, model_max_context: int, desired_max_output: int,
-                            safety_margin: int = 200, min_output: int = 1024) -> int:
+                            safety_margin: int = 1000, min_output: int = 1024) -> int:
     """
     Compute the largest safe max_tokens value that won't exceed the model's context limit.
     
@@ -131,10 +131,12 @@ def compute_safe_max_tokens(input_tokens: int, model_max_context: int, desired_m
     Returns:
         Clamped max_tokens value, or min_output if budget is very tight.
     """
-    available = model_max_context - input_tokens - safety_margin
+    # Qwen/other tokenizer density can be ~10% higher than cl100k_base (used for est.)
+    adjusted_input = int(input_tokens * 1.1)
+    available = model_max_context - adjusted_input - safety_margin
     if available < min_output:
         console.print(f"[red]Context budget very tight: {available} tokens available "
-                      f"(input={input_tokens}, limit={model_max_context}). "
+                      f"(est_input={input_tokens} -> {adjusted_input}, limit={model_max_context}). "
                       f"Clamping to min={min_output}.[/red]")
         return min_output
     safe = min(desired_max_output, available)
