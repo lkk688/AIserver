@@ -110,6 +110,7 @@ class AgentConfig:
     provider: str = "openai"
     sandbox_container: Optional[str] = None
     rl_mode: bool = False
+    max_retries: int = 4
 
 
 # ---------------------------
@@ -306,7 +307,8 @@ def complete_with_continuation(
     temperature: float = 0.2,
     max_output_tokens: int = 4096,
     model_max_context: int = 16384,
-    provider: str = "openai"
+    provider: str = "openai",
+    session_dir: Optional[Path] = None
 ) -> str:
     """
     Calls the LLM. If finish_reason is 'length', appends the partial response
@@ -340,6 +342,7 @@ def complete_with_continuation(
         
         # Retry with backoff on API errors
         resp = None
+        start_time = time.time()
         for attempt in range(3):
             try:
                 if provider == "anthropic":
@@ -373,32 +376,52 @@ def complete_with_continuation(
                     continue
                 break
         
-        console.print(f"[debug] Raw response object type: {type(resp)}")
-        
-        if resp is None:
-            console.print(f"[red]All LLM retry attempts failed.[/red]")
-            break
-            
-        
         # Custom Environment Handling: If client returns a string, use it directly
         if isinstance(resp, str):
             full_content += resp
             break
 
+        usage_info = {}
         if provider == "anthropic":
-            console.print(f"[dim]Finish Reason: {resp.stop_reason}[/dim]")
+            # Anthropic completion
             content = resp.content[0].text
             finish_reason = resp.stop_reason
             if finish_reason == "max_tokens":
                 finish_reason = "length"
+            if hasattr(resp, 'usage'):
+                usage_info = {"prompt_tokens": resp.usage.input_tokens, "completion_tokens": resp.usage.output_tokens}
         else:
             choice = resp.choices[0]
-            console.print(f"[dim]Finish Reason: {choice.finish_reason}[/dim]")
             content = choice.message.content or ""
             finish_reason = choice.finish_reason
+            if hasattr(resp, 'usage') and resp.usage:
+                usage_info = {"prompt_tokens": resp.usage.prompt_tokens, "completion_tokens": resp.usage.completion_tokens}
         
-        console.print(f"[debug] Extracted content length: {len(content)}")
-        console.print(f"[debug] Extracted content preview (first 100): {content[:100]}")
+        elapsed = time.time() - start_time
+        
+        # Fallback to estimate if usage not provided
+        if not usage_info:
+            usage_info["prompt_tokens"] = input_est
+            usage_info["completion_tokens"] = estimate_tokens(content)
+            
+        total_tokens = usage_info["prompt_tokens"] + usage_info["completion_tokens"]
+        tok_speed = usage_info["completion_tokens"] / elapsed if elapsed > 0 else 0
+        
+        console.print(f"[bold blue][LLM][/bold blue] [dim]{usage_info['prompt_tokens']} prompt, {usage_info['completion_tokens']} completion tokens | {tok_speed:.1f} tok/s | {elapsed:.1f}s[/dim]")
+        
+        if session_dir:
+            from CodeAgent.codeagent_libs import write_jsonl, now_stamp
+            usage_log = session_dir / "llm_usage.json"
+            record = {
+                "timestamp": now_stamp(),
+                "model": model,
+                "elapsed_sys": elapsed,
+                "prompt_tokens": usage_info["prompt_tokens"],
+                "completion_tokens": usage_info["completion_tokens"],
+                "total_tokens": total_tokens,
+                "tok_per_sec": tok_speed
+            }
+            write_jsonl(usage_log, record)
         
         # --- Robust Stitching Logic ---
         # If this is a continuation (loop > 0), filter out conversational prefixes.
@@ -930,7 +953,7 @@ def run_subtask_loop(
     """
     skill_dir = config.agent_dir / "skilldb"
     turn_base = subtask_idx * 10
-    console.rule(f"Executing Sub-task {subtask_idx+1}: {subtask}")
+    console.print(f"\n[bold green]=== Task {subtask_idx+1} ===[/bold green] [dim]{subtask}[/dim]")
 
     def get_turn_dir(offset: int) -> Path:
         d = config.session_dir / f"{turn_base + offset:04d}"
@@ -944,7 +967,7 @@ def run_subtask_loop(
     # =========================================================================
     # PHASE 1: GENERATION
     # =========================================================================
-    console.print("[bold cyan]Phase 1: Generating Code[/bold cyan]")
+    console.print("[cyan]-> Write Code[/cyan]")
     turn_dir = get_turn_dir(0)
     
     # 1. Prepare Prompt
@@ -964,14 +987,14 @@ def run_subtask_loop(
     add_rl_msg("user", prompt_md)
 
     # 2. Call Model
-    console.print("[cyan]Generating solution...[/cyan]")
     content = complete_with_continuation(
         config.client, config.model,
         [{"role": "system", "content": PromptRegistry.SYSTEM}, 
          {"role": "user", "content": prompt_md}],
         max_output_tokens=config.max_output,
         model_max_context=config.model_max_context,
-        provider=config.provider
+        provider=config.provider,
+        session_dir=config.session_dir
     )
     (turn_dir / "response.md").write_text(content, encoding="utf-8")
     add_rl_msg("assistant", content)
@@ -1005,12 +1028,10 @@ def run_subtask_loop(
         console.print("[red]Failed to apply generated code. Stopping.[/red]")
         save_rl_trajectory(config, subtask_idx, -1.0, rl_messages)
         return False
-    console.print("[green]Code generated and applied.[/green]")
-
     # =========================================================================
     # PHASE 2: VERIFICATION & FIX
     # =========================================================================
-    console.print("[bold cyan]Phase 2: Verification[/bold cyan]")
+    console.print("[cyan]-> Verification[/cyan]")
     
     # Check for explicit verification command in output
     auto_verify_cmd = None
@@ -1030,12 +1051,12 @@ def run_subtask_loop(
     # --- Verification Loop ---
     error_history = []
     
-    # Increase from 3 to 4 attempts (0=Initial, 1=Diff, 2=Rewrite, 3=Final Rewrite)
-    MAX_RETRIES = 4
+    # Use configured max retries (default 8 in rl-mode, 4 otherwise)
+    MAX_RETRIES = config.max_retries
     
     for fix_stage in range(MAX_RETRIES): 
         
-        console.print(f"[blue]Running verification (Stage {fix_stage})...[/blue]")
+        console.print(f"[dim]  Running verification (Stage {fix_stage})...[/dim]")
         code, out = run_shell(verify_cmd, cap=20000, sandbox_container=config.sandbox_container)
         
         # --- Auto-Install Missing Modules ---
@@ -1056,7 +1077,7 @@ def run_subtask_loop(
             save_rl_trajectory(config, subtask_idx, 1.0, rl_messages)
             return True
         
-        console.print(f"[red]Verification Failed (exit={code})[/red]")
+        console.print(f"[red]  Verification Failed (exit={code})[/red]")
         error_history.append(f"Stage {fix_stage} Output:\n{out}\n{'-'*20}")
         
         if fix_stage == MAX_RETRIES - 1:
@@ -1081,7 +1102,7 @@ def run_subtask_loop(
 
         if fix_stage < 2 or config.rl_mode:
             # STRATEGY 1: INTERACTIVE DEBUG TOOL LOOP
-            console.print("[yellow]Attempting Fix 1: Interactive Debugging...[/yellow]")
+            console.print("[yellow]-> Debug[/yellow]")
             
             if config.rl_mode:
                 fix_prompt = extract_error_context_rl(str(target_file), current_code, out)
@@ -1108,12 +1129,11 @@ def run_subtask_loop(
             for tool_turn in range(MAX_TOOL_TURNS):
                 (turn_dir / f"prompt_turn_{tool_turn}.md").write_text(messages[-1]["content"], encoding="utf-8")
                 add_rl_msg(messages[-1]["role"], messages[-1]["content"])
-                
-                console.print(f"[cyan]Agent thinking (Tool Turn {tool_turn+1}/{MAX_TOOL_TURNS})...[/cyan]")
                 resp_content = complete_with_continuation(
                     config.client, config.model,
                     messages, max_output_tokens=config.max_output,
-                    model_max_context=config.model_max_context, provider=config.provider
+                    model_max_context=config.model_max_context, provider=config.provider,
+                    session_dir=config.session_dir
                 )
                 
                 (turn_dir / f"response_turn_{tool_turn}.md").write_text(resp_content, encoding="utf-8")
@@ -1154,7 +1174,7 @@ def run_subtask_loop(
 
         if not config.rl_mode and (fix_stage >= 2 or force_rewrite):
             # STRATEGY 2: FULL REWRITE (Only after 2 diff-based debugging attempts fail)
-            console.print("[yellow]Attempting Fix 2: Full Rewrite (Accumulated Errors)...[/yellow]")
+            console.print("[yellow]-> Full Rewrite Fallback[/yellow]")
             
             fallback_errors = "\n".join(error_history[-2:])[-6000:]
             debug_context = build_debug_prompt(fallback_errors)
@@ -1168,15 +1188,14 @@ def run_subtask_loop(
             )
 
             (turn_dir / "prompt.md").write_text(fix_prompt, encoding="utf-8")
-
-            console.print("[cyan]Generating fix...[/cyan]")
             fix_content = complete_with_continuation(
                 config.client, config.model,
                 [{"role": "system", "content": PromptRegistry.SYSTEM}, 
                  {"role": "user", "content": fix_prompt}],
                 max_output_tokens=config.max_output,
                 model_max_context=config.model_max_context,
-                provider=config.provider
+                provider=config.provider,
+                session_dir=config.session_dir
             )
             (turn_dir / "response.md").write_text(fix_content, encoding="utf-8")
             add_rl_msg("assistant", fix_content)
@@ -1327,6 +1346,7 @@ def main():
     parser.add_argument("--provider", default="openai", help="LLM Provider: openai or anthropic")
     parser.add_argument("--sandbox-container", default=None, help="Name of the docker container to use as sandbox")
     parser.add_argument("--rl-mode", action="store_true", help="Enable strict reinforcement learning mode (no prompt scaffolding on debug, logs full trajectories)")
+    parser.add_argument("--max-retries", type=int, default=None, help="Max retries for verification (default 8 in rl-mode, 4 otherwise)")
     
     args = parser.parse_args()
 
@@ -1382,6 +1402,8 @@ def main():
     session_dir = agent_dir / "sessions" / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
 
+    eff_max_retries = args.max_retries if args.max_retries is not None else (8 if args.rl_mode else 4)
+
     config = AgentConfig(
         client=client,
         model=args.model,
@@ -1394,6 +1416,7 @@ def main():
         provider=args.provider,
         sandbox_container=args.sandbox_container,
         rl_mode=args.rl_mode,
+        max_retries=eff_max_retries,
     )
 
     console.print(Panel(
