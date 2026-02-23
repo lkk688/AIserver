@@ -5,9 +5,11 @@ import json
 import time
 import hashlib
 import subprocess
+import ast
+import fnmatch
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 
 from rich.console import Console
 from rich.prompt import Prompt, Confirm
@@ -17,6 +19,8 @@ try:
     import tiktoken
 except ImportError:
     tiktoken = None
+
+console = Console()
 
 # ---------------------------
 # Utilities
@@ -145,12 +149,42 @@ def ensure_dirs(base_dir: Path):
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text("", encoding="utf-8")
 
-def run_shell(cmd: str, cwd: Optional[str] = None, cap: int = 20000) -> Tuple[int, str]:
-    p = subprocess.run(cmd, shell=True, text=True, capture_output=True, cwd=cwd)
-    out = (p.stdout or "") + (p.stderr or "")
+def run_shell(cmd: str, cwd: Optional[str] = None, cap: int = 20000, 
+              timeout: Optional[int] = 1200, sandbox_container: Optional[str] = None) -> Tuple[int, str]:
+    if sandbox_container:
+        if cwd:
+            cmd_to_run = f'docker exec -i -w "{cwd}" {sandbox_container} /bin/bash -c {cmd!r}'
+        else:
+            cmd_to_run = f'docker exec -i {sandbox_container} /bin/bash -c {cmd!r}'
+    else:
+        cmd_to_run = cmd
+
+    start_time = time.time()
+    try:
+        p = subprocess.run(
+            cmd_to_run, 
+            shell=True, 
+            text=True, 
+            capture_output=True, 
+            cwd=cwd if not sandbox_container else None, 
+            timeout=timeout
+        )
+        code = p.returncode
+        out = (p.stdout or "") + (p.stderr or "")
+    except subprocess.TimeoutExpired as e:
+        code = 124
+        out = (e.stdout or "") + (e.stderr or "")
+        out += f"\n[Error] Command timed out after {timeout} seconds!"
+    except Exception as e:
+        code = 1
+        out = f"[Error] Failed to execute command: {e}"
+
+    elapsed = time.time() - start_time
+    out += f"\n[Execution Time: {elapsed:.2f}s]"
+
     if len(out) > cap:
         out = out[-cap:]
-    return p.returncode, out
+    return code, out
 
 def is_git_repo() -> bool:
     code, _ = run_shell("git rev-parse --is-inside-work-tree")
@@ -173,6 +207,123 @@ def read_file(path: str, max_chars: int = 64000) -> str:
         return data[:max_chars] + "\n\n[TRUNCATED]\n"
     return data
 
+# ---------------------------
+# Custom Exploration Tools
+# ---------------------------
+
+def _is_binary(file_path: Path) -> bool:
+    if not file_path.exists():
+        return True # Treat missing/broken as binary to skip
+    try:
+        with open(file_path, 'tr') as f:
+            f.read(1024)
+            return False
+    except UnicodeDecodeError:
+        return True
+
+def search_code(query: str, root_dir: str = ".") -> str:
+    """
+    Search for a text query across all non-binary, non-hidden files.
+    Format: <filepath>:<line_number>: <content>
+    Truncates at 50 matches.
+    """
+    results = []
+    root = Path(root_dir).resolve()
+    
+    for root_path_str, dirs, files in os.walk(root):
+        # Clean dirs in-place to prevent walking into them
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("__pycache__", "node_modules", "site-packages", "venv", "env", ".venv")]
+        
+        root_path = Path(root_path_str)
+        for file in files:
+            if file.startswith("."):
+                continue
+            
+            path = root_path / file
+            
+            # Skip massive files (e.g. > 1MB) to prevent freezing
+            try:
+                if path.stat().st_size > 1024 * 1024:
+                    continue
+            except Exception:
+                pass
+                
+            if _is_binary(path):
+                continue
+                
+            try:
+                with path.open("r", encoding="utf-8", errors="ignore") as f:
+                    for i, line in enumerate(f, start=1):
+                        if query in line:
+                            rel_path = path.relative_to(root)
+                            results.append(f"{rel_path}:{i}: {line.rstrip()}")
+                            if len(results) >= 50:
+                                break
+            except Exception:
+                pass
+                
+            if len(results) >= 50:
+                break
+                
+        if len(results) >= 50:
+            results.append("Warning: Too many matches (>50). Showing first 50. Please refine your search.")
+            break
+            
+    if not results:
+        return "No matches found."
+    return "\n".join(results)
+
+def find_file(filename_pattern: str, root_dir: str = ".") -> str:
+    """
+    Find files by name using glob fuzzy matching.
+    """
+    results = []
+    root = Path(root_dir).resolve()
+    pattern = filename_pattern.lower()
+    
+    for root_path_str, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("__pycache__", "node_modules", "site-packages", "venv", "env", ".venv")]
+        
+        root_path = Path(root_path_str)
+        for file in files:
+            if file.startswith("."):
+                continue
+                
+            if fnmatch.fnmatch(file.lower(), f"*{pattern}*"):
+                path = root_path / file
+                results.append(str(path.relative_to(root)))
+                
+    if not results:
+        return "No matching files found."
+    return "\n".join(results)
+
+def view_file_content(filepath: str, start_line: int, end_line: int) -> str:
+    """
+    Read a specific range of lines from a file, adding line numbers.
+    """
+    try:
+        if not os.path.exists(filepath):
+            return f"[Error] File not found: {filepath}"
+            
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+            
+        if start_line < 1:
+            start_line = 1
+        if end_line > len(lines):
+            end_line = len(lines)
+            
+        if start_line > end_line:
+            return f"[Error] Invalid range: start_line ({start_line}) > end_line ({end_line})"
+            
+        result = [f"--- {filepath} (Lines {start_line}-{end_line}) ---"]
+        for i in range(start_line - 1, end_line):
+            result.append(f"{i+1:4d} | {lines[i].rstrip()}")
+            
+        return "\n".join(result)
+        
+    except Exception as e:
+        return f"[Error] Could not read file {filepath}: {e}"
 def top_level_tree(max_items: int = 200) -> str:
     items = []
     try:
@@ -409,6 +560,7 @@ def extract_write_file_actions(text: str) -> List[Tuple[str, str]]:
     
     # 6. Terminator Group:
     #    - CONTENT>{2,3}        -> Normal closer (>>> or >>)
+    #    - <<<CONTENT\s*$       -> Hallucinated closer
     #    - (?=\n.*?WRITE_FILE:) -> Lookahead: Next file starts
     #    - (?=\ndiff --git)     -> Lookahead: Diff starts
     #    - (?=\n\#\#\s)         -> Lookahead: Markdown header (e.g. ## Reasoning)
@@ -419,7 +571,7 @@ def extract_write_file_actions(text: str) -> List[Tuple[str, str]]:
         r'(?:^|\n)(?!\-).*?WRITE_FILE:\s*(\S+).*?\n'  # Header (safe from diffs)
         r'\s*<<<CONTENT\n'                            # Start Tag
         r'(.*?)'                                      # Content Capture
-        r'(?:CONTENT>{2,3}|(?=\n.*?WRITE_FILE:)|(?=\ndiff --git)|(?=\n\#\#\s)|(?=\n```)|$)', # Robust Terminator
+        r'(?:CONTENT>{2,3}|<<<CONTENT\s*$|(?=\n.*?WRITE_FILE:)|(?=\ndiff --git)|(?=\n\#\#\s)|(?=\n```)|$)', # Robust Terminator
         re.DOTALL
     )
     
@@ -427,9 +579,10 @@ def extract_write_file_actions(text: str) -> List[Tuple[str, str]]:
         filepath = m.group(1).strip()
         content = m.group(2)
         
-        # Post-processing: Strip "CONTENT>>>" manually if regex captured it due to whitespace
-        if "CONTENT>>>" in content:
-            content = content.replace("CONTENT>>>", "")
+        # Post-processing: Strip accidentally captured closers
+        for strip_tag in ["CONTENT>>>", "<<<CONTENT"]:
+            if strip_tag in content:
+                content = content.replace(strip_tag, "")
         
         # Post-processing checks
         
@@ -1055,7 +1208,7 @@ def _determine_verify_cmd(
     allowlist: List[str], 
     modified_files: List[str], 
     auto_verify_cmd: Optional[str], 
-    config: AgentConfig
+    config: Any
 ) -> str:
     """
     Determine the verification command.
@@ -1192,7 +1345,7 @@ def score_skill(skill: Skill, query: str) -> int:
     
     return s
 
-def select_relevant_skills(goal_and_notes: str, skill_dir: Path, topk: int = SKILL_INJECT_TOPK) -> List[Skill]:
+def select_relevant_skills(goal_and_notes: str, skill_dir: Path, topk: int = 6) -> List[Skill]:
     skills = load_skills(skill_dir)
     scored = [(score_skill(sk, goal_and_notes), sk) for sk in skills]
     # Sort by score desc
@@ -1223,122 +1376,14 @@ def format_skill_injection(skills: List[Skill]) -> str:
         
     return "\n".join(lines).strip() + "\n"
 
-def extract_skill_insight(
-    client: OpenAI, 
-    model: str, 
-    goal: str, 
-    success: bool, 
-    evidence: str
-) -> Skill:
-    """
-    Uses the LLM to distill the execution result into a concise Skill.
-    """
-    outcome = "SUCCESS" if success else "FAILURE"
-    prompt = (
-        f"Analyze this CodeAgent execution ({outcome}).\n"
-        f"Goal: {goal}\n"
-        f"Evidence/Output:\n{evidence[:2000]}\n\n"
-        f"Extract a SINGLE, concise 'Skill' or 'Insight' to help future agents avoid this failure or repeat this success.\n"
-        f"Return ONLY a JSON object with these keys:\n"
-        f"- category: One of [PyTorch, NumPy, Syntax, Logic, API, General]\n"
-        f"- pattern: A short trigger keyword/phrase (e.g. 'conv2d', 'plot', 'json.load')\n"
-        f"- insight: A concise rule (max 15 words). E.g. 'Use .detach().cpu() before plotting tensors.'\n"
-    )
-    
-    try:
-        # Use valid messages format for complete_with_continuation
-        messages = [
-            {"role": "system", "content": "You are an expert developer extracting coding insights."},
-            {"role": "user", "content": prompt}
-        ]
-        
-        # Use the robust completion helper
-        content = complete_with_continuation(
-            client, model, messages, 
-            max_output_tokens=200,
-            model_max_context=4000
-        )
-        
-        # Strip markdown fences if present
-        content = content.strip()
-        if content.startswith("```"):
-            content = re.sub(r"^```json\s*|```$", "", content).strip()
-            
-        # JSON extraction heuristic (find first { and last })
-        json_start = content.find('{')
-        json_end = content.rfind('}')
-        if json_start != -1 and json_end != -1:
-             content = content[json_start:json_end+1]
 
-        data = json.loads(content)
-        return Skill(
-            category=data.get("category", "General"),
-            pattern=data.get("pattern", "general"),
-            insight=data.get("insight", "Always check outputs."),
-            evidence=evidence[:500],
-            created_at=now_stamp()
-        )
-    except Exception as e:
-        console.print(f"[yellow]Failed to extract insight: {e}[/yellow]")
-        console.print(f"[dim]Raw content: {content[:200]}...[/dim]")
-        # Fallback
-        return Skill(
-            category="General",
-            pattern="general",
-            insight=f"Review output for {outcome} details.",
-            evidence=evidence[:500],
-            created_at=now_stamp()
-        )
-
-def save_skill(config: AgentConfig, goal: str, notes: str, success: bool, evidence: str):
-    """Save the session outcome to the SkillDB (new structured format)."""
-    # Only save if there's meaningful evidence
-    if not evidence.strip():
-        return
-
-    # Use a unified skills file for v2
-    skill_file = config.agent_dir / "skilldb" / "skills.jsonl"
-    
-    # 1. Extract Insight
-    console.print("[cyan]Extracting experience insight...[/cyan]")
-    skill = extract_skill_insight(config.client, config.model, goal, success, evidence)
-    
-    # 2. Load existing to deduplicate
-    current_skills = []
-    if skill_file.exists():
-        for line in skill_file.read_text(errors="ignore").splitlines():
-            try: current_skills.append(json.loads(line))
-            except: pass
-            
-    # 3. Check for duplicates (same insight + category)
-    found = False
-    for existing in current_skills:
-        if (existing.get("category") == skill.category and 
-            existing.get("insight") == skill.insight):
-            existing["count"] = existing.get("count", 1) + 1
-            existing["evidence"] = skill.evidence # Update with latest evidence
-            existing["created_at"] = now_stamp()
-            found = True
-            console.print(f"[green]Updated existing skill: [{skill.category}] {skill.insight}[/green]")
-            break
-            
-    if not found:
-        current_skills.append(asdict(skill))
-        console.print(f"[green]Saved new skill: [{skill.category}] {skill.insight}[/green]")
-        
-    # 4. Write back
-    with open(skill_file, "w", encoding="utf-8") as f:
-        for s in current_skills:
-            f.write(json.dumps(s) + "\n")
-
-
-def detect_tech_stack(goal: str, allowlist: List[str]) -> str:
+def detect_tech_stack(goal: str, allowlist: List[str], skill_teacher_path: Path = None) -> str:
     """
     Heuristics to detect the tech stack (PyTorch, NumPy, etc.) 
     and return strict 'Teacher Guidelines' to prevent common runtime errors.
     Loads guidelines from SKILL_TEACHER (teacher.jsonl).
     """
-    if not SKILL_TEACHER.exists():
+    if not skill_teacher_path or not skill_teacher_path.exists():
         return ""
 
     goal_lower = goal.lower()
@@ -1349,7 +1394,7 @@ def detect_tech_stack(goal: str, allowlist: List[str]) -> str:
     try:
         # Load teacher guidelines from JSONL
         # Format: {"category": "...", "triggers": [...], "header": "...", "guidelines": [...]}
-        with open(SKILL_TEACHER, "r", encoding="utf-8") as f:
+        with open(skill_teacher_path, "r", encoding="utf-8") as f:
             for line in f:
                 if not line.strip(): continue
                 try:
@@ -1376,3 +1421,167 @@ def detect_tech_stack(goal: str, allowlist: List[str]) -> str:
     if guidelines:
         return "\n".join(guidelines).strip()
     return ""
+
+def error_code_extraction(source_code: str, error_message: str = "") -> str:
+    """
+    Analyzes Python code for syntax errors using AST or extracts error context based on a provided traceback.
+    Returns the numbered lines of code around the error for the LLM.
+    """
+    error_lines = set()
+
+    # 1. Parse traceback for line numbers if provided
+    if error_message:
+        matches = re.finditer(r'line (\d+)', error_message)
+        for match in matches:
+            error_lines.add(int(match.group(1)))
+
+    # 2. Try parsing AST for syntax errors
+    try:
+        ast.parse(source_code)
+    except SyntaxError as e:
+        if e.lineno:
+            error_lines.add(e.lineno)
+            if not error_message:
+                error_message = f"SyntaxError: {e.msg} at line {e.lineno}"
+    except Exception as e:
+        pass # Other parsing errors ignored
+    
+    # 3. If no specific lines found, but there's an error
+    if not error_lines:
+        if error_message:
+            return f"Error: {error_message}\n(No specific line numbers found in traceback)"
+        return "No syntax errors detected."
+
+    # 4. Format result
+    result = []
+    if error_message:
+        result.append(f"Error Information:\n{error_message}\n")
+    else:
+        result.append("Error Information:\nSyntax Error detected.\n")
+        
+    result.append("Code Context:")
+    # Use robust snippet extractor
+    snippets = _extract_snippets_from_string(source_code, error_lines, window=5)
+    result.append(snippets)
+        
+    return "\n".join(result)
+
+def build_debug_prompt(traceback_str: str, window_size: int = 15, root_dir: str = ".") -> str:
+    """
+    Automatically extracts file skeletons and context from errors to build high-quality LLM prompts.
+    """
+    tb_pattern = re.compile(r'File\s+"([^"]+)",\s+line\s+(\d+)')
+    error_locations: Dict[str, Set[int]] = {}
+    
+    for match in tb_pattern.finditer(traceback_str):
+        filepath = match.group(1)
+        line_num = int(match.group(2))
+        
+        abs_path = os.path.abspath(filepath)
+        abs_root = os.path.abspath(root_dir)
+        if not abs_path.startswith(abs_root) or "site-packages" in abs_path:
+            continue
+            
+        if os.path.exists(filepath) and os.path.isfile(filepath):
+            if filepath not in error_locations:
+                error_locations[filepath] = set()
+            error_locations[filepath].add(line_num)
+
+    prompt_parts = []
+    prompt_parts.append("# Debug Task\n")
+    prompt_parts.append("## Error Traceback\n```text\n" + traceback_str.strip() + "\n```\n")
+
+    for filepath, lines in error_locations.items():
+        rel_path = os.path.relpath(filepath, root_dir)
+        prompt_parts.append(f"## Context for `{rel_path}`\n")
+        
+        prompt_parts.append("### File Map (Structure)\n```python")
+        prompt_parts.append(_generate_ast_map_from_file(filepath))
+        prompt_parts.append("```\n")
+        
+        prompt_parts.append("### Error Context Snippets\n```python")
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                source = f.read()
+            prompt_parts.append(_extract_snippets_from_string(source, lines, window_size))
+        except Exception as e:
+            prompt_parts.append(f"# [Warning] Could not extract snippets: {e}")
+        prompt_parts.append("```\n")
+
+    prompt_parts.append("## Instructions")
+    prompt_parts.append("1. Analyze the Traceback and the provided Error Context Snippets.")
+    prompt_parts.append("2. Use the File Map to understand the structure and available methods.")
+    prompt_parts.append("3. Provide the corrected code using Format B (WRITE_FILE) for the entire file, or output the necessary diff.")
+    
+    return "\n".join(prompt_parts)
+
+
+def _generate_ast_map_from_string(source: str) -> str:
+    try:
+        tree = ast.parse(source)
+        lines = []
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                lines.append(f"class {node.name}:")
+                for sub_node in node.body:
+                    if isinstance(sub_node, ast.FunctionDef):
+                        args = [arg.arg for arg in sub_node.args.args]
+                        lines.append(f"    def {sub_node.name}({', '.join(args)}): ...")
+            elif isinstance(node, ast.FunctionDef):
+                args = [arg.arg for arg in node.args.args]
+                lines.append(f"def {node.name}({', '.join(args)}): ...")
+                
+        if not lines:
+            return "# No top-level classes or functions found."
+        return "\n".join(lines)
+    except SyntaxError as e:
+        return f"# [Warning] SyntaxError in file, cannot generate AST: {e}"
+    except Exception as e:
+        return f"# [Warning] Could not generate file map: {e}"
+
+
+def _generate_ast_map_from_file(filepath: str) -> str:
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            source = f.read()
+        return _generate_ast_map_from_string(source)
+    except Exception as e:
+        return f"# [Warning] Could not read file for AST: {e}"
+
+
+def _extract_snippets_from_string(source: str, error_lines: Set[int], window: int) -> str:
+    try:
+        source_lines = source.splitlines()
+        total_lines = len(source_lines)
+        windows = []
+        for eline in sorted(error_lines):
+            start = max(1, eline - window)
+            end = min(total_lines, eline + window)
+            windows.append([start, end, {eline}])
+            
+        merged_windows = []
+        for w in sorted(windows, key=lambda x: x[0]):
+            if not merged_windows:
+                merged_windows.append(w)
+            else:
+                prev = merged_windows[-1]
+                if w[0] <= prev[1] + 1:
+                    prev[1] = max(prev[1], w[1])
+                    prev[2].update(w[2])
+                else:
+                    merged_windows.append(w)
+                    
+        snippets = []
+        for start, end, elines in merged_windows:
+            snippet_lines = [f"# --- Snippet from line {start} to {end} ---"]
+            for i in range(start, end + 1):
+                idx = i - 1
+                if 0 <= idx < len(source_lines):
+                    line_content = source_lines[idx]
+                    marker = ">> " if i in elines else "   "
+                    snippet_lines.append(f"{marker}{i:4d}: {line_content}")
+            snippets.append("\n".join(snippet_lines))
+            
+        return "\n\n".join(snippets)
+    except Exception as e:
+        return f"# [Warning] Could not extract snippets: {e}"

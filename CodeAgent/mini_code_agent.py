@@ -28,6 +28,7 @@ import json
 import time
 import hashlib
 import subprocess
+import ast
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -58,9 +59,8 @@ from CodeAgent.codeagent_libs import (
     run_shell,
     _determine_verify_cmd,
     format_skill_injection,
-    save_skill,
+    Skill,
     select_relevant_skills,
-    extract_skill_insight,
     detect_tech_stack,
     truncate_to_tokens,
     compute_safe_max_tokens,
@@ -73,6 +73,10 @@ from CodeAgent.codeagent_libs import (
     apply_fuzzy_patch,
     extract_files_from_diff,
     resolve_path,
+    search_code,
+    find_file,
+    view_file_content,
+    build_debug_prompt,
 )
 
 # ---------------------------
@@ -95,7 +99,7 @@ SKILL_INJECT_MAX_LINES = 40  # total lines injected into prompt
 
 @dataclass
 class AgentConfig:
-    client: OpenAI
+    client: Any
     model: str
     session_dir: Path
     max_context: int
@@ -103,6 +107,9 @@ class AgentConfig:
     auto_approve: bool
     agent_dir: Path
     model_max_context: int = 0  # 0 = auto-detected from model, fallback to max_context
+    provider: str = "openai"
+    sandbox_container: Optional[str] = None
+    rl_mode: bool = False
 
 
 # ---------------------------
@@ -293,12 +300,13 @@ def _try_apply_content(content: str, allowlist: List[str], turn_dir: Path,
 # LLM Interaction
 # ---------------------------
 def complete_with_continuation(
-    client: OpenAI,
+    client: Any,
     model: str,
     messages: List[Dict[str, str]],
     temperature: float = 0.2,
     max_output_tokens: int = 4096,
     model_max_context: int = 16384,
+    provider: str = "openai"
 ) -> str:
     """
     Calls the LLM. If finish_reason is 'length', appends the partial response
@@ -334,12 +342,23 @@ def complete_with_continuation(
         resp = None
         for attempt in range(3):
             try:
-                resp = client.chat.completions.create(
-                    model=model,
-                    messages=current_messages,
-                    temperature=temperature,
-                    max_tokens=safe_tokens
-                )
+                if provider == "anthropic":
+                    sys_msg = next((m["content"] for m in current_messages if m["role"] == "system"), "")
+                    usr_msgs = [m for m in current_messages if m["role"] != "system"]
+                    resp = client.messages.create(
+                        model=model,
+                        system=sys_msg,
+                        messages=usr_msgs,
+                        temperature=temperature,
+                        max_tokens=safe_tokens
+                    )
+                else:
+                    resp = client.chat.completions.create(
+                        model=model,
+                        messages=current_messages,
+                        temperature=temperature,
+                        max_tokens=safe_tokens
+                    )
                 break
             except Exception as e:
                 err_str = str(e)
@@ -354,6 +373,8 @@ def complete_with_continuation(
                     continue
                 break
         
+        console.print(f"[debug] Raw response object type: {type(resp)}")
+        
         if resp is None:
             console.print(f"[red]All LLM retry attempts failed.[/red]")
             break
@@ -364,9 +385,20 @@ def complete_with_continuation(
             full_content += resp
             break
 
-        choice = resp.choices[0]
-        console.print(f"[dim]Finish Reason: {choice.finish_reason}[/dim]")
-        content = choice.message.content or ""
+        if provider == "anthropic":
+            console.print(f"[dim]Finish Reason: {resp.stop_reason}[/dim]")
+            content = resp.content[0].text
+            finish_reason = resp.stop_reason
+            if finish_reason == "max_tokens":
+                finish_reason = "length"
+        else:
+            choice = resp.choices[0]
+            console.print(f"[dim]Finish Reason: {choice.finish_reason}[/dim]")
+            content = choice.message.content or ""
+            finish_reason = choice.finish_reason
+        
+        console.print(f"[debug] Extracted content length: {len(content)}")
+        console.print(f"[debug] Extracted content preview (first 100): {content[:100]}")
         
         # --- Robust Stitching Logic ---
         # If this is a continuation (loop > 0), filter out conversational prefixes.
@@ -409,7 +441,7 @@ def complete_with_continuation(
 
         full_content += content
         
-        if choice.finish_reason == "length":
+        if finish_reason == "length":
             console.print("[yellow]Output truncated (limit reached). Continuing...[/yellow]")
             
             # Append partial content to history
@@ -545,6 +577,7 @@ class PromptRegistry:
 
     SYSTEM = (
         "You are an advanced AI coding agent. Your ONLY job is to produce file changes.\n"
+        "You operate in a strict ONE-SHOT generation environment. You DO NOT have access to interactive read tools, shell commands, or <tool_call> tags. You must output code immediately.\n"
         "\n"
         "## Output Format (STRICT)\n"
         "You MUST output in ONE of these two formats per response. Never mix them.\n"
@@ -568,6 +601,7 @@ class PromptRegistry:
         "## Rules\n"
         "- NEVER embed triple-backtick fences inside a diff block.\n"
         "- NEVER mix Format A and Format B in the same response.\n"
+        "- NEVER output <tool_call>, <search_code>, or any other interactive tags. Simply output the file changes.\n"
         "- If output will be very long, prefer Format B (WRITE_FILE) to avoid truncation.\n"
         "- Always include `Verification: <command>` on its own line if you know how to verify.\n"
         "\n"
@@ -601,7 +635,12 @@ class PromptRegistry:
 
         # Suggest WRITE_FILE for new or multi-file tasks
         format_hint = ""
-        if (allowlist and len(allowlist) > 1) or all_new_files:
+        if not allowlist or all_new_files:
+            format_hint = (
+                "\n> **IMPORTANT**: You are creating NEW code. Do NOT attempt to read existing files. "
+                "You MUST use **Format B (WRITE_FILE)** to output the complete new file directly.\n"
+            )
+        elif len(allowlist) > 1:
             format_hint = (
                 "\n> **IMPORTANT**: Use **Format B (WRITE_FILE)** to create all files. "
                 "This avoids diff truncation issues and is more reliable for new files.\n"
@@ -735,17 +774,20 @@ class PromptRegistry:
         )
 
     @staticmethod
-    def format_fix_rewrite(file_path: str, current_code: str, error_history: str, teacher_guidelines: str = "") -> str:
+    def format_fix_rewrite(file_path: str, current_code: str, debug_context: str, teacher_guidelines: str = "", max_context: int = 16000, max_output: int = 8192) -> str:
         """
         Prompt for Strategy 2: Full Rewrite.
         Ensures the model sees the broken code so it can recover logic.
         """
+        usable = max_context - max_output - 1000 - estimate_tokens(debug_context) - 500
+        if usable < 1000: usable = 1000
+        current_code = truncate_to_tokens(current_code, usable)
         return (
             f"# Rewrite Required (Fresh Start)\n\n"
             f"Diff-based fixes have failed. We need a clean rewrite of `{file_path}`.\n\n"
             f"## Context: Current File Content (Broken)\n"
             f"```python\n{current_code}\n```\n\n"
-            f"## Failure History\n```\n{error_history[-4000:]}\n```\n\n"
+            f"{debug_context}\n\n"
             f"## Instructions\n"
             f"1. **Recover**: Use the logic from the 'Current File' above, but fix the errors.\n"
             f"2. **Format**: Output the **COMPLETE** file using **Format B (WRITE_FILE)**.\n"
@@ -757,6 +799,123 @@ class PromptRegistry:
             f"... complete fixed code ...\n"
             f"CONTENT>>>\n"
         )
+
+    @staticmethod
+    def format_interactive_debug(file_path: Optional[str], debug_context: str, teacher_guidelines: str = "", max_context: int = 16000, max_output: int = 8192) -> str:
+        """
+        Prompt for Strategy 1: Interactive Debugging via Diff.
+        """
+        usable = max_context - max_output - 1000
+        if usable < 1000: usable = 1000
+        debug_context = truncate_to_tokens(debug_context, usable)
+        prompt = (
+            f"# Interactive Debugging Task\n\n"
+            f"The verification command failed. You need to investigate the cause and provide a fix.\n\n"
+            f"{debug_context}\n\n"
+        )
+        if file_path:
+            prompt += f"## Primary target file: `{file_path}`\n\n"
+            
+        prompt += (
+            f"## Tools Available\n"
+            f"You can use the following XML tags to gather more context before providing a fix.\n"
+            f"Limit your exploration to 1-3 tool calls at a time.\n"
+            f"- `<search_code>query</search_code>`: Globally search for `query` in the codebase.\n"
+            f"- `<find_file>pattern</find_file>`: Fuzzy search for files matching `pattern`.\n"
+            f"- `<view_file><filepath>path/to/file.py</filepath></view_file>`: Read a file. Optional: add `<start_line>X</start_line><end_line>Y</end_line>` to read specific lines.\n\n"
+            f"## Actions\n"
+            f"When you have enough context, provide the fix using one of the standard output formats:\n"
+            f"- **Format A (Unified Diff)** (Preferred for localized fixes)\n"
+            f"- **Format B (WRITE_FILE)** (If you need to rewrite the entire file)\n\n"
+            f"## Instructions\n"
+            f"1. Analyze the error.\n"
+            f"2. Use tools to gather context if necessary.\n"
+            f"3. Provide the fix directly.\n"
+            f"{teacher_guidelines}\n"
+        )
+        return prompt
+
+
+def save_rl_trajectory(config: AgentConfig, subtask_idx: int, reward: float, messages: list):
+    """Saves the full RL episode trajectory as a single JSON object."""
+    log_file = config.session_dir / "rl_trajectory.jsonl"
+    entry = {
+        "task_id": f"{config.session_dir.name}_subtask_{subtask_idx}",
+        "reward": reward,
+        "messages": messages
+    }
+    try:
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        console.print(f"[dim]Failed to write RL trajectory log: {e}[/dim]")
+
+
+def extract_error_context_rl(target_file: str, current_code: str, error_out: str) -> str:
+    """Extract line number from error output and build AST skeleton of the file for RL mode."""
+    fname = Path(target_file).name
+    pattern = r'File "[^"]*' + re.escape(fname) + r'", line (\d+)'
+    matches = re.findall(pattern, error_out)
+    
+    error_line = None
+    if matches:
+        error_line = int(matches[-1])
+        
+    skeleton_code = current_code
+    if error_line is not None:
+        try:
+            tree = ast.parse(current_code)
+            
+            class Skeletonizer(ast.NodeTransformer):
+                def visit_FunctionDef(self, node):
+                    # Keep whole body if error line is inside
+                    # (node.end_lineno might be None in very old pythons, but py312 is fine)
+                    end_line = getattr(node, 'end_lineno', node.lineno)
+                    if node.lineno <= error_line <= end_line:
+                        self.generic_visit(node)
+                        return node
+                    # Keep signature, replace body with ...
+                    node.body = [ast.Expr(value=ast.Constant(value=Ellipsis))]
+                    return node
+                
+                def visit_AsyncFunctionDef(self, node):
+                    end_line = getattr(node, 'end_lineno', node.lineno)
+                    if node.lineno <= error_line <= end_line:
+                        self.generic_visit(node)
+                        return node
+                    node.body = [ast.Expr(value=ast.Constant(value=Ellipsis))]
+                    return node
+                    
+                def visit_ClassDef(self, node):
+                    self.generic_visit(node)
+                    return node
+                    
+            tree = Skeletonizer().visit(tree)
+            skeleton_code = ast.unparse(tree)
+        except Exception:
+            pass  # Fallback to full code if syntax error or unparse fails
+
+    prompt = f"[Verification Failed] Exit Code 1\nTraceback...\n{error_out[-3000:]}\n\n"
+    
+    if error_line is not None:
+        lines = current_code.splitlines()
+        start = max(0, error_line - 10)
+        end = min(len(lines), error_line + 10)
+        snippet = "\n".join(f"{i+1}: {lines[i]}" for i in range(start, end))
+        prompt += f"## Context: error around line {error_line} in `{target_file}`\n"
+        prompt += f"```python\n{snippet}\n```\n\n"
+        
+    prompt += f"## Context: skeleton of `{target_file}`\n"
+    prompt += f"```python\n{skeleton_code}\n```\n\n"
+    
+    prompt += (
+        "**CRITICAL FORMATTING RULE:**\n"
+        "The previous code failed. Since I am only showing you the error message and a skeleton of the file (NOT the full file), "
+        "you are STRICTLY FORBIDDEN from using Format B (WRITE_FILE). If you use Format B, you will destroy the rest of the file. "
+        "You MUST use Format A (Unified Diff) to only patch the broken parts.\n"
+    )
+    return prompt
+
 
 def run_subtask_loop(
     config: AgentConfig,
@@ -777,6 +936,10 @@ def run_subtask_loop(
         d = config.session_dir / f"{turn_base + offset:04d}"
         d.mkdir(parents=True, exist_ok=True)
         return d
+        
+    rl_messages = []
+    def add_rl_msg(role: str, content: str):
+        rl_messages.append({"role": role, "content": content})
 
     # =========================================================================
     # PHASE 1: GENERATION
@@ -796,6 +959,9 @@ def run_subtask_loop(
         config.max_context, config.max_output
     )
     (turn_dir / "prompt.md").write_text(prompt_md, encoding="utf-8")
+    
+    add_rl_msg("system", PromptRegistry.SYSTEM)
+    add_rl_msg("user", prompt_md)
 
     # 2. Call Model
     console.print("[cyan]Generating solution...[/cyan]")
@@ -804,9 +970,11 @@ def run_subtask_loop(
         [{"role": "system", "content": PromptRegistry.SYSTEM}, 
          {"role": "user", "content": prompt_md}],
         max_output_tokens=config.max_output,
-        model_max_context=config.model_max_context
+        model_max_context=config.model_max_context,
+        provider=config.provider
     )
     (turn_dir / "response.md").write_text(content, encoding="utf-8")
+    add_rl_msg("assistant", content)
 
     # 3. Detect Modified Files (Critical for Verification)
     # We parse the output to see what files are being touched
@@ -835,6 +1003,7 @@ def run_subtask_loop(
              # (Optional: Insert retry logic here)
         
         console.print("[red]Failed to apply generated code. Stopping.[/red]")
+        save_rl_trajectory(config, subtask_idx, -1.0, rl_messages)
         return False
     console.print("[green]Code generated and applied.[/green]")
 
@@ -867,7 +1036,7 @@ def run_subtask_loop(
     for fix_stage in range(MAX_RETRIES): 
         
         console.print(f"[blue]Running verification (Stage {fix_stage})...[/blue]")
-        code, out = run_shell(verify_cmd, cap=20000)
+        code, out = run_shell(verify_cmd, cap=20000, sandbox_container=config.sandbox_container)
         
         # --- Auto-Install Missing Modules ---
         if code != 0:
@@ -876,7 +1045,7 @@ def run_subtask_loop(
                 out += install_log
                 # Retry verification immediately
                 console.print("[blue]Retrying verification after installation...[/blue]")
-                code, out_retry = run_shell(verify_cmd, cap=20000)
+                code, out_retry = run_shell(verify_cmd, cap=20000, sandbox_container=config.sandbox_container)
                 out += f"\n[Post-Install Verification]\n{out_retry}\n"
         
         (turn_dir / "verify_stdout.txt").write_text(out, encoding='utf-8')
@@ -884,6 +1053,7 @@ def run_subtask_loop(
         if code == 0:
             console.print(f"[green]Verification PASSED at Stage {fix_stage}![/green]")
             save_skill(config, subtask, global_notes, True, out)
+            save_rl_trajectory(config, subtask_idx, 1.0, rl_messages)
             return True
         
         console.print(f"[red]Verification Failed (exit={code})[/red]")
@@ -892,6 +1062,7 @@ def run_subtask_loop(
         if fix_stage == MAX_RETRIES - 1:
             console.print("[bold red]All fix attempts failed. Exiting subtask.[/bold red]")
             save_skill(config, subtask, global_notes, False, out)
+            save_rl_trajectory(config, subtask_idx, -1.0, rl_messages)
             return False
 
         # --- PREPARE FIX ---
@@ -908,36 +1079,107 @@ def run_subtask_loop(
 
         current_code = read_file(str(target_file))
 
-        if fix_stage == 0:
-            # STRATEGY 1: DIFF FIX
-            console.print("[yellow]Attempting Fix 1: Targeted Diff...[/yellow]")
-            fix_prompt = PromptRegistry.format_fix_diff(
-                target_file, current_code, out,
-                teacher_guidelines=combined_guidelines
-            )
+        if fix_stage < 2 or config.rl_mode:
+            # STRATEGY 1: INTERACTIVE DEBUG TOOL LOOP
+            console.print("[yellow]Attempting Fix 1: Interactive Debugging...[/yellow]")
+            
+            if config.rl_mode:
+                fix_prompt = extract_error_context_rl(str(target_file), current_code, out)
+            else:
+                truncated_out = out[-6000:]
+                debug_context = build_debug_prompt(truncated_out)
+                if "## Error Traceback" not in debug_context or "File Map (Structure)" not in debug_context:
+                    debug_context = f"## Error Output\n```text\n{truncated_out}\n```\n"
+                    
+                fix_prompt = PromptRegistry.format_interactive_debug(
+                    str(target_file), debug_context, teacher_guidelines=combined_guidelines,
+                    max_context=config.model_max_context, max_output=config.max_output
+                )
+            
+            messages = [
+                {"role": "system", "content": PromptRegistry.SYSTEM},
+                {"role": "user", "content": fix_prompt}
+            ]
+            
+            MAX_TOOL_TURNS = 3
+            force_rewrite = False
+            fix_content = ""
+            
+            for tool_turn in range(MAX_TOOL_TURNS):
+                (turn_dir / f"prompt_turn_{tool_turn}.md").write_text(messages[-1]["content"], encoding="utf-8")
+                add_rl_msg(messages[-1]["role"], messages[-1]["content"])
+                
+                console.print(f"[cyan]Agent thinking (Tool Turn {tool_turn+1}/{MAX_TOOL_TURNS})...[/cyan]")
+                resp_content = complete_with_continuation(
+                    config.client, config.model,
+                    messages, max_output_tokens=config.max_output,
+                    model_max_context=config.model_max_context, provider=config.provider
+                )
+                
+                (turn_dir / f"response_turn_{tool_turn}.md").write_text(resp_content, encoding="utf-8")
+                add_rl_msg("assistant", resp_content)
+                
+                tool_results = []
+                for match in re.finditer(r'<search_code>(.*?)</search_code>', resp_content, re.DOTALL):
+                    query = match.group(1).strip()
+                    res = search_code(query)
+                    tool_results.append(f"Result for <search_code>{query}</search_code>:\n{res}")
+                    
+                for match in re.finditer(r'<find_file>(.*?)</find_file>', resp_content, re.DOTALL):
+                    pattern = match.group(1).strip()
+                    res = find_file(pattern)
+                    tool_results.append(f"Result for <find_file>{pattern}</find_file>:\n{res}")
+                    
+                for match in re.finditer(r'<view_file>\s*<filepath>(.*?)</filepath>(.*?)</view_file>', resp_content, re.DOTALL):
+                    fpath = match.group(1).strip()
+                    rest_content = match.group(2)
+                    m_start = re.search(r'<start_line>(\d+)</start_line>', rest_content)
+                    m_end = re.search(r'<end_line>(\d+)</end_line>', rest_content)
+                    s_line = int(m_start.group(1)) if m_start else 1
+                    e_line = int(m_end.group(1)) if m_end else 1000
+                    res = view_file_content(fpath, s_line, e_line)
+                    tool_results.append(f"Result for <view_file> {fpath} ({s_line}-{e_line}):\n{res}")
+
+                if not tool_results:
+                    fix_content = resp_content
+                    break
+                
+                messages.append({"role": "assistant", "content": resp_content})
+                combined_results = "\n\n".join(tool_results)
+                tool_msg = f"Tool Results:\n```text\n{combined_results}\n```\nPlease continue debugging or provide the final fix format."
+                messages.append({"role": "user", "content": tool_msg})
+                
         else:
-            # STRATEGY 2: FULL REWRITE
+            force_rewrite = False
+
+        if not config.rl_mode and (fix_stage >= 2 or force_rewrite):
+            # STRATEGY 2: FULL REWRITE (Only after 2 diff-based debugging attempts fail)
             console.print("[yellow]Attempting Fix 2: Full Rewrite (Accumulated Errors)...[/yellow]")
-            full_history = "\n".join(error_history)
-            # UPDATE: Pass current_code here
+            
+            fallback_errors = "\n".join(error_history[-2:])[-6000:]
+            debug_context = build_debug_prompt(fallback_errors)
+            if "## Error Traceback" not in debug_context or "File Map (Structure)" not in debug_context:
+                debug_context = f"## Failure History\n```text\n{fallback_errors}\n```\n"
+
             fix_prompt = PromptRegistry.format_fix_rewrite(
-                target_file, current_code, full_history,
-                teacher_guidelines=combined_guidelines
+                str(target_file), current_code, debug_context,
+                teacher_guidelines=combined_guidelines,
+                max_context=config.model_max_context, max_output=config.max_output
             )
-            #fix_prompt = PromptRegistry.format_fix_rewrite(target_file, full_history)
 
-        (turn_dir / "prompt.md").write_text(fix_prompt, encoding="utf-8")
+            (turn_dir / "prompt.md").write_text(fix_prompt, encoding="utf-8")
 
-        # Generate Fix
-        console.print("[cyan]Generating fix...[/cyan]")
-        fix_content = complete_with_continuation(
-            config.client, config.model,
-            [{"role": "system", "content": PromptRegistry.SYSTEM}, 
-             {"role": "user", "content": fix_prompt}],
-            max_output_tokens=config.max_output,
-            model_max_context=config.model_max_context
-        )
-        (turn_dir / "response.md").write_text(fix_content, encoding="utf-8")
+            console.print("[cyan]Generating fix...[/cyan]")
+            fix_content = complete_with_continuation(
+                config.client, config.model,
+                [{"role": "system", "content": PromptRegistry.SYSTEM}, 
+                 {"role": "user", "content": fix_prompt}],
+                max_output_tokens=config.max_output,
+                model_max_context=config.model_max_context,
+                provider=config.provider
+            )
+            (turn_dir / "response.md").write_text(fix_content, encoding="utf-8")
+            add_rl_msg("assistant", fix_content)
 
         # Apply Fix
         if not _try_apply_content(fix_content, allowlist, turn_dir, config):
@@ -946,6 +1188,114 @@ def run_subtask_loop(
     
     return False
 
+def extract_skill_insight(
+    client: OpenAI, 
+    model: str, 
+    goal: str, 
+    success: bool, 
+    evidence: str
+) -> Skill:
+    """
+    Uses the LLM to distill the execution result into a concise Skill.
+    """
+    outcome = "SUCCESS" if success else "FAILURE"
+    prompt = (
+        f"Analyze this CodeAgent execution ({outcome}).\n"
+        f"Goal: {goal}\n"
+        f"Evidence/Output:\n{evidence[:2000]}\n\n"
+        f"Extract a SINGLE, concise 'Skill' or 'Insight' to help future agents avoid this failure or repeat this success.\n"
+        f"Return ONLY a JSON object with these keys:\n"
+        f"- category: One of [PyTorch, NumPy, Syntax, Logic, API, General]\n"
+        f"- pattern: A short trigger keyword/phrase (e.g. 'conv2d', 'plot', 'json.load')\n"
+        f"- insight: A concise rule (max 15 words). E.g. 'Use .detach().cpu() before plotting tensors.'\n"
+    )
+    
+    content = ""
+    try:
+        # Use valid messages format for complete_with_continuation
+        messages = [
+            {"role": "system", "content": "You are an expert developer extracting coding insights."},
+            {"role": "user", "content": prompt}
+        ]
+        
+        # Use the robust completion helper
+        content = complete_with_continuation(
+            client, model, messages, 
+            max_output_tokens=200,
+            model_max_context=4000
+        )
+        
+        # Strip markdown fences if present
+        content = content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```json\s*|```$", "", content).strip()
+            
+        # JSON extraction heuristic (find first { and last })
+        json_start = content.find('{')
+        json_end = content.rfind('}')
+        if json_start != -1 and json_end != -1:
+             content = content[json_start:json_end+1]
+
+        data = json.loads(content)
+        return Skill(
+            category=data.get("category", "General"),
+            pattern=data.get("pattern", "general"),
+            insight=data.get("insight", "Always check outputs."),
+            evidence=evidence[:500],
+            created_at=now_stamp()
+        )
+    except Exception as e:
+        console.print(f"[yellow]Failed to extract insight: {e}[/yellow]")
+        console.print(f"[dim]Raw content: {content[:200]}...[/dim]")
+        # Fallback
+        return Skill(
+            category="General",
+            pattern="general",
+            insight=f"Review output for {outcome} details.",
+            evidence=evidence[:500],
+            created_at=now_stamp()
+        )
+
+def save_skill(config: Any, goal: str, notes: str, success: bool, evidence: str):
+    """Save the session outcome to the SkillDB (new structured format)."""
+    # Only save if there's meaningful evidence
+    if not evidence.strip():
+        return
+
+    # Use a unified skills file for v2
+    skill_file = config.agent_dir / "skilldb" / "skills.jsonl"
+    
+    # 1. Extract Insight
+    console.print("[cyan]Extracting experience insight...[/cyan]")
+    skill = extract_skill_insight(config.client, config.model, goal, success, evidence)
+    
+    # 2. Load existing to deduplicate
+    current_skills = []
+    if skill_file.exists():
+        for line in skill_file.read_text(errors="ignore").splitlines():
+            try: current_skills.append(json.loads(line))
+            except: pass
+            
+    # 3. Check for duplicates (same insight + category)
+    found = False
+    for existing in current_skills:
+        if (existing.get("category") == skill.category and 
+            existing.get("insight") == skill.insight):
+            existing["count"] = existing.get("count", 1) + 1
+            existing["evidence"] = skill.evidence # Update with latest evidence
+            existing["created_at"] = now_stamp()
+            found = True
+            console.print(f"[green]Updated existing skill: [{skill.category}] {skill.insight}[/green]")
+            break
+            
+    if not found:
+        current_skills.append(asdict(skill))
+        console.print(f"[green]Saved new skill: [{skill.category}] {skill.insight}[/green]")
+        
+    # 4. Write back
+    with open(skill_file, "w", encoding="utf-8") as f:
+        for s in current_skills:
+            f.write(json.dumps(s) + "\n")
 
 
 # ---------------------------
@@ -969,10 +1319,14 @@ def main():
     # Configurable Agent config
     parser.add_argument("--agent-dir", default=".agent", help="Directory for agent artifacts")
     parser.add_argument("--max-context", type=int, default=16000, help="Max context length")
-    parser.add_argument("--max-output", type=int, default=4096, help="Max output tokens")
+    parser.add_argument("--max-output", type=int, default=8192, help="Max output tokens")
     
     parser.add_argument("--migrate-skills", action="store_true", help="Migrate legacy skill DB to new format")
     parser.add_argument("--artifacts-dir", help="Directory where the agent should save task artifacts (plots, models)")
+    
+    parser.add_argument("--provider", default="openai", help="LLM Provider: openai or anthropic")
+    parser.add_argument("--sandbox-container", default=None, help="Name of the docker container to use as sandbox")
+    parser.add_argument("--rl-mode", action="store_true", help="Enable strict reinforcement learning mode (no prompt scaffolding on debug, logs full trajectories)")
     
     args = parser.parse_args()
 
@@ -980,7 +1334,11 @@ def main():
     ensure_dirs(agent_dir)
 
     # Initialize Client
-    client = OpenAI(base_url=args.base_url, api_key=args.api_key)
+    if args.provider == "anthropic":
+        import anthropic
+        client = anthropic.Anthropic(api_key=args.api_key, base_url=args.base_url if "api.anthropic.com" not in args.base_url else None)
+    else:
+        client = OpenAI(base_url=args.base_url, api_key=args.api_key)
     
     # Migration Mode
     if args.migrate_skills:
@@ -1033,6 +1391,9 @@ def main():
         auto_approve=args.yes,
         agent_dir=agent_dir,
         model_max_context=effective_ctx,
+        provider=args.provider,
+        sandbox_container=args.sandbox_container,
+        rl_mode=args.rl_mode,
     )
 
     console.print(Panel(
@@ -1085,7 +1446,7 @@ def main():
 
     # --- INJECT TEACHER GUIDELINES ---
     console.print("[dim]Scanning task for technical risks...[/dim]")
-    teacher_guidelines = detect_tech_stack(goal, allowlist)
+    teacher_guidelines = detect_tech_stack(goal, allowlist, SKILL_TEACHER)
     if teacher_guidelines:
         console.print(Panel(teacher_guidelines, title="Teacher Guidelines Injected", style="yellow"))
         # Append to extra_notes so it persists through Planning AND Execution
@@ -1142,6 +1503,6 @@ python CodeAgent//mini_claude_codev4.py --goal "Implement Univariate Linear Regr
 
 python CodeAgent/mini_claude_codev4.py --goal "Implement ML Task: SVM (Score Calibration + ROC/PR). Description: Calibrate decision scores; produce ROC/PR curves and AUC. Write a SINGLE self-contained Python file (task.py) with these functions: get_task_metadata, set_seed, get_device, make_dataloaders, build_model, train, evaluate, predict, save_artifacts."
 
-python CodeAgent/mini_claude_codev4.py --api-key "myhpcvllmqwen123" --goal "Implement Multivariate Linear Regression using torch.autograd. Visualize training. Description: Calibrate decision scores; produce ROC/PR curves and AUC. Write a SINGLE self-contained Python file (task.py) with these functions: get_task_metadata, set_seed, get_device, make_dataloaders, build_model, train, evaluate, predict, save_artifacts."
+python CodeAgent/mini_code_agent.py --api-key "myhpcvllmqwen134" --goal "Implement Multivariate Linear Regression using torch.autograd. Visualize training. Description: Calibrate decision scores; produce ROC/PR curves and AUC. Write a SINGLE self-contained Python file (task.py) with these functions: get_task_metadata, set_seed, get_device, make_dataloaders, build_model, train, evaluate, predict, save_artifacts."
 
 """

@@ -1,0 +1,374 @@
+{
+    "version": "1.1.0",
+    "prompt_language": "en",
+    "interface_protocols": {
+        "pytorch_task_v1": {
+            "entrypoint": "python tasks/<task_id>/task.py",
+            "prompt_instructions": "Implement this ML task as a SINGLE self-contained Python file (task.py). Include all required functions AND a complete `if __name__ == '__main__':` block that trains the model, evaluates on a validation split, prints standard metrics (MSE, R2, parameter accuracy where applicable), and asserts quality thresholds so the script exits non-zero on failure. Do NOT create separate test files or README. The script itself is the test.",
+            "must_have_files": [
+                "tasks/<task_id>/task.py"
+            ],
+            "required_functions": [
+                "get_task_metadata",
+                "set_seed",
+                "get_device",
+                "make_dataloaders",
+                "build_model",
+                "train",
+                "evaluate",
+                "predict",
+                "save_artifacts"
+            ],
+            "evaluation_rules": [
+                "The `evaluate()` function MUST compute and return standard metrics: MSE, R2 score, and any task-specific metrics on the VALIDATION data split.",
+                "The `if __name__ == '__main__':` block MUST: (1) train the model, (2) evaluate on BOTH train and validation splits, (3) print all metrics clearly, (4) assert quality thresholds (e.g., R2 > 0.9, MSE < threshold), (5) exit 0 on success or non-zero on failure.",
+                "Do NOT use a separate test file. All evaluation logic goes in main()."
+            ],
+            "required_cfg_keys": [],
+            "standard_outputs_schema": {},
+            "docstring_rules": []
+        }
+    },
+    "tasks": [
+        {
+            "series": "Computer Vision Foundations",
+            "level": 1,
+            "id": "cv_lvl1_augmentations_ablation",
+            "algorithm": "Augmentation Study (TorchVision v2 / Albumentations)",
+            "description": "Implement a clean augmentation pipeline and run ablations (none vs light vs strong) to quantify impact on accuracy/robustness.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "data": "CIFAR10 or a small custom image folder; offline fallback supported.",
+                "training": "Same model/config across ablations; only augmentation changes.",
+                "evaluation": "Report clean accuracy + corruption/shifted-set accuracy (synthetic blur/noise) + calibration (ECE if available).",
+                "artifacts": "Save example augmented images grid and ablation table to artifacts/.",
+                "validation": "At least one augmentation setting improves robustness over baseline without collapsing clean accuracy beyond tolerance."
+            }
+        },
+        {
+            "series": "Object Detection",
+            "level": 1,
+            "id": "det_lvl1_yolov8_finetune_eval",
+            "algorithm": "YOLO Fine-tuning + COCO mAP",
+            "description": "Fine-tune a YOLO-style detector (e.g., Ultralytics YOLOv8 or a lightweight detector) on a small dataset; compute mAP@50 and mAP@[.5:.95].",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "data": "COCO subset or VOC; offline fallback: tiny detection dataset in YOLO format.",
+                "evaluation": "Compute mAP metrics; report per-class AP for at least 3 classes when possible.",
+                "artifacts": "Save qualitative predictions overlay images (>=20) to artifacts/preds/.",
+                "validation": "mAP@50 must exceed a naive baseline (random/anchor-only) by a documented margin."
+            }
+        },
+        {
+            "series": "Object Detection",
+            "level": 2,
+            "id": "det_lvl2_detr_finetune_hf",
+            "algorithm": "DETR / RT-DETR Fine-tuning (HF Transformers)",
+            "description": "Fine-tune a DETR-family model with Hugging Face Transformers; implement proper box format conversions and evaluation with COCO API.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "data": "COCO-style annotations; offline fallback: synthetic boxes with known geometry.",
+                "training": "Use gradient clipping + mixed precision when cuda.",
+                "evaluation": "COCO mAP + IoU analysis; verify bbox conversion correctness with unit tests.",
+                "validation": "COCO mAP improves vs frozen backbone baseline; bbox unit tests must pass."
+            }
+        },
+        {
+            "series": "Object Detection",
+            "level": 3,
+            "id": "det_lvl3_tiling_large_images",
+            "algorithm": "Tiled Inference + NMS Fusion",
+            "description": "Implement tiled inference for large images (e.g., aerial/street-view): split into overlapping tiles, run detector, fuse results with NMS/Soft-NMS/WBF.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "data": "High-res images or synthetic large canvas images with injected objects.",
+                "evaluation": "Compare recall/precision vs non-tiling baseline; report runtime cost.",
+                "artifacts": "Save tile-visualization overlays and fused predictions.",
+                "validation": "Tiling must increase recall on small objects vs non-tiling baseline."
+            }
+        },
+        {
+            "series": "Instance Segmentation",
+            "level": 2,
+            "id": "seg_lvl2_maskrcnn_finetune",
+            "algorithm": "Mask R-CNN Fine-tuning",
+            "description": "Fine-tune Mask R-CNN on a small dataset; evaluate both bbox AP and mask AP.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "data": "COCO instance segmentation subset; offline fallback: synthetic shapes with masks.",
+                "evaluation": "Report bbox mAP and mask mAP; include qualitative mask overlays.",
+                "validation": "Mask mAP improves vs pretrained-no-finetune baseline on the same validation subset."
+            }
+        },
+        {
+            "series": "Depth Estimation",
+            "level": 1,
+            "id": "depth_lvl1_midas_infer_metrics",
+            "algorithm": "Monocular Depth (MiDaS Inference + Metrics)",
+            "description": "Run monocular depth inference (MiDaS/DPT-like) and compute standard depth metrics; handle resizing and scale alignment.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "data": "NYU-Depth v2 subset or KITTI depth subset; offline fallback: synthetic depth planes.",
+                "evaluation": "Compute abs-rel, rmse, delta1/delta2; document scale/shift alignment if using relative depth.",
+                "artifacts": "Save depth colormap visualizations and error maps.",
+                "validation": "Metrics must be finite; alignment must be verified with a unit test on synthetic planes."
+            }
+        },
+        {
+            "series": "Depth Estimation",
+            "level": 2,
+            "id": "depth_lvl2_finetune_depth_head",
+            "algorithm": "Depth Fine-tuning (Frozen Backbone + Trainable Head)",
+            "description": "Freeze a pretrained encoder and train a lightweight depth head; compare to full fine-tuning for speed/accuracy tradeoff.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "training": "Two runs: (A) frozen backbone, (B) partial unfreeze; same data split.",
+                "evaluation": "Depth metrics + throughput (fps) on a fixed resolution.",
+                "validation": "Frozen-head run must be faster; partial unfreeze must improve accuracy beyond tolerance."
+            }
+        },
+        {
+            "series": "Face Detection & Recognition",
+            "level": 1,
+            "id": "face_lvl1_face_detection_benchmark",
+            "algorithm": "Face Detection (MTCNN/RetinaFace-style) + Precision/Recall",
+            "description": "Implement face detection inference + evaluation; handle confidence thresholds and NMS.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "data": "WIDER FACE subset if available; offline fallback: synthetic faces (cartoon circles) with known boxes.",
+                "evaluation": "Compute precision/recall across thresholds; plot PR curve.",
+                "artifacts": "Save detection overlays and PR curve plot.",
+                "validation": "PR AUC beats a naive baseline; box format/NMS tests included."
+            }
+        },
+        {
+            "series": "Pose / Skeleton Detection",
+            "level": 1,
+            "id": "pose_lvl1_keypoint_infer_pck",
+            "algorithm": "2D Pose Estimation Inference + PCK",
+            "description": "Run keypoint estimation (OpenPose/HRNet/ViTPose-like) and evaluate with PCK or OKS-like metric on a small labeled subset.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "data": "COCO keypoints subset; offline fallback: synthetic stick figures with keypoints.",
+                "evaluation": "Compute PCK@0.05 and PCK@0.1 (or OKS proxy); include joint-wise breakdown.",
+                "artifacts": "Save skeleton overlays on images and metric table.",
+                "validation": "Metric computation verified by unit tests on synthetic stick figures."
+            }
+        },
+        {
+            "series": "Object Tracking",
+            "level": 1,
+            "id": "track_lvl1_kalman_iou_tracker",
+            "algorithm": "Multi-Object Tracking (IoU + Kalman Filter)",
+            "description": "Build a simple MOT pipeline: detector outputs + IoU association + Kalman filter; assign track IDs over time.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "data": "MOT-style sequences; offline fallback: synthetic moving boxes.",
+                "evaluation": "Compute MOTA/MOTP (or simplified IDF1 proxy) and track fragmentation stats.",
+                "artifacts": "Save annotated video frames with track IDs and trajectories plot.",
+                "validation": "On synthetic sequences, ID switches must be below a threshold; association tests included."
+            }
+        },
+        {
+            "series": "Object Tracking",
+            "level": 2,
+            "id": "track_lvl2_deepsort_reid_ablation",
+            "algorithm": "DeepSORT-like Tracking (ReID Embeddings Ablation)",
+            "description": "Add appearance embeddings (ReID) to improve association; ablate IoU-only vs IoU+ReID.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "training": "Optionally train a tiny embedding model on cropped identities; or use a pretrained embedder.",
+                "evaluation": "Compare IDF1/ID switches between ablations; report runtime overhead.",
+                "validation": "IoU+ReID must reduce ID switches on at least one sequence."
+            }
+        },
+        {
+            "series": "Video Understanding",
+            "level": 2,
+            "id": "video_lvl2_action_recognition_clip",
+            "algorithm": "Video Classification (Temporal Pooling / CLIP-ViT features)",
+            "description": "Implement a lightweight video classifier using frozen image encoder features (e.g., CLIP/ViT) + temporal pooling; evaluate accuracy/F1.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "data": "UCF101/HMDB51 subset or offline tiny labeled clips.",
+                "evaluation": "Report accuracy + macro-F1; confusion matrix artifact.",
+                "validation": "Must beat a random/majority baseline by a margin; deterministic evaluation with seed."
+            }
+        },
+        {
+            "series": "Deployment & Optimization",
+            "level": 3,
+            "id": "deploy_cv_lvl3_torch_compile_onnx_trt",
+            "algorithm": "CV Deployment (torch.compile + ONNX + Runtime Benchmark)",
+            "description": "Benchmark inference using eager vs torch.compile vs ONNXRuntime (and optional TensorRT if available) for a detection or segmentation model.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "benchmark": "Measure latency, throughput, and memory; run warmup + timed runs; save benchmark JSON.",
+                "parity": "Verify numerical parity on a fixed batch within tolerance (logits/boxes).",
+                "validation": "At least one optimized path improves throughput/latency without breaking parity."
+            }
+        },
+        {
+            "series": "Evaluation & Robustness",
+            "level": 3,
+            "id": "cv_eval_lvl3_corruptions_and_shift",
+            "algorithm": "Robustness Evaluation (Corruptions + Domain Shift)",
+            "description": "Evaluate a detector or classifier under corruptions (noise/blur/fog) and domain shift; produce a robustness report.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "evaluation": "Report metric degradation curves vs severity; include calibration drift if classification.",
+                "artifacts": "Save robustness report JSON + plots; include a top-failure-case gallery.",
+                "validation": "Report must be deterministic; includes tests that verify corruption pipeline correctness."
+            }
+        },
+        {
+            "series": "Modern NLP with Hugging Face",
+            "level": 1,
+            "id": "nlp_hf_lvl1_textcls_trainer_evaluate",
+            "algorithm": "HF Trainer (Text Classification)",
+            "description": "Fine-tune a compact encoder model (e.g., DistilBERT) for sentiment/topic classification using Hugging Face Trainer; evaluate with HF Evaluate metrics.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "data": "Use HF Datasets (e.g., SST-2 or AG News). If offline, fall back to a tiny bundled JSONL dataset with same schema.",
+                "training": "Use Trainer with gradient accumulation and early stopping; log train/eval metrics each epoch.",
+                "evaluation": "Report accuracy + macro-F1 via HF Evaluate; include confusion matrix artifact (png).",
+                "validation": "Must beat a majority-class baseline by a clear margin; exit_code=0 only if threshold met."
+            }
+        },
+        {
+            "series": "Modern NLP with Hugging Face",
+            "level": 2,
+            "id": "nlp_hf_lvl2_tokenization_packing_efficiency",
+            "algorithm": "Tokenizer Engineering (Packing + Truncation Strategy)",
+            "description": "Compare padding strategies and dynamic packing for efficiency: measure tokens/sec and GPU memory impact; ensure metric parity within tolerance.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "data": "Any HF text dataset; if offline, synthetic paragraphs with variable lengths.",
+                "training": "Run 2 short training runs: (A) padded batches, (B) packed sequences / dynamic padding.",
+                "benchmark": "Report throughput (tokens/sec) and peak memory; save plot (png).",
+                "validation": "Packed/dynamic run must be faster OR use less memory; accuracy/F1 drop must be within tolerance."
+            }
+        },
+        {
+            "series": "Sequence-to-Sequence & Generation",
+            "level": 1,
+            "id": "nlp_gen_lvl1_summarization_rouge",
+            "algorithm": "Seq2Seq Fine-tuning (Summarization)",
+            "description": "Fine-tune a small seq2seq model (e.g., T5-small) for summarization; evaluate ROUGE with HF Evaluate.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "data": "Use a summarization dataset (e.g., CNN/DailyMail subset) or offline tiny summarization pairs.",
+                "evaluation": "Compute ROUGE-1/2/L using HF Evaluate; save sample generations to artifacts/samples.txt.",
+                "validation": "ROUGE must improve vs zero-shot baseline or vs a trivial baseline (lead-3)."
+            }
+        },
+        {
+            "series": "Tiny LLM Training (Causal LM)",
+            "level": 1,
+            "id": "llm_tiny_lvl1_causallm_perplexity_eval",
+            "algorithm": "Tiny Causal LM Fine-tuning (Transformers)",
+            "description": "Fine-tune a tiny instruct or base LLM (<= ~1.5B) on a small instruction or text corpus; track perplexity and generation sanity checks.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "model": "Use a small model such as TinyLlama (1.1B) or Qwen2.5-0.5B-class models if available.",
+                "evaluation": "Report train/eval loss + perplexity; include a deterministic generation test (fixed prompt + seed).",
+                "artifacts": "Save generations for 10 prompts to artifacts/generations.jsonl.",
+                "validation": "Perplexity must decrease; generation must be non-empty and free of NaNs/inf logits."
+            }
+        },
+        {
+            "series": "Parameter-Efficient Fine-Tuning",
+            "level": 1,
+            "id": "peft_lvl1_lora_basics_hf_peft",
+            "algorithm": "LoRA Fine-tuning (HF PEFT)",
+            "description": "Apply LoRA adapters with PEFT to a tiny LLM; compare trainable parameter count and quality vs full fine-tuning (or vs frozen baseline).",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "training": "Implement LoRA with rank/alpha/dropout as configurable hyperparams; log trainable params.",
+                "evaluation": "Measure perplexity delta and simple generation quality checks; report adapter size on disk.",
+                "validation": "LoRA run must achieve comparable eval loss to baseline within tolerance while training far fewer parameters."
+            }
+        },
+        {
+            "series": "Parameter-Efficient Fine-Tuning",
+            "level": 2,
+            "id": "peft_lvl2_unsloth_lora_speed_memory",
+            "algorithm": "Unsloth LoRA Fine-tuning (Speed/VRAM Profiling)",
+            "description": "Use Unsloth to fine-tune the same tiny LLM with LoRA and compare throughput + memory vs a standard Transformers/PEFT run.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "training": "Run (A) baseline PEFT+Transformers and (B) Unsloth LoRA on same data/config where possible.",
+                "benchmark": "Report tokens/sec and peak VRAM; save benchmark table to outputs['metrics']['benchmark'].",
+                "validation": "Unsloth run must show measurable efficiency improvement (speed and/or VRAM) while keeping eval loss close."
+            }
+        },
+        {
+            "series": "Instruction Tuning with TRL",
+            "level": 1,
+            "id": "trl_lvl1_sft_trainer_instruction_tuning",
+            "algorithm": "SFT (TRL SFTTrainer)",
+            "description": "Perform supervised fine-tuning (SFT) on an instruction dataset using TRL SFTTrainer; implement chat templates and dataset formatting checks.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "data": "Instruction pairs (prompt/response). If offline, use a small curated set (>= 200 samples).",
+                "training": "Use TRL SFTTrainer; log loss curves and save best checkpoint.",
+                "validation": "Format validator: ensure every sample conforms to the expected chat/instruction schema; fail fast with sys.exit(nonzero) if not."
+            }
+        },
+        {
+            "series": "Preference Learning & Alignment",
+            "level": 1,
+            "id": "trl_align_lvl1_reward_modeling",
+            "algorithm": "Reward Modeling (Preference Pairs)",
+            "description": "Train a reward model on preference pairs (chosen vs rejected) and verify it assigns higher reward to chosen on a held-out set.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "data": "Preference dataset (chosen/rejected). If offline, synthesize pairs with rule-based preferences.",
+                "evaluation": "Report pairwise accuracy (% where r(chosen) > r(rejected)) and calibration stats.",
+                "artifacts": "Save a small leaderboard of hardest examples (where model is wrong) to artifacts/hard_cases.jsonl.",
+                "validation": "Pairwise accuracy must exceed a random baseline by a margin."
+            }
+        },
+        {
+            "series": "Preference Learning & Alignment",
+            "level": 2,
+            "id": "trl_align_lvl2_dpo",
+            "algorithm": "DPO (Direct Preference Optimization)",
+            "description": "Run DPO fine-tuning starting from an SFT model; evaluate preference win-rate on a validation preference set.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "training": "Use TRL DPOTrainer on chosen/rejected pairs; implement beta as configurable hyperparam.",
+                "evaluation": "Report win-rate proxy: fraction of validation pairs where model prefers chosen completion.",
+                "validation": "DPO must improve win-rate vs the SFT-only checkpoint on the same validation pairs."
+            }
+        },
+        {
+            "series": "RLHF-Style Post-Training",
+            "level": 3,
+            "id": "trl_align_lvl3_ppo_or_grpo_toy_reward",
+            "algorithm": "PPO / GRPO (Toy Reward, TRL)",
+            "description": "Run PPO (or GRPO where available) with a lightweight, transparent reward function (e.g., format compliance, keyword coverage) to teach the RLHF loop mechanics.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "reward": "Reward must be deterministic and explainable (no external judge required).",
+                "training": "Use TRL PPOTrainer or GRPO trainer; log KL, reward, and length statistics.",
+                "evaluation": "Before/after comparison on a fixed prompt set; show improved reward without degenerate collapse (e.g., empty outputs).",
+                "validation": "Average reward increases vs pre-RL checkpoint; generation remains valid JSON/text per task spec."
+            }
+        },
+        {
+            "series": "LLM Evaluation & Reporting",
+            "level": 1,
+            "id": "eval_lvl1_llm_eval_hf_evaluate_suite",
+            "algorithm": "Evaluation Harness (Perplexity + ROUGE/BLEU + Safety Checks)",
+            "description": "Build a reusable evaluation script that computes perplexity and task metrics (ROUGE/BLEU where applicable) using HF Evaluate; includes regression tests to prevent metric drift.",
+            "interface_protocol": "pytorch_task_v1",
+            "requirements": {
+                "evaluation": "Use HF Evaluate for at least 2 metrics relevant to the task (e.g., perplexity + ROUGE or BLEU).",
+                "testing": "Add unit tests for metric computation and deterministic batching (seed control).",
+                "artifacts": "Save a single eval report JSON to artifacts/eval_report.json containing model id, dataset hash, metrics, and runtime info.",
+                "validation": "Re-running evaluation with same seed yields identical metrics within tight tolerance."
+            }
+        }
+    ]
+}

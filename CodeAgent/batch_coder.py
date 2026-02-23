@@ -26,14 +26,7 @@ from datetime import datetime
 # ---------------------
 # Configuration
 # ---------------------
-TASKS_JSON = Path("CodeAgent/ml_tasks.json")
-OUTPUT_DIR = Path("output")
-DEFAULT_STATUS_FILE = Path("output/batch_status.json")
-
-# Inherit from env or use defaults
-BASE_URL = os.environ.get("VLLM_BASE_URL", "https://w0wqtv67-8000.usw3.devtunnels.ms/v1")
-API_KEY = os.environ.get("VLLM_API_KEY", "myhpcvllmqwen123")
-MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-Coder-Next-FP8")
+# Dynamic configuration will be parsed securely via argparse.
 
 
 def load_tasks(tasks_json: Path) -> dict:
@@ -76,11 +69,12 @@ def build_goal_and_notes(task: dict, protocol: dict) -> tuple:
     return goal, notes
 
 
-def run_single_task(task: dict, protocol: dict, output_dir: Path, verbose: bool = False) -> dict:
+def run_single_task(task: dict, protocol: dict, args) -> dict:
     """
     Run the mini_claude_code agent for a single task.
     Returns a status dict with success/failure, timing, and details.
     """
+    output_dir = Path(args.output_dir)
     task_id = task["id"]
     task_dir = output_dir / "tasks" / task_id
     task_file = task_dir / "task.py"
@@ -94,14 +88,15 @@ def run_single_task(task: dict, protocol: dict, output_dir: Path, verbose: bool 
 
     # Build the command
     cmd = [
-        sys.executable, "-m", "CodeAgent.mini_claude_codev4",
+        sys.executable, "-m", "CodeAgent.mini_code_agent", #mini_claude_codev4
         "--goal", goal,
         "--notes", notes,
         "--allowlist", str(task_file),
         "--yes",
-        "--base-url", BASE_URL,
-        "--api-key", API_KEY,
-        "--model", MODEL,
+        "--rl-mode",
+        "--base-url", args.base_url,
+        "--api-key", args.api_key,
+        "--model", args.model,
         "--artifacts-dir", str(task_dir),  # Save artifacts directly to task folder
     ]
 
@@ -129,7 +124,7 @@ def run_single_task(task: dict, protocol: dict, output_dir: Path, verbose: bool 
 
         # Run the agent as a subprocess
         env = os.environ.copy()
-        if verbose:
+        if args.verbose:
             env["FORCE_COLOR"] = "1"
 
         proc = subprocess.Popen(
@@ -147,11 +142,11 @@ def run_single_task(task: dict, protocol: dict, output_dir: Path, verbose: bool 
             # Stream output
             for line in proc.stdout:
                 captured_lines.append(line)
-                if verbose:
+                if args.verbose:
                     sys.stdout.write(line)
                     sys.stdout.flush()
             
-            proc.wait(timeout=800)
+            proc.wait(timeout=3600)
         except subprocess.TimeoutExpired:
             proc.kill()
             raise
@@ -178,7 +173,7 @@ def run_single_task(task: dict, protocol: dict, output_dir: Path, verbose: bool 
                 [sys.executable, str(task_file)],
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=1200,
                 cwd=str(Path.cwd()),
             )
             result["verification_passed"] = verify_result.returncode == 0
@@ -196,7 +191,7 @@ def run_single_task(task: dict, protocol: dict, output_dir: Path, verbose: bool 
                             else:
                                 item.unlink()
                             cleaned_count += 1
-                    if verbose and cleaned_count > 0:
+                    if args.verbose and cleaned_count > 0:
                         print(f"  Cleanup: Removed {cleaned_count} artifacts, kept only task.py")
                 except Exception as e:
                     print(f"  [WARNING] Cleanup Failed: {e}")
@@ -213,7 +208,7 @@ def run_single_task(task: dict, protocol: dict, output_dir: Path, verbose: bool 
 
     except subprocess.TimeoutExpired:
         result["status"] = "timeout"
-        result["error"] = "Task exceeded 10 minute timeout"
+        result["error"] = "Task exceeded 60 minute timeout"
         result["duration_sec"] = round(time.time() - start_time, 1)
     except Exception as e:
         result["status"] = "exception"
@@ -226,14 +221,14 @@ def run_single_task(task: dict, protocol: dict, output_dir: Path, verbose: bool 
     return result
 
 
-def save_status(results: list, status_file: Path):
+def save_status(results: list, status_file: Path, model: str):
     """Save batch results to JSON."""
     summary = {
         "total": len(results),
         "success": sum(1 for r in results if r["status"] == "success"),
         "failed": sum(1 for r in results if r["status"] != "success"),
         "timestamp": datetime.now().isoformat(),
-        "model": MODEL,
+        "model": model,
     }
 
     output = {
@@ -257,19 +252,28 @@ def main():
                         help="Run only this specific task ID")
     parser.add_argument("--redo-failed", action="store_true",
                         help="Retry all tasks that failed in the previous run")
-    parser.add_argument("--status-file", type=str, default=str(DEFAULT_STATUS_FILE),
+    parser.add_argument("--tasks-json", type=str, default="CodeAgent/dl_tasks.json",
+                        help="Path to tasks JSON file, dl_tasks.json")
+    parser.add_argument("--status-file", type=str, default="output/batch_status.json",
                         help="Path to save status JSON")
-    parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR),
+    parser.add_argument("--output-dir", type=str, default="output",
                         help="Base output directory")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show detailed output from code agent")
+    
+    # Configurable Model/Env
+    parser.add_argument("--base-url", default=os.environ.get("VLLM_BASE_URL", "https://w0wqtv67-8000.usw3.devtunnels.ms/v1"))
+    parser.add_argument("--api-key", default=os.environ.get("VLLM_API_KEY", "myhpcvllmqwen123"))
+    parser.add_argument("--model", default=os.environ.get("VLLM_MODEL", "Qwen/Qwen3-Coder-Next-FP8"))
+    
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     status_file = Path(args.status_file)
 
     # Load tasks
-    data = load_tasks(TASKS_JSON)
+    tasks_json_path = Path(args.tasks_json)
+    data = load_tasks(tasks_json_path)
     tasks = data["tasks"]
     protocols = data.get("interface_protocols", {})
 
@@ -277,7 +281,7 @@ def main():
     if args.task_id:
         tasks = [t for t in tasks if t["id"] == args.task_id]
         if not tasks:
-            print(f"Error: task '{args.task_id}' not found in {TASKS_JSON}")
+            print(f"Error: task '{args.task_id}' not found in {tasks_json_path}")
             sys.exit(1)
     else:
         tasks = tasks[args.start_from:]
@@ -286,7 +290,7 @@ def main():
 
     print(f"\n{'#'*70}")
     print(f"  Batch Coder — {len(tasks)} task(s) to process")
-    print(f"  Model: {MODEL}")
+    print(f"  Model: {args.model}")
     print(f"  Output: {output_dir}")
     print(f"  Status: {status_file}")
     print(f"{'#'*70}")
@@ -317,7 +321,7 @@ def main():
     if args.task_id:
         tasks = [t for t in tasks if t["id"] == args.task_id]
         if not tasks:
-            print(f"Error: task '{args.task_id}' not found in {TASKS_JSON}")
+            print(f"Error: task '{args.task_id}' not found in {tasks_json_path}")
             sys.exit(1)
     elif args.redo_failed:
         # Find failed task IDs from existing results
@@ -367,11 +371,11 @@ def main():
 
         print(f"\n[{i+1}/{len(tasks)}] Starting {task_id}...")
 
-        result = run_single_task(task, protocol, output_dir, verbose=args.verbose)
+        result = run_single_task(task, protocol, args)
         results.append(result)
 
         # Save after each task (in case of crash)
-        save_status(results, status_file)
+        save_status(results, status_file, args.model)
 
     # Final summary
     success = sum(1 for r in results if r["status"] == "success")
@@ -388,15 +392,21 @@ def main():
         icon = "✓" if r["status"] == "success" else "✗"
         print(f"  {icon} {r['task_id']:<38} {r['status']:<20} {r['duration_sec']:>6.1f}s")
 
-    save_status(results, status_file)
+    save_status(results, status_file, args.model)
 
 
 if __name__ == "__main__":
     main()
 
 """
-python3 CodeAgent/batch_coder.py --task-id linreg_lvl3_regularization_optim --status-file output/batch_status.json
+python3 CodeAgent/batch_coder.py --task-id linreg_lvl3_regularization_optim --status-file output/batch_status.json --verbose
 
 python3 CodeAgent/batch_coder.py --task-id linreg_lvl4_sklearn_production --status-file output/batch_status.json
 
+
+python3 CodeAgent/batch_coder.py --task-id cv_lvl1_augmentations_ablation --api-key myhpcvllmqwen134 --verbose
+
+python3 CodeAgent/batch_coder.py --task-id nlp_hf_lvl1_textcls_trainer_evaluate --api-key myhpcvllmqwen134 --verbose
+
+python3 CodeAgent/batch_coder.py --api-key myhpcvllmqwen134 --verbose
 """

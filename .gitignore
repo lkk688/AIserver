@@ -21,3 +21,9 @@ evalplus_results/
 eval_results_remote/
 eval_results_20260217-130023/
 eval_results_20260219-120127/
+*.py
+*.pth
+yolo11n.pt
+.gitignore
+yolov8n.pt
+Audio/vibevoice
