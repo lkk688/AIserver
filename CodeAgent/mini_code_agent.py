@@ -360,7 +360,9 @@ def complete_with_continuation(
                         model=model,
                         messages=current_messages,
                         temperature=temperature,
-                        max_tokens=safe_tokens
+                        max_tokens=safe_tokens,
+                        stream=True,
+                        stream_options={"include_usage": True}
                     )
                 break
             except Exception as e:
@@ -391,11 +393,19 @@ def complete_with_continuation(
             if hasattr(resp, 'usage'):
                 usage_info = {"prompt_tokens": resp.usage.input_tokens, "completion_tokens": resp.usage.output_tokens}
         else:
-            choice = resp.choices[0]
-            content = choice.message.content or ""
-            finish_reason = choice.finish_reason
-            if hasattr(resp, 'usage') and resp.usage:
-                usage_info = {"prompt_tokens": resp.usage.prompt_tokens, "completion_tokens": resp.usage.completion_tokens}
+            # Handle OpenAI stream
+            content = ""
+            finish_reason = None
+            for chunk in resp:
+                if len(chunk.choices) > 0:
+                    delta = chunk.choices[0].delta
+                    if delta.content is not None:
+                        content += delta.content
+                    if chunk.choices[0].finish_reason is not None:
+                        finish_reason = chunk.choices[0].finish_reason
+                
+                if hasattr(chunk, 'usage') and chunk.usage:
+                    usage_info = {"prompt_tokens": chunk.usage.prompt_tokens, "completion_tokens": chunk.usage.completion_tokens}
         
         elapsed = time.time() - start_time
         
@@ -1358,7 +1368,14 @@ def main():
         import anthropic
         client = anthropic.Anthropic(api_key=args.api_key, base_url=args.base_url if "api.anthropic.com" not in args.base_url else None)
     else:
-        client = OpenAI(base_url=args.base_url, api_key=args.api_key)
+        import httpx
+        custom_http_client = httpx.Client(timeout=1200.0)
+        client = OpenAI(
+            base_url=args.base_url, 
+            api_key=args.api_key, 
+            http_client=custom_http_client, 
+            max_retries=5
+        )
     
     # Migration Mode
     if args.migrate_skills:

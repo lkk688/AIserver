@@ -27,3 +27,4 @@ yolo11n.pt
 .gitignore
 yolov8n.pt
 Audio/vibevoice
+artifacts/
