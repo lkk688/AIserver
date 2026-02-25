@@ -76,7 +76,9 @@ from CodeAgent.codeagent_libs import (
     resolve_path,
     search_code,
     find_file,
-    view_file_content,
+    list_directory,
+    read_file_chunk,
+    run_bash_command,
     build_debug_prompt,
 )
 
@@ -115,6 +117,123 @@ class AgentConfig:
 
 
 # ---------------------------
+# Agent Action Protocol
+# ---------------------------
+
+@dataclass
+class AgentAction:
+    pass
+
+@dataclass
+class ActionWriteFile(AgentAction):
+    path: str
+    content: str
+
+@dataclass
+class ActionReplaceText(AgentAction):
+    path: str
+    old_text: str
+    new_text: str
+
+@dataclass
+class ActionApplyDiff(AgentAction):
+    diff_text: str
+
+@dataclass
+class ActionToolCall(AgentAction):
+    name: str
+    args: Dict[str, Any]
+
+
+# ---------------------------
+# Claude Native Tools
+# ---------------------------
+
+ANTHROPIC_TOOLS = [
+    {
+        "name": "write_file",
+        "description": "Create a new file or completely overwrite an existing file with new content. Use this for new files or when changes are too complex for search_and_replace.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative path to the file"},
+                "content": {"type": "string", "description": "The complete file content to write"}
+            },
+            "required": ["path", "content"]
+        }
+    },
+    {
+        "name": "search_and_replace",
+        "description": "Precisely replace a block of text in an existing file. The old_text MUST exactly match the file content, including whitespace.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative path to the file"},
+                "old_text": {"type": "string", "description": "The exact substring to replace, including exact whitespace and indentation."},
+                "new_text": {"type": "string", "description": "The new replacement text."}
+            },
+            "required": ["path", "old_text", "new_text"]
+        }
+    },
+    {
+        "name": "search_code",
+        "description": "Search for a string or regex pattern in the codebase.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The text pattern to search for"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "find_file",
+        "description": "Find files matching a glob pattern.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "The glob pattern to search for, e.g. '*.py'"}
+            },
+            "required": ["pattern"]
+        }
+    },
+    {
+        "name": "read_file_chunk",
+        "description": "Read the contents of a file along with line numbers.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filepath": {"type": "string", "description": "Relative path to the file to open"},
+                "start_line": {"type": "integer", "description": "Optional: Start line number (1-indexed)"},
+                "end_line": {"type": "integer", "description": "Optional: End line number"}
+            },
+            "required": ["filepath"]
+        }
+    },
+    {
+        "name": "list_directory",
+        "description": "List the contents of a directory using ls -la.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dir_path": {"type": "string", "description": "Directory path to list, defaults to '.'"}
+            }
+        }
+    },
+    {
+        "name": "run_bash_command",
+        "description": "Execute a terminal command with a timeout. Only use this for reading status, logs, or debugging outputs.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The bash command to execute."}
+            },
+            "required": ["command"]
+        }
+    }
+]
+
+# ---------------------------
 # Prompt Logic (centralized in PromptRegistry below)
 # ---------------------------
 # All prompt construction functions have been merged into the PromptRegistry class.
@@ -125,56 +244,43 @@ class AgentConfig:
 # Core Loop
 # ---------------------------
 
-def _try_apply_content(content: str, allowlist: List[str], turn_dir: Path, 
-                       config: AgentConfig) -> bool:
+def execute_actions(actions: List[AgentAction], content: str, allowlist: List[str], turn_dir: Path, config: AgentConfig) -> bool:
     """
-    Try all methods to apply model output as file changes.
-    Order: 
-    1. git apply (Strict Diff)
-    2. apply_fuzzy_patch (Loose Diff - handles line/whitespace errors)
-    3. WRITE_FILE (Full rewrite) — tried even if diff was found
-    4. Diff Extraction (Last resort reconstruction for new files)
+    Execute parsed AgentActions symmetrically.
+    Returns True if any file changes were successfully applied.
     """
-    
-    # --- Extract Diff once ---
-    diff = extract_all_diffs(content)
     changes_applied = False
-    apply_method = None
     
-    # --- TRY FORMAT A: Unified Diff Strategies ---
-    if diff:
-        (turn_dir / "patch.diff").write_text(diff, encoding="utf-8")
-        
-        # Strategy 1: Strict Git Apply
-        if is_git_repo():
-            changes_applied = apply_patch_guarded(diff, turn_dir, auto_approve=config.auto_approve)
-            if changes_applied:
-                apply_method = "git_apply"
-        else:
-            console.print("[red]Not a git repo, skipping strict diff apply.[/red]")
-        
-        # Strategy 2: Fuzzy Patch
-        if not changes_applied:
-            console.print("[yellow]Strict apply failed. Attempting fuzzy patch...[/yellow]")
+    for action in actions:
+        if isinstance(action, ActionApplyDiff):
+            diff = action.diff_text
+            (turn_dir / "patch.diff").write_text(diff, encoding="utf-8")
+            
+            # Strategy 1: Strict Git Apply
+            if is_git_repo():
+                applied = apply_patch_guarded(diff, turn_dir, auto_approve=config.auto_approve)
+                if applied:
+                    changes_applied = True
+                    console.print("[green]Strict diff applied.[/green]")
+                    continue
+            else:
+                console.print("[red]Not a git repo, skipping strict diff apply.[/red]")
+            
+            # Strategy 2: Fuzzy Patch
+            console.print("[yellow]Strict apply failed (or not git). Attempting fuzzy patch...[/yellow]")
             file_diffs = re.split(r'(?=^diff --git )', diff, flags=re.MULTILINE)
             fuzzy_successes = 0
             fuzzy_total = 0
-            
             fuzzy_logs = ["\n--- Fuzzy Patch Attempt ---"]
             
             for fd in file_diffs:
                 if not fd.strip().startswith("diff --git"): continue
                 fuzzy_total += 1
-                
-                # Extract raw path from header
                 match = re.search(r'diff --git a/\S+ b/(\S+)', fd)
                 if match:
                     raw_path = match.group(1)
                     fuzzy_logs.append(f"Processing diff for: {raw_path}")
-                    
-                    # Resolve Path
                     target_path = resolve_path(raw_path, allowlist)
-                    
                     if target_path:
                         if target_path != Path(raw_path):
                             msg = f"[dim]Redirecting '{raw_path}' -> '{target_path}'[/dim]"
@@ -191,111 +297,109 @@ def _try_apply_content(content: str, allowlist: List[str], turn_dir: Path,
                         console.print(msg)
                         fuzzy_logs.append(msg)
             
-            # Append logs to apply.log
             try:
                 with open(turn_dir / "apply.log", "a", encoding="utf-8") as f:
                     f.write("\n".join(fuzzy_logs) + "\n")
             except Exception as e:
                 console.print(f"Failed to append to apply.log: {e}")
 
-            # Mark success if at least one file was patched
             if fuzzy_successes > 0:
                 changes_applied = True
-                apply_method = "fuzzy_patch"
                 console.print(f"[green]Fuzzy patch applied ({fuzzy_successes}/{fuzzy_total} files).[/green]")
-
-
-    # --- TRY FORMAT B: WRITE_FILE ---
-    # Try WRITE_FILE regardless of whether a diff was found — some responses
-    # contain both a diff AND a WRITE_FILE block. If the diff failed, the
-    # WRITE_FILE may still work.
-    if not changes_applied:
-        write_actions = extract_write_file_actions(content)
-        if write_actions:
-            valid_actions = []
-            for path, text in write_actions:
-                # Resolve Path
-                target_path = resolve_path(path, allowlist)
-                if target_path:
-                    valid_actions.append((str(target_path), text))
+                
+        elif isinstance(action, ActionWriteFile):
+            target_path = resolve_path(action.path, allowlist)
+            if target_path:
+                applied = apply_write_files([(str(target_path), action.content)], allowlist, turn_dir)
+                if applied:
+                    changes_applied = True
+            else:
+                console.print(f"[red]Skipping WRITE_FILE for unresolved path: {action.path}[/red]")
+                
+        elif isinstance(action, ActionReplaceText):
+            target_path = resolve_path(action.path, allowlist)
+            if target_path and target_path.exists():
+                file_text = target_path.read_text(encoding="utf-8")
+                if action.old_text in file_text:
+                    new_text = file_text.replace(action.old_text, action.new_text, 1)
+                    target_path.write_text(new_text, encoding="utf-8")
+                    console.print(f"[green]Replaced text in {target_path}[/green]")
+                    changes_applied = True
                 else:
-                    console.print(f"[red]Skipping WRITE_FILE for unresolved path: {path}[/red]")
-            
-            if valid_actions:
-                changes_applied = apply_write_files(valid_actions, allowlist, turn_dir)
-                if changes_applied:
-                    apply_method = "write_file"
-    
-    # --- TRY FORMAT C: Extract NEW files from diff (Last resort) ---
-    # SAFETY: extract_files_from_diff ONLY extracts new files (--- /dev/null).
-    # For edit diffs, it safely skips to avoid overwriting existing files
-    # with tiny fragments (the session 2026-02-16_215657 bug).
-    if not changes_applied and diff:
+                    console.print(f"[red]search_and_replace failed: 'old_text' not found in {target_path}[/red]")
+                    try:
+                        with open(turn_dir / "apply.log", "a", encoding="utf-8") as f:
+                            f.write(f"\n[search_and_replace Error]: old_text not found exactly in {target_path}\n")
+                    except Exception:
+                        pass
+            else:
+                console.print(f"[red]search_and_replace skipped: unresolved or missing file {action.path}[/red]")
+
+    # Check for extractable new files if diff methods failed entirely
+    if not changes_applied and content and extract_all_diffs(content):
         console.print("[yellow]All patch methods failed. Checking for extractable new files in diff...[/yellow]")
-        diff_files = extract_files_from_diff(diff)
+        diff_files = extract_files_from_diff(extract_all_diffs(content))
         if diff_files:
             changes_applied = apply_write_files(diff_files, allowlist, turn_dir)
             if changes_applied:
-                apply_method = "diff_extraction"
                 console.print("[green]Wrote new files extracted from diff.[/green]")
-        else:
-            console.print("[red]No new files to extract. Edit diffs cannot be safely applied as rewrites.[/red]")
-    
-    # --- Log result ---
-    if apply_method:
-        console.print(f"[green]Changes applied via: {apply_method}[/green]")
-    elif not changes_applied:
-        # Check if we missed a WRITE_FILE due to bad formatting
-        if "WRITE_FILE:" in content and "CONTENT" in content:
-             console.print("[red]Potential malformed WRITE_FILE block detected but extraction failed.[/red]")
-        
-        if not diff and not extract_write_file_actions(content):
-            console.print("[red]No valid diff or WRITE_FILE actions found in response.[/red]")
-            
-            # --- TRY FORMAT E: Fenced Block Fallback (Session 213156 fix) ---
-            # If model wraps code in markdown fences but forgets WRITE_FILE
-            if len(allowlist) == 1 and not changes_applied:
-                # Look for ```python ... ``` or just ``` ... ```
-                # We want EXACTLY ONE code block to be safe
-                code_blocks = re.findall(r'```(?:python)?\s*(.*?)```', content, re.DOTALL)
-                
-                if len(code_blocks) == 1:
-                    target_file = Path(allowlist[0])
-                    block_content = code_blocks[0].strip()
-                    
-                    # Heuristic: does it look like Python code?
-                    if "def " in block_content or "import " in block_content:
-                        console.print(f"[yellow]Fallback E: Extracting single fenced block for {target_file}[/yellow]")
-                        target_file.parent.mkdir(parents=True, exist_ok=True)
-                        target_file.write_text(block_content + "\n", encoding="utf-8")
-                        apply_method = "fenced_fallback"
-                        changes_applied = True
-            
-            # --- TRY FORMAT D: Raw Code Fallback (Session 153128 fix) ---
-            # If the model outputs *just* the code without formatting, and we expect 1 file.
-            if len(allowlist) == 1 and not changes_applied:
-                target_file = Path(allowlist[0])
-                # Heuristic: does it look like Python code?
-                if "def " in content or "import " in content:
-                    console.print(f"[yellow]Fallback D: Treating entire response as content for {target_file}[/yellow]")
-                    
-                    # Sanitize: Remove markdown fences if they wrap the whole content
-                    clean_content = content.strip()
-                    if clean_content.startswith("```python"):
-                        clean_content = clean_content[len("```python"):].strip()
-                    elif clean_content.startswith("```"):
-                        clean_content = clean_content[3:].strip()
-                    
-                    if clean_content.endswith("```"):
-                        clean_content = clean_content[:-3].strip()
-                        
-                    target_file.parent.mkdir(parents=True, exist_ok=True)
-                    target_file.write_text(clean_content + "\n", encoding="utf-8")
-                    apply_method = "raw_fallback"
-                    changes_applied = True
-    
+
     return changes_applied
 
+
+
+def parse_text_actions(content: str, allowlist: List[str]) -> List[AgentAction]:
+    """Fallback text parser to convert plain text markdown into AgentAction protocol."""
+    actions = []
+    
+    # 1. WRITE_FILE
+    write_actions = extract_write_file_actions(content)
+    if write_actions:
+        for path, text in write_actions:
+            target_path = resolve_path(path, allowlist)
+            if target_path:
+                actions.append(ActionWriteFile(path=str(target_path), content=text))
+                
+    # 2. Unified Diff
+    diff = extract_all_diffs(content)
+    if diff:
+        actions.append(ActionApplyDiff(diff_text=diff))
+        
+    # 3. Interactive Tool Tags
+    for match in re.finditer(r'<search_code>(.*?)</search_code>', content, re.DOTALL):
+        actions.append(ActionToolCall(name="search_code", args={"query": match.group(1).strip()}))
+    for match in re.finditer(r'<find_file>(.*?)</find_file>', content, re.DOTALL):
+        actions.append(ActionToolCall(name="find_file", args={"pattern": match.group(1).strip()}))
+    for match in re.finditer(r'<read_file_chunk>\s*<filepath>(.*?)</filepath>(.*?)</read_file_chunk>', content, re.DOTALL):
+        fpath = match.group(1).strip()
+        rest = match.group(2)
+        m_s = re.search(r'<start_line>(\d+)</start_line>', rest)
+        m_e = re.search(r'<end_line>(\d+)</end_line>', rest)
+        s_line = int(m_s.group(1)) if m_s else 1
+        e_line = int(m_e.group(1)) if m_e else 1000
+        actions.append(ActionToolCall(name="read_file_chunk", args={"filepath": fpath, "start_line": s_line, "end_line": e_line}))
+        
+    for match in re.finditer(r'<list_directory>\s*<dir_path>(.*?)</dir_path>\s*</list_directory>', content, re.DOTALL):
+        actions.append(ActionToolCall(name="list_directory", args={"dir_path": match.group(1).strip()}))
+        
+    for match in re.finditer(r'<run_bash_command>\s*<command>(.*?)</command>\s*</run_bash_command>', content, re.DOTALL):
+        actions.append(ActionToolCall(name="run_bash_command", args={"command": match.group(1).strip()}))
+
+    # 4. Fallbacks if no explicit format found
+    if not actions and len(allowlist) == 1:
+        code_blocks = re.findall(r'```(?:python)?\s*(.*?)```', content, re.DOTALL)
+        if len(code_blocks) == 1:
+            block = code_blocks[0].strip()
+            if "def " in block or "import " in block:
+                actions.append(ActionWriteFile(path=allowlist[0], content=block))
+        elif "def " in content or "import " in content:
+            clean = content.strip()
+            if clean.startswith("```python"): clean = clean[len("```python"):].strip()
+            elif clean.startswith("```"): clean = clean[3:].strip()
+            if clean.endswith("```"): clean = clean[:-3].strip()
+            actions.append(ActionWriteFile(path=allowlist[0], content=clean))
+            
+    return actions
 
 
 # ---------------------------
@@ -309,8 +413,9 @@ def complete_with_continuation(
     max_output_tokens: int = 4096,
     model_max_context: int = 16384,
     provider: str = "openai",
-    session_dir: Optional[Path] = None
-) -> str:
+    session_dir: Optional[Path] = None,
+    anthropic_tools: Optional[List[Dict[str, Any]]] = None
+) -> Tuple[str, List[AgentAction]]:
     """
     Calls the LLM. If finish_reason is 'length', appends the partial response
     to messages and asks it to continue, stitching the results.
@@ -321,6 +426,7 @@ def complete_with_continuation(
     - Adaptively caps max_tokens to prevent context overflow.
     """
     full_content = ""
+    parsed_actions = []
     current_messages = list(messages)
     
     max_loops = 5  # Max continuation loops
@@ -361,14 +467,31 @@ def complete_with_continuation(
             try:
                 if provider == "anthropic":
                     sys_msg = next((m["content"] for m in current_messages if m["role"] == "system"), "")
-                    usr_msgs = [m for m in current_messages if m["role"] != "system"]
-                    resp = client.messages.create(
-                        model=model,
-                        system=sys_msg,
-                        messages=usr_msgs,
-                        temperature=temperature,
-                        max_tokens=safe_tokens
-                    )
+                    
+                    # Deep copy and format for Prompt Caching
+                    usr_msgs = []
+                    for m in current_messages:
+                        if m["role"] != "system":
+                            # Convert string to dict block
+                            content_blocks = [{"type": "text", "text": m["content"]}]
+                            usr_msgs.append({"role": m["role"], "content": content_blocks})
+                    
+                    # Add cache_control to the massive file context message (usually the last user msg in loop 0)
+                    if usr_msgs:
+                        usr_msgs[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
+                        
+                    sys_msg_blocks = [{"type": "text", "text": sys_msg, "cache_control": {"type": "ephemeral"}}]
+                    
+                    config_kwargs = {
+                        "model": model,
+                        "system": sys_msg_blocks,
+                        "messages": usr_msgs,
+                        "temperature": temperature,
+                        "max_tokens": safe_tokens
+                    }
+                    if anthropic_tools:
+                        config_kwargs["tools"] = anthropic_tools
+                    resp = client.messages.create(**config_kwargs)
                 else:
                     resp = client.chat.completions.create(
                         model=model,
@@ -400,7 +523,18 @@ def complete_with_continuation(
         usage_info = {}
         if provider == "anthropic":
             # Anthropic completion
-            content = resp.content[0].text
+            content = ""
+            for block in resp.content:
+                if block.type == "text":
+                    content += block.text
+                elif block.type == "tool_use":
+                    if block.name == "write_file":
+                        parsed_actions.append(ActionWriteFile(path=block.input["path"], content=block.input["content"]))
+                    elif block.name == "search_and_replace":
+                        parsed_actions.append(ActionReplaceText(path=block.input["path"], old_text=block.input["old_text"], new_text=block.input["new_text"]))
+                    elif block.name in ["search_code", "find_file", "view_file"]:
+                        parsed_actions.append(ActionToolCall(name=block.name, args=block.input))
+            
             finish_reason = resp.stop_reason
             if finish_reason == "max_tokens":
                 finish_reason = "length"
@@ -504,10 +638,12 @@ def complete_with_continuation(
                 "Just output the missing characters."
             )
             current_messages.append({"role": "user", "content": cont_prompt})
+        elif finish_reason == "tool_use":
+            break
         else:
             break
             
-    return full_content
+    return full_content, parsed_actions
 
 
 
@@ -1021,14 +1157,15 @@ def run_subtask_loop(
     add_rl_msg("user", prompt_md)
 
     # 2. Call Model
-    content = complete_with_continuation(
+    content, actions = complete_with_continuation(
         config.client, config.model,
         [{"role": "system", "content": PromptRegistry.SYSTEM}, 
          {"role": "user", "content": prompt_md}],
         max_output_tokens=config.max_output,
         model_max_context=config.model_max_context,
         provider=config.provider,
-        session_dir=config.session_dir
+        session_dir=config.session_dir,
+        anthropic_tools=ANTHROPIC_TOOLS if config.provider == "anthropic" else None
     )
     (turn_dir / "response.md").write_text(content, encoding="utf-8")
     add_rl_msg("assistant", content)
@@ -1052,8 +1189,12 @@ def run_subtask_loop(
     # Deduplicate
     modified_files = list(set(modified_files))
 
+    # Parse fallback actions if not using native tools
+    if not actions:
+        actions = parse_text_actions(content, allowlist)
+
     # 4. Apply Code
-    if not _try_apply_content(content, allowlist, turn_dir, config):
+    if not execute_actions(actions, content, allowlist, turn_dir, config):
         # Retry logic for malformed WRITE_FILE could go here
         if "WRITE_FILE:" in content and "CONTENT" in content and not w_actions:
              console.print("[yellow]Detected malformed WRITE_FILE. Retrying...[/yellow]")
@@ -1163,39 +1304,52 @@ def run_subtask_loop(
             for tool_turn in range(MAX_TOOL_TURNS):
                 (turn_dir / f"prompt_turn_{tool_turn}.md").write_text(messages[-1]["content"], encoding="utf-8")
                 add_rl_msg(messages[-1]["role"], messages[-1]["content"])
-                resp_content = complete_with_continuation(
+                resp_content, resp_actions = complete_with_continuation(
                     config.client, config.model,
                     messages, max_output_tokens=config.max_output,
                     model_max_context=config.model_max_context, provider=config.provider,
-                    session_dir=config.session_dir
+                    session_dir=config.session_dir,
+                    anthropic_tools=ANTHROPIC_TOOLS if config.provider == "anthropic" else None
                 )
                 
                 (turn_dir / f"response_turn_{tool_turn}.md").write_text(resp_content, encoding="utf-8")
                 add_rl_msg("assistant", resp_content)
                 
                 tool_results = []
-                for match in re.finditer(r'<search_code>(.*?)</search_code>', resp_content, re.DOTALL):
-                    query = match.group(1).strip()
-                    res = search_code(query)
-                    tool_results.append(f"Result for <search_code>{query}</search_code>:\n{res}")
+                # Fallback extraction for text-based tools
+                if not resp_actions:
+                    resp_actions = parse_text_actions(resp_content, allowlist)
                     
-                for match in re.finditer(r'<find_file>(.*?)</find_file>', resp_content, re.DOTALL):
-                    pattern = match.group(1).strip()
-                    res = find_file(pattern)
-                    tool_results.append(f"Result for <find_file>{pattern}</find_file>:\n{res}")
+                for action in resp_actions:
+                    if not isinstance(action, ActionToolCall): continue
                     
-                for match in re.finditer(r'<view_file>\s*<filepath>(.*?)</filepath>(.*?)</view_file>', resp_content, re.DOTALL):
-                    fpath = match.group(1).strip()
-                    rest_content = match.group(2)
-                    m_start = re.search(r'<start_line>(\d+)</start_line>', rest_content)
-                    m_end = re.search(r'<end_line>(\d+)</end_line>', rest_content)
-                    s_line = int(m_start.group(1)) if m_start else 1
-                    e_line = int(m_end.group(1)) if m_end else 1000
-                    res = view_file_content(fpath, s_line, e_line)
-                    tool_results.append(f"Result for <view_file> {fpath} ({s_line}-{e_line}):\n{res}")
+                    if action.name == "search_code":
+                        query = action.args.get("query", "")
+                        res = search_code(query)
+                        tool_results.append(f"Result for <search_code>{query}</search_code>:\n{res}")
+                    elif action.name == "find_file":
+                        pattern = action.args.get("pattern", "")
+                        res = find_file(pattern)
+                        tool_results.append(f"Result for <find_file>{pattern}</find_file>:\n{res}")
+                    elif action.name == "read_file_chunk":
+                        fpath = action.args.get("filepath", "")
+                        s_line = action.args.get("start_line", 1)
+                        e_line = action.args.get("end_line", 1000)
+                        res = read_file_chunk(fpath, s_line, e_line)
+                        tool_results.append(f"Result for <read_file_chunk> {fpath} ({s_line}-{e_line}):\n{res}")
+                    elif action.name == "list_directory":
+                        dir_path = action.args.get("dir_path", ".")
+                        res = list_directory(dir_path)
+                        tool_results.append(f"Result for <list_directory> {dir_path}:\n{res}")
+                    elif action.name == "run_bash_command":
+                        cmd = action.args.get("command", "")
+                        res = run_bash_command(cmd)
+                        tool_results.append(f"Result for <run_bash_command> {cmd}:\n{res}")
 
                 if not tool_results:
                     fix_content = resp_content
+                    # We might have apply diffs or write files built up here
+                    actions = [a for a in resp_actions if not isinstance(a, ActionToolCall)]
                     break
                 
                 messages.append({"role": "assistant", "content": resp_content})
@@ -1222,20 +1376,24 @@ def run_subtask_loop(
             )
 
             (turn_dir / "prompt.md").write_text(fix_prompt, encoding="utf-8")
-            fix_content = complete_with_continuation(
+            fix_content, actions = complete_with_continuation(
                 config.client, config.model,
                 [{"role": "system", "content": PromptRegistry.SYSTEM}, 
                  {"role": "user", "content": fix_prompt}],
                 max_output_tokens=config.max_output,
                 model_max_context=config.model_max_context,
                 provider=config.provider,
-                session_dir=config.session_dir
+                session_dir=config.session_dir,
+                anthropic_tools=ANTHROPIC_TOOLS if config.provider == "anthropic" else None
             )
             (turn_dir / "response.md").write_text(fix_content, encoding="utf-8")
             add_rl_msg("assistant", fix_content)
 
         # Apply Fix
-        if not _try_apply_content(fix_content, allowlist, turn_dir, config):
+        if not actions:
+            actions = parse_text_actions(fix_content, allowlist)
+            
+        if not execute_actions(actions, fix_content, allowlist, turn_dir, config):
             console.print("[red]Failed to apply fix. Moving to next strategy...[/red]")
             # Loop continues to next stage (Rewrite) automatically
     
@@ -1272,7 +1430,7 @@ def extract_skill_insight(
         ]
         
         # Use the robust completion helper
-        content = complete_with_continuation(
+        content, _ = complete_with_continuation(
             client, model, messages, 
             max_output_tokens=200,
             model_max_context=4000

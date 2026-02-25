@@ -1,0 +1,306 @@
+{
+    "version": "1.0.0",
+    "prompt_language": "en",
+    "interface_protocols": {
+        "python_task_v1": {
+            "entrypoint": "python tasks/<task_id>/task.py",
+            "prompt_instructions": "Implement this Python learning task as a SINGLE self-contained Python file (task.py). Do NOT create separate test files or README. The script itself is the test. Include all required functions AND a complete `if __name__ == '__main__':` block that: (1) runs self-checks (unit-like tests), (2) prints clear metrics or pass/fail summaries, (3) asserts quality thresholds and exits non-zero on failure. Prefer standard library only unless the task explicitly allows third-party libs. If optional dependencies are missing, provide a graceful fallback path while still verifying correctness.",
+            "must_have_files": [
+                "tasks/<task_id>/task.py"
+            ],
+            "required_functions": [
+                "get_task_metadata",
+                "set_seed",
+                "run",
+                "self_check",
+                "save_artifacts"
+            ],
+            "evaluation_rules": [
+                "The `self_check()` function MUST validate correctness with deterministic tests (use seed). It MUST raise AssertionError on failure.",
+                "The `run()` function MUST execute the main logic and return a dict of results/metrics.",
+                "The `if __name__ == '__main__':` block MUST call set_seed(), run(), self_check(), print results, save_artifacts(), and exit 0 on success or non-zero on failure.",
+                "No external test runner. No separate test files."
+            ],
+            "required_cfg_keys": [],
+            "standard_outputs_schema": {
+                "task_id": "str",
+                "passed": "bool",
+                "metrics": "dict",
+                "artifacts": "dict"
+            },
+            "docstring_rules": [
+                "Top-level module docstring must include: purpose, inputs/outputs, and at least 1 example usage snippet."
+            ]
+        }
+    },
+    "tasks": [
+        {
+            "series": "Python Basics",
+            "level": 1,
+            "id": "py_basics_lvl1_values_control_flow",
+            "algorithm": "Types, Operators, Control Flow",
+            "description": "Implement small pure functions exercising ints/floats/strings/bools, conditionals, loops, and basic error handling. Include deterministic self-checks.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "implementation": "Write functions: safe_div(a,b)->float|None, fizzbuzz(n)->list[str], summarize(nums)->dict(min,max,mean). Use only stdlib.",
+                "edge_cases": "safe_div must handle b==0 without throwing; fizzbuzz must validate n>=1; summarize must handle empty list by raising ValueError.",
+                "evaluation": "self_check must cover at least 12 assertions, including edge cases.",
+                "main_block": "Print summary of passed checks + example outputs; exit non-zero on failure.",
+                "output": "Return dict with counts of checks run, checks passed, and example outputs."
+            }
+        },
+        {
+            "series": "Python Basics",
+            "level": 2,
+            "id": "py_basics_lvl2_functions_scope_docstrings",
+            "algorithm": "Functions, Scope, Docstrings",
+            "description": "Implement a small library of functions with type hints, docstrings, and demonstrate local/global/nonlocal scope behavior safely.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "implementation": "Functions: normalize_text(s)->str, word_count(s)->dict[str,int], make_power(k)->callable. Use closures for make_power.",
+                "style": "All public functions must have type hints and docstrings with examples.",
+                "evaluation": "self_check must verify correctness on punctuation/whitespace cases and closure behavior.",
+                "output": "Return dict with sample transformed text and top-k words."
+            }
+        },
+        {
+            "series": "Python Basics",
+            "level": 3,
+            "id": "py_basics_lvl3_data_structures",
+            "algorithm": "Lists, Dicts, Sets, Tuples",
+            "description": "Implement utility functions that manipulate Python data structures and demonstrate complexity-aware choices.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "implementation": "Functions: dedupe_preserve_order(xs), invert_mapping(d), group_by_key(items,key_fn).",
+                "evaluation": "self_check must include randomized tests with fixed seed and compare against reference implementations.",
+                "output": "Return dict with sizes and a few example groups."
+            }
+        },
+        {
+            "series": "Python Basics",
+            "level": 4,
+            "id": "py_basics_lvl4_files_json_csv",
+            "algorithm": "File I/O, JSON, CSV",
+            "description": "Generate synthetic records, write to JSON and CSV, then read back and validate round-trip integrity.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "data": "Create 200 records with fields: id(int), name(str), score(float), tags(list[str]).",
+                "implementation": "Write/read JSON and CSV (CSV stores tags as ';'-joined string). Use tempfile and pathlib.",
+                "evaluation": "Round-trip must preserve ids and scores within 1e-9; tags must match exactly after CSV decoding.",
+                "artifacts": "Save outputs to tasks/<task_id>/artifacts/records.json and records.csv."
+            }
+        },
+        {
+            "series": "Python Intermediate",
+            "level": 1,
+            "id": "py_intermediate_lvl1_oop_dataclasses",
+            "algorithm": "OOP + dataclasses",
+            "description": "Build a small domain model using dataclasses, validation, and rich repr/ordering.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "implementation": "Create dataclass Student(name:str, sid:int, grades:list[float]) with methods: average(), letter_grade(). Validate grade range [0,100].",
+                "evaluation": "self_check must validate ordering by sid, average correctness, and validation failures.",
+                "output": "Return dict with class roster stats (mean, min, max)."
+            }
+        },
+        {
+            "series": "Python Intermediate",
+            "level": 2,
+            "id": "py_intermediate_lvl2_iterators_generators",
+            "algorithm": "Iterators, Generators, itertools",
+            "description": "Implement streaming computations with generators to avoid loading all data into memory.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "implementation": "Generator: read_numbers_from_text(text)->yield floats; sliding_window(iterable,k)->yield tuples; moving_average(iterable,k)->yield floats.",
+                "evaluation": "self_check must verify laziness by processing large synthetic stream and not materializing the whole list (use counters/limited peeks).",
+                "output": "Return dict with first/last few moving averages and count processed."
+            }
+        },
+        {
+            "series": "Python Intermediate",
+            "level": 3,
+            "id": "py_intermediate_lvl3_context_managers",
+            "algorithm": "Context Managers",
+            "description": "Implement a custom context manager for timing and for safe temporary directory handling.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "implementation": "Create @contextmanager timer(name) yielding start_time and capturing elapsed; create class TempDir context manager (mkdtemp + cleanup).",
+                "evaluation": "self_check must assert temp dir removed after exit and timer reports positive elapsed.",
+                "artifacts": "Save a small timing report JSON."
+            }
+        },
+        {
+            "series": "Python Intermediate",
+            "level": 4,
+            "id": "py_intermediate_lvl4_exceptions_logging",
+            "algorithm": "Exceptions + logging",
+            "description": "Design robust error handling and structured logs for a mini ETL pipeline.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "implementation": "Parse mixed-quality lines into records; invalid lines go to 'rejects' with reason codes; use logging with timestamps and levels.",
+                "evaluation": "self_check must inject at least 5 malformed cases and verify reasons and counts.",
+                "artifacts": "Save etl.log and rejects.json."
+            }
+        },
+        {
+            "series": "Python Advanced",
+            "level": 1,
+            "id": "py_advanced_lvl1_decorators",
+            "algorithm": "Decorators + Introspection",
+            "description": "Implement decorators for memoization and call tracing while preserving metadata.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "implementation": "Decorator memoize(maxsize=None) and trace_calls(logger_fn). Use functools.wraps.",
+                "evaluation": "self_check must verify cache hits reduce call count and __name__/__doc__ preserved.",
+                "output": "Return dict with call counts and cache stats."
+            }
+        },
+        {
+            "series": "Python Advanced",
+            "level": 2,
+            "id": "py_advanced_lvl2_typing_protocols",
+            "algorithm": "Typing, Protocols, Static-friendly design",
+            "description": "Design interfaces using typing.Protocol and implement two concrete classes.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "implementation": "Define Protocol Serializer with dumps/loads; implement JsonSerializer and CsvSerializer (for simple list-of-dicts).",
+                "evaluation": "self_check must round-trip multiple schemas and validate type hints exist for public APIs.",
+                "output": "Return dict with encoded sizes and round-trip success flags."
+            }
+        },
+        {
+            "series": "Python Advanced",
+            "level": 3,
+            "id": "py_advanced_lvl3_concurrency_threading_mp",
+            "algorithm": "Threading vs Multiprocessing",
+            "description": "Benchmark CPU-bound and I/O-bound workloads using threading and multiprocessing; report speedups.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "implementation": "CPU task: count primes up to N; IO task: simulate downloads via sleep + small writes. Implement sequential, threading, multiprocessing versions.",
+                "evaluation": "self_check must validate correctness of prime counts and that MP outperforms sequential by a minimum factor for CPU-bound (configurable small N).",
+                "artifacts": "Save benchmark_results.json with timing summary."
+            }
+        },
+        {
+            "series": "Python Advanced",
+            "level": 4,
+            "id": "py_advanced_lvl4_asyncio_pipeline",
+            "algorithm": "Asyncio Producer/Consumer",
+            "description": "Build an asyncio pipeline with backpressure using queues, tasks, and cancellation handling.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "implementation": "Async producer generates items; consumers process with variable latency; ensure clean shutdown and no leaked tasks.",
+                "evaluation": "self_check must assert all items processed exactly once and pipeline terminates under timeout.",
+                "output": "Return dict with throughput (items/sec) and processed counts."
+            }
+        },
+        {
+            "series": "Algorithms in Python",
+            "level": 1,
+            "id": "algo_lvl1_sort_search",
+            "algorithm": "Sorting + Binary Search",
+            "description": "Implement stable merge sort and binary search with thorough correctness checks vs Python's sorted().",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "implementation": "merge_sort(xs,key=None)->list; binary_search(sorted_xs,target)->index|(-1).",
+                "evaluation": "self_check must run randomized tests and verify stability property with (key,value) pairs.",
+                "metrics": "Report comparisons count estimate and runtime for increasing sizes."
+            }
+        },
+        {
+            "series": "Algorithms in Python",
+            "level": 2,
+            "id": "algo_lvl2_hashmap_lru_cache",
+            "algorithm": "LRU Cache (OrderedDict)",
+            "description": "Implement an LRU cache with O(1) get/put using OrderedDict; verify eviction correctness.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "implementation": "Class LRUCache(capacity) with get/put; track hits/misses.",
+                "evaluation": "self_check must include a reference simulation and randomized operation sequences.",
+                "output": "Return dict with hit rate and final keys."
+            }
+        },
+        {
+            "series": "Algorithms in Python",
+            "level": 3,
+            "id": "algo_lvl3_graph_bfs_dijkstra",
+            "algorithm": "BFS + Dijkstra",
+            "description": "Implement BFS shortest path in unweighted graphs and Dijkstra for weighted graphs using heapq.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "implementation": "Represent graph via adjacency dict; implement bfs_path(graph,s,t) and dijkstra(graph,s).",
+                "evaluation": "self_check must test on known graphs and randomized small graphs (compare dijkstra to brute force for tiny graphs).",
+                "output": "Return dict with path lengths and example paths."
+            }
+        },
+        {
+            "series": "Algorithms in Python",
+            "level": 4,
+            "id": "algo_lvl4_dynamic_programming",
+            "algorithm": "Dynamic Programming",
+            "description": "Solve edit distance (Levenshtein) with DP, plus memory-optimized variant; compare results and speed.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "implementation": "edit_distance(a,b)->int; edit_distance_optimized(a,b)->int using O(min(n,m)) memory.",
+                "evaluation": "self_check must compare both methods across randomized strings and known examples.",
+                "artifacts": "Save a small report comparing runtimes and memory use estimates."
+            }
+        },
+        {
+            "series": "Accelerated Computing with Python",
+            "level": 1,
+            "id": "accel_lvl1_numpy_vectorization",
+            "algorithm": "NumPy Vectorization",
+            "description": "Replace Python loops with NumPy vectorization and quantify speedup while preserving correctness.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "dependencies": "numpy required.",
+                "implementation": "Compute pairwise distances between points (N x 2) with (1) pure Python loops and (2) vectorized NumPy. Verify max error < 1e-9.",
+                "evaluation": "self_check must assert vectorized is faster than loops by a minimum factor for N>=2000 (use time.perf_counter; allow slack).",
+                "artifacts": "Save timings JSON and a small histogram of distances (matplotlib optional)."
+            }
+        },
+        {
+            "series": "Accelerated Computing with Python",
+            "level": 2,
+            "id": "accel_lvl2_numba_jit",
+            "algorithm": "Numba JIT Acceleration",
+            "description": "Use numba.njit to accelerate a numeric kernel; provide fallback if numba unavailable.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "dependencies": "numpy required; numba optional but recommended.",
+                "implementation": "Kernel: 2D convolution (valid) on float32 arrays. Implement numpy baseline and numba-jit version.",
+                "evaluation": "If numba present, assert speedup >= 1.5x for medium size; always assert numerical agreement within tolerance.",
+                "artifacts": "Save timing + correctness report JSON."
+            }
+        },
+        {
+            "series": "Accelerated Computing with Python",
+            "level": 3,
+            "id": "accel_lvl3_gpu_array_cupy_optional",
+            "algorithm": "GPU Arrays (CuPy optional)",
+            "description": "Implement a GPU/CPU dual-path array computation (e.g., batched matmul + softmax) using CuPy if available, otherwise NumPy.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "dependencies": "numpy required; cupy optional.",
+                "implementation": "Detect backend; run identical computation on both when possible and compare outputs (CPU reference).",
+                "evaluation": "Always validate correctness; if cupy available, report GPU timing and assert it runs end-to-end.",
+                "output": "Return dict with backend used, timings, and max error vs reference."
+            }
+        },
+        {
+            "series": "Accelerated Computing with Python",
+            "level": 4,
+            "id": "accel_lvl4_torch_compile_optional",
+            "algorithm": "PyTorch Acceleration (cuda + compile optional)",
+            "description": "Build a numeric workload with PyTorch tensors and benchmark CPU vs CUDA if available; optionally torch.compile if present.",
+            "interface_protocol": "python_task_v1",
+            "requirements": {
+                "dependencies": "torch required.",
+                "implementation": "Workload: fused MLP-like ops (matmul + gelu + layernorm-ish) on random tensors; benchmark multiple runs with warmup.",
+                "evaluation": "Always validate deterministic shapes and finite outputs; if CUDA available, assert CUDA is faster than CPU for large tensors (allow slack).",
+                "artifacts": "Save benchmark_results.json with device info and timings."
+            }
+        }
+    ]
+}

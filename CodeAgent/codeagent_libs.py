@@ -129,7 +129,7 @@ def compute_safe_max_tokens(input_tokens: int, model_max_context: int, desired_m
         min_output: Minimum output tokens; below this, signal an error condition
     
     Returns:
-        Clamped max_tokens value, or min_output if budget is very tight.
+        Clamped max_tokens value without blindly asserting min_output if budget is tight.
     """
     # Qwen/other tokenizer density can be ~10% higher than cl100k_base (used for est.)
     adjusted_input = int(input_tokens * 1.1)
@@ -137,10 +137,51 @@ def compute_safe_max_tokens(input_tokens: int, model_max_context: int, desired_m
     if available < min_output:
         console.print(f"[red]Context budget very tight: {available} tokens available "
                       f"(est_input={input_tokens} -> {adjusted_input}, limit={model_max_context}). "
-                      f"Clamping to min={min_output}.[/red]")
-        return min_output
+                      f"Returning available tokens to avoid exceeding context window.[/red]")
+        return max(1, available)
     safe = min(desired_max_output, available)
     return safe
+
+def compress_messages(messages: List[Dict[str, str]], max_allowed_tokens: int) -> List[Dict[str, str]]:
+    """
+    Compress the messages list to fit within max_allowed_tokens by truncating 
+    the longest text blocks in 'user' or 'assistant' messages.
+    """
+    import copy
+    msgs = copy.deepcopy(messages)
+    
+    while True:
+        current_tokens = sum(estimate_tokens(m.get("content", "")) for m in msgs)
+        if current_tokens <= max_allowed_tokens:
+            break
+            
+        longest_idx = -1
+        longest_len = 0
+        for i, m in enumerate(msgs):
+            if m["role"] == "system":
+                continue # prefer keep system intact
+            content_len = len(m.get("content", ""))
+            if content_len > longest_len:
+                longest_len = content_len
+                longest_idx = i
+                
+        if longest_idx == -1: 
+            # fallback to system as well
+            for i, m in enumerate(msgs):
+                content_len = len(m.get("content", ""))
+                if content_len > longest_len:
+                    longest_len = content_len
+                    longest_idx = i
+                    
+        if longest_idx == -1 or longest_len < 200:
+            break # Can't compress meaningfully further
+            
+        content = msgs[longest_idx]["content"]
+        keep_chars = int(longest_len * 0.45) # trim middle 10%
+        
+        msgs[longest_idx]["content"] = content[:keep_chars] + "\n...[TRUNCATED TO FIT CONTEXT]...\n" + content[-keep_chars:]
+        
+    return msgs
 
 
 def ensure_dirs(base_dir: Path):
@@ -299,9 +340,10 @@ def find_file(filename_pattern: str, root_dir: str = ".") -> str:
         return "No matching files found."
     return "\n".join(results)
 
-def view_file_content(filepath: str, start_line: int, end_line: int) -> str:
+def read_file_chunk(filepath: str, start_line: int, end_line: int) -> str:
     """
     Read a specific range of lines from a file, adding line numbers.
+    Replaces view_file_content.
     """
     try:
         if not os.path.exists(filepath):
@@ -326,6 +368,55 @@ def view_file_content(filepath: str, start_line: int, end_line: int) -> str:
         
     except Exception as e:
         return f"[Error] Could not read file {filepath}: {e}"
+def list_directory(dir_path: str = ".") -> str:
+    """
+    List contents of a directory using ls -la.
+    """
+    try:
+        target_dir = Path(dir_path).resolve()
+        if not target_dir.exists() or not target_dir.is_dir():
+            return f"[Error] Directory not found or not a directory: {dir_path}"
+            
+        result = subprocess.run(
+            ["ls", "-la", str(target_dir)], 
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+        else:
+            return f"[Error] ls failed: {result.stderr.strip()}"
+    except Exception as e:
+        return f"[Error] Failed to list directory {dir_path}: {e}"
+
+def run_bash_command(command: str) -> str:
+    """
+    Execute a terminal command with a standard timeout.
+    Returns stdout + stderr.
+    """
+    try:
+        # Use a short timeout of 60 seconds to prevent blocking the agent indefinitely
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=60
+        )
+        
+        output = []
+        if result.stdout:
+            output.append("STDOUT:\n" + result.stdout)
+        if result.stderr:
+            output.append("STDERR:\n" + result.stderr)
+            
+        if result.returncode != 0:
+            output.insert(0, f"[Error] Command exited with code {result.returncode}")
+            
+        if not output:
+            return "[Empty Output - Success]"
+            
+        return "\n".join(output)
+    except subprocess.TimeoutExpired:
+        return f"[Error] Command timed out after 60 seconds:\n{command}"
+    except Exception as e:
+        return f"[Error] Failed to run command: {e}"
+
 def top_level_tree(max_items: int = 200) -> str:
     items = []
     try:

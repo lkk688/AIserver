@@ -325,9 +325,10 @@ def main():
             sys.exit(1)
     elif args.redo_failed:
         # Find failed task IDs from existing results
-        failed_ids = {r["task_id"] for r in results if r["status"] != "success"}
+        target_ids = {r["task_id"] for r in results if r["status"] != "success"}
         
         # Also check for ORPHANED tasks (folder exists but missing from results, likely crashed)
+        # OR entirely new tasks
         existing_ids = {r["task_id"] for r in results}
         for t in tasks:
             t_id = t["id"]
@@ -338,19 +339,22 @@ def main():
                 t_file = t_dir / "task.py"
                 if t_dir.exists() and not t_file.exists():
                      print(f"  [WARNING] Task {t_id} folder exists but no result/task.py. Marking as orphaned failure.")
-                     failed_ids.add(t_id)
+                     target_ids.add(t_id)
+                elif not t_dir.exists():
+                     print(f"  [INFO] Task {t_id} is completely new. Adding to run list.")
+                     target_ids.add(t_id)
 
-        if not failed_ids:
-            print("No failed tasks found in status file (or orphans). Nothing to redo.")
+        if not target_ids:
+            print("No failed or new tasks found in status file. Nothing to redo.")
             sys.exit(0)
         
-        # Filter tasks to only those that failed
-        tasks = [t for t in tasks if t["id"] in failed_ids]
-        print(f"  Redo Mode: Retrying {len(tasks)} failed tasks...")
+        # Filter tasks to only those we want to run
+        tasks = [t for t in tasks if t["id"] in target_ids]
+        print(f"  Redo Mode: Retrying/Running {len(tasks)} failed/new tasks...")
         
-        # Remove failed tasks from 'results' so we don't duplicate entries
-        # ONLY remove those present in results. Orphans are already missing.
-        results = [r for r in results if r["task_id"] not in failed_ids]
+        # Remove target tasks from 'results' so we don't duplicate entries
+        # ONLY remove those present in results. Orphans/new tests are already missing.
+        results = [r for r in results if r["task_id"] not in target_ids]
     else:
         # Normal run (resume mode)
         # Skip tasks that are already in results (success OR failure)
