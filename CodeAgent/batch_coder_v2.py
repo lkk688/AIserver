@@ -412,5 +412,5 @@ python3 CodeAgent/batch_coder.py --task-id cv_lvl1_augmentations_ablation --api-
 
 python3 CodeAgent/batch_coder.py --task-id nlp_hf_lvl1_textcls_trainer_evaluate --api-key myhpcvllmqwen134 --verbose
 
-python3 CodeAgent/batch_coder.py --api-key myhpcvllmqwen134 --verbose
+python3 CodeAgent/batch_coder_v2.py --tasks-json "CodeAgent/python_tasks.json" --task-id py_basics_lvl1_values_control_flow --api-key myhpcvllmqwen134 --verbose
 """

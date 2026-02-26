@@ -158,27 +158,32 @@ def compress_messages(messages: List[Dict[str, str]], max_allowed_tokens: int) -
         longest_idx = -1
         longest_len = 0
         for i, m in enumerate(msgs):
-            if m["role"] == "system":
-                continue # prefer keep system intact
+            if i in (0, 1):
+                continue # Never truncate System Prompt (0) and Initial Task (1) to keep vLLM prefix caching intact
             content_len = len(m.get("content", ""))
             if content_len > longest_len:
                 longest_len = content_len
                 longest_idx = i
                 
         if longest_idx == -1: 
-            # fallback to system as well
+            # fallback if everything else is tiny (extremely rare)
             for i, m in enumerate(msgs):
+                if i == 0: continue # Still protect System
                 content_len = len(m.get("content", ""))
                 if content_len > longest_len:
                     longest_len = content_len
                     longest_idx = i
                     
-        if longest_idx == -1 or longest_len < 200:
+        if longest_idx == -1 or longest_len < 400:
             break # Can't compress meaningfully further
             
         content = msgs[longest_idx]["content"]
         keep_chars = int(longest_len * 0.45) # trim middle 10%
         
+        # Prevent infinite loops where the truncation tag makes the string longer than before
+        if keep_chars * 2 + 35 >= longest_len:
+            break
+            
         msgs[longest_idx]["content"] = content[:keep_chars] + "\n...[TRUNCATED TO FIT CONTEXT]...\n" + content[-keep_chars:]
         
     return msgs
@@ -368,6 +373,9 @@ def read_file_chunk(filepath: str, start_line: int, end_line: int) -> str:
         
     except Exception as e:
         return f"[Error] Could not read file {filepath}: {e}"
+
+# Backward compatibility alias for older agents (e.g. mini_code_agent.py)
+view_file_content = read_file_chunk
 def list_directory(dir_path: str = ".") -> str:
     """
     List contents of a directory using ls -la.

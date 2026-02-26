@@ -111,6 +111,7 @@ class AgentConfig:
     agent_dir: Path
     model_max_context: int = 0  # 0 = auto-detected from model, fallback to max_context
     provider: str = "openai"
+    mode: str = "generate"
     sandbox_container: Optional[str] = None
     rl_mode: bool = False
     max_retries: int = 4
@@ -261,13 +262,10 @@ def execute_actions(actions: List[AgentAction], content: str, allowlist: List[st
                 applied = apply_patch_guarded(diff, turn_dir, auto_approve=config.auto_approve)
                 if applied:
                     changes_applied = True
-                    console.print("[green]Strict diff applied.[/green]")
+                    console.print("[green]Strict diff applied successfully.[/green]")
                     continue
-            else:
-                console.print("[red]Not a git repo, skipping strict diff apply.[/red]")
             
             # Strategy 2: Fuzzy Patch
-            console.print("[yellow]Strict apply failed (or not git). Attempting fuzzy patch...[/yellow]")
             file_diffs = re.split(r'(?=^diff --git )', diff, flags=re.MULTILINE)
             fuzzy_successes = 0
             fuzzy_total = 0
@@ -283,8 +281,7 @@ def execute_actions(actions: List[AgentAction], content: str, allowlist: List[st
                     target_path = resolve_path(raw_path, allowlist)
                     if target_path:
                         if target_path != Path(raw_path):
-                            msg = f"[dim]Redirecting '{raw_path}' -> '{target_path}'[/dim]"
-                            console.print(msg)
+                            msg = f"Redirecting '{raw_path}' -> '{target_path}'"
                             fuzzy_logs.append(msg)
                         
                         if apply_fuzzy_patch(target_path, fd, log_buffer=fuzzy_logs):
@@ -294,7 +291,6 @@ def execute_actions(actions: List[AgentAction], content: str, allowlist: List[st
                             fuzzy_logs.append(">> Failed")
                     else:
                         msg = f"[red]Skipping diff for unresolved path: {raw_path}[/red]"
-                        console.print(msg)
                         fuzzy_logs.append(msg)
             
             try:
@@ -306,6 +302,8 @@ def execute_actions(actions: List[AgentAction], content: str, allowlist: List[st
             if fuzzy_successes > 0:
                 changes_applied = True
                 console.print(f"[green]Fuzzy patch applied ({fuzzy_successes}/{fuzzy_total} files).[/green]")
+            else:
+                console.print(f"[red]Patch failed ({fuzzy_total} hunks). See patch.diff and apply.log.[/red]")
                 
         elif isinstance(action, ActionWriteFile):
             target_path = resolve_path(action.path, allowlist)
@@ -366,11 +364,11 @@ def parse_text_actions(content: str, allowlist: List[str]) -> List[AgentAction]:
         actions.append(ActionApplyDiff(diff_text=diff))
         
     # 3. Interactive Tool Tags
-    for match in re.finditer(r'<search_code>(.*?)</search_code>', content, re.DOTALL):
+    for match in re.finditer(r'(?:<tool_call>\s*)?<search_code>(.*?)</search_code>(?:\s*</tool_call>)?', content, re.DOTALL):
         actions.append(ActionToolCall(name="search_code", args={"query": match.group(1).strip()}))
-    for match in re.finditer(r'<find_file>(.*?)</find_file>', content, re.DOTALL):
+    for match in re.finditer(r'(?:<tool_call>\s*)?<find_file>(.*?)</find_file>(?:\s*</tool_call>)?', content, re.DOTALL):
         actions.append(ActionToolCall(name="find_file", args={"pattern": match.group(1).strip()}))
-    for match in re.finditer(r'<read_file_chunk>\s*<filepath>(.*?)</filepath>(.*?)</read_file_chunk>', content, re.DOTALL):
+    for match in re.finditer(r'(?:<tool_call>\s*)?<read_file_chunk>\s*<filepath>(.*?)</filepath>(.*?)</read_file_chunk>(?:\s*</tool_call>)?', content, re.DOTALL):
         fpath = match.group(1).strip()
         rest = match.group(2)
         m_s = re.search(r'<start_line>(\d+)</start_line>', rest)
@@ -379,10 +377,10 @@ def parse_text_actions(content: str, allowlist: List[str]) -> List[AgentAction]:
         e_line = int(m_e.group(1)) if m_e else 1000
         actions.append(ActionToolCall(name="read_file_chunk", args={"filepath": fpath, "start_line": s_line, "end_line": e_line}))
         
-    for match in re.finditer(r'<list_directory>\s*<dir_path>(.*?)</dir_path>\s*</list_directory>', content, re.DOTALL):
+    for match in re.finditer(r'(?:<tool_call>\s*)?<list_directory>\s*<dir_path>(.*?)</dir_path>\s*</list_directory>(?:\s*</tool_call>)?', content, re.DOTALL):
         actions.append(ActionToolCall(name="list_directory", args={"dir_path": match.group(1).strip()}))
         
-    for match in re.finditer(r'<run_bash_command>\s*<command>(.*?)</command>\s*</run_bash_command>', content, re.DOTALL):
+    for match in re.finditer(r'(?:<tool_call>\s*)?<run_bash_command>\s*<command>(.*?)</command>\s*</run_bash_command>(?:\s*</tool_call>)?', content, re.DOTALL):
         actions.append(ActionToolCall(name="run_bash_command", args={"command": match.group(1).strip()}))
 
     # 4. Fallbacks if no explicit format found
@@ -519,6 +517,10 @@ def complete_with_continuation(
         if isinstance(resp, str):
             full_content += resp
             break
+            
+        if resp is None:
+            console.print("[red]All retry attempts failed. Returning empty content.[/red]")
+            break
 
         usage_info = {}
         if provider == "anthropic":
@@ -577,6 +579,7 @@ def complete_with_continuation(
                 "prompt_tokens": usage_info["prompt_tokens"],
                 "completion_tokens": usage_info["completion_tokens"],
                 "total_tokens": total_tokens,
+                "model_max_context": model_max_context,
                 "tok_per_sec": tok_speed
             }
             write_jsonl(usage_log, record)
@@ -1123,7 +1126,12 @@ def run_subtask_loop(
     """
     skill_dir = config.agent_dir / "skilldb"
     turn_base = subtask_idx * 10
-    console.print(f"\n[bold green]=== Task {subtask_idx+1} ===[/bold green] [dim]{subtask}[/dim]")
+    
+    # Truncate to first line for clean console UI
+    short_title = subtask.strip().split('\n')[0]
+    if len(short_title) > 80: short_title = short_title[:77] + "..."
+    
+    console.print(f"\n[bold green]=== Task {subtask_idx+1} ===[/bold green] [dim]{short_title}[/dim]")
 
     def get_turn_dir(offset: int) -> Path:
         d = config.session_dir / f"{turn_base + offset:04d}"
@@ -1157,18 +1165,91 @@ def run_subtask_loop(
     add_rl_msg("user", prompt_md)
 
     # 2. Call Model
-    content, actions = complete_with_continuation(
-        config.client, config.model,
-        [{"role": "system", "content": PromptRegistry.SYSTEM}, 
-         {"role": "user", "content": prompt_md}],
-        max_output_tokens=config.max_output,
-        model_max_context=config.model_max_context,
-        provider=config.provider,
-        session_dir=config.session_dir,
-        anthropic_tools=ANTHROPIC_TOOLS if config.provider == "anthropic" else None
-    )
-    (turn_dir / "response.md").write_text(content, encoding="utf-8")
-    add_rl_msg("assistant", content)
+    
+    if config.mode == "agent":
+        console.print("[yellow]-> Agent Exploration Phase[/yellow]")
+        exploration_prompt = prompt_md + "\n\n**AGENT MODE ENABLED**: You may explore the codebase before writing any code. Gather the necessary context. Once you are ready, output the final diff or write_file action.\n\n"
+        
+        if config.provider != "anthropic":
+            exploration_prompt += (
+                "You have access to the following tools. To use them, output exactly this XML format:\n"
+                "- `<tool_call><search_code>your_query_here</search_code></tool_call>`\n"
+                "- `<tool_call><find_file>your_glob_pattern</find_file></tool_call>`\n"
+                "- `<tool_call><read_file_chunk><filepath>path/to/file</filepath><start_line>1</start_line><end_line>100</end_line></read_file_chunk></tool_call>`\n"
+                "- `<tool_call><list_directory><dir_path>path/to/dir</dir_path></list_directory></tool_call>`\n"
+                "- `<tool_call><run_bash_command><command>ls -la</command></run_bash_command></tool_call>`\n"
+            )
+        
+        # Interactive Tool Loop before generating code
+        messages = [
+            {"role": "system", "content": PromptRegistry.SYSTEM},
+            {"role": "user", "content": exploration_prompt}
+        ]
+        
+        MAX_AGENT_TURNS = 5
+        content = ""
+        actions = []
+        
+        for agent_turn in range(MAX_AGENT_TURNS):
+            (turn_dir / f"prompt_turn_{agent_turn}.md").write_text(messages[-1]["content"], encoding="utf-8")
+            add_rl_msg(messages[-1]["role"], messages[-1]["content"])
+            
+            resp_content, resp_actions = complete_with_continuation(
+                config.client, config.model,
+                messages, max_output_tokens=config.max_output,
+                model_max_context=config.model_max_context, provider=config.provider,
+                session_dir=config.session_dir,
+                anthropic_tools=ANTHROPIC_TOOLS if config.provider == "anthropic" else None
+            )
+            
+            (turn_dir / f"response_turn_{agent_turn}.md").write_text(resp_content, encoding="utf-8")
+            add_rl_msg("assistant", resp_content)
+            
+            tool_results = []
+            if not resp_actions:
+                resp_actions = parse_text_actions(resp_content, allowlist)
+                
+            for action in resp_actions:
+                if not isinstance(action, ActionToolCall): continue
+                
+                if action.name == "search_code":
+                    query = action.args.get("query", "")
+                    tool_results.append(f"Result for <search_code>{query}</search_code>:\n{search_code(query)}")
+                elif action.name == "find_file":
+                    pattern = action.args.get("pattern", "")
+                    tool_results.append(f"Result for <find_file>{pattern}</find_file>:\n{find_file(pattern)}")
+                elif action.name == "read_file_chunk":
+                    tool_results.append(f"Result for <read_file_chunk>:\n{read_file_chunk(action.args.get('filepath', ''), action.args.get('start_line', 1), action.args.get('end_line', 1000))}")
+                elif action.name == "list_directory":
+                    tool_results.append(f"Result for <list_directory>:\n{list_directory(action.args.get('dir_path', '.'))}")
+                elif action.name == "run_bash_command":
+                    tool_results.append(f"Result for <run_bash_command>:\n{run_bash_command(action.args.get('command', ''))}")
+
+            if not tool_results:
+                content = resp_content
+                actions = [a for a in resp_actions if not isinstance(a, ActionToolCall)]
+                break # Model decided it is done exploring and output code
+                
+            messages.append({"role": "assistant", "content": resp_content})
+            messages.append({"role": "user", "content": f"Tool Results:\n```text\n{chr(10).join(tool_results)}\n```\nContinue exploring or provide the final code."})
+            
+        if not content:
+             content = resp_content # Fallback if max turns hit
+        
+    else:
+        # Generate Mode (Default)
+        content, actions = complete_with_continuation(
+            config.client, config.model,
+            [{"role": "system", "content": PromptRegistry.SYSTEM}, 
+             {"role": "user", "content": prompt_md}],
+            max_output_tokens=config.max_output,
+            model_max_context=config.model_max_context,
+            provider=config.provider,
+            session_dir=config.session_dir,
+            anthropic_tools=ANTHROPIC_TOOLS if config.provider == "anthropic" else None
+        )
+        (turn_dir / "response.md").write_text(content, encoding="utf-8")
+        add_rl_msg("assistant", content)
 
     # 3. Detect Modified Files (Critical for Verification)
     # We parse the output to see what files are being touched
@@ -1539,6 +1620,7 @@ def main():
     parser.add_argument("--sandbox-container", default=None, help="Name of the docker container to use as sandbox")
     parser.add_argument("--rl-mode", action="store_true", help="Enable strict reinforcement learning mode (no prompt scaffolding on debug, logs full trajectories)")
     parser.add_argument("--max-retries", type=int, default=None, help="Max retries for verification (default 8 in rl-mode, 4 otherwise)")
+    parser.add_argument("--mode", default="generate", choices=["generate", "agent"], help="Execution mode: 'generate' (write immediately) or 'agent' (exploration tool loop first)")
     
     args = parser.parse_args()
 
@@ -1613,6 +1695,7 @@ def main():
         agent_dir=agent_dir,
         model_max_context=effective_ctx,
         provider=args.provider,
+        mode=args.mode,
         sandbox_container=args.sandbox_container,
         rl_mode=args.rl_mode,
         max_retries=eff_max_retries,
