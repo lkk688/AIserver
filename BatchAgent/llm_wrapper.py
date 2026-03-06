@@ -18,6 +18,122 @@ from BatchAgent.mini_batch_agent_libs import (
 )
 from BatchAgent.mini_batch_agent import AgentAction, ActionWriteFile, ActionReplaceText, ActionToolCall, parse_text_actions
 
+from typing import List, Dict, Any
+
+# ==========================================
+# 1. Base Tool Definitions (Single Source of Truth)
+# ==========================================
+BASE_TOOLS = [
+    {
+        "name": "write_file",
+        "description": "Create a new file or completely overwrite an existing file with new content. Use this for new files or when changes are too complex for search_and_replace.",
+        "properties": {
+            "path": {"type": "string", "description": "Relative path to the file"},
+            "content": {"type": "string", "description": "The complete file content to write"}
+        },
+        "required": ["path", "content"]
+    },
+    {
+        "name": "search_code",
+        "description": "Search for a string or regex pattern in the codebase.",
+        "properties": {
+            "query": {"type": "string", "description": "The text pattern to search for"}
+        },
+        "required": ["query"]
+    },
+    {
+        "name": "find_file",
+        "description": "Find files matching a glob pattern.",
+        "properties": {
+            "pattern": {"type": "string", "description": "The glob pattern to search for, e.g. '*.py'"}
+        },
+        "required": ["pattern"]
+    },
+    {
+        "name": "read_file_chunk",
+        "description": "Read the contents of a file along with line numbers.",
+        "properties": {
+            "filepath": {"type": "string", "description": "Relative path to the file to open"},
+            "start_line": {"type": "integer", "description": "Optional: Start line number (1-indexed)"},
+            "end_line": {"type": "integer", "description": "Optional: End line number"}
+        },
+        "required": ["filepath"]
+    },
+    {
+        "name": "list_directory",
+        "description": "List the contents of a directory using ls -la.",
+        "properties": {
+            "dir_path": {"type": "string", "description": "Directory path to list, defaults to '.'"}
+        },
+        "required": [] # list_directory technically might not strictly require it if default is used, but good to define
+    },
+    {
+        "name": "run_bash_command",
+        "description": "Execute a terminal command. Only use this for reading status, logs, or debugging outputs.",
+        "properties": {
+            "command": {"type": "string", "description": "The bash command to execute."}
+        },
+        "required": ["command"]
+    },
+    {
+        "name": "web_search",
+        "description": "Search the internet. Use categories to route to specific reliable sources.",
+        "properties": {
+            "query": {"type": "string", "description": "The exact search query."},
+            "category": {
+                "type": "string", 
+                "enum": ["general", "news", "code", "academic"],
+                "description": "Choose 'news' for current events, 'code' for github/docs, 'academic' for papers. Default to 'general'."
+            }
+        },
+        "required": ["query"]
+    },
+    {
+        "name": "read_url",
+        "description": "Fetch and read the full text content of a specific webpage URL. Use this after web_search if you need more details from a specific source.",
+        "properties": {
+            "url": {"type": "string", "description": "The exact URL to fetch (must start with http:// or https://)."}
+        },
+        "required": ["url"]
+    }
+]
+
+# ==========================================
+# 2. Dynamic Tool Compiler
+# ==========================================
+def get_compiled_tools(provider: str) -> List[Dict[str, Any]]:
+    """
+    Compiles the BASE_TOOLS into the specific format required by the LLM provider.
+    """
+    compiled = []
+    for tool in BASE_TOOLS:
+        if provider == "anthropic":
+            # Anthropic Format
+            compiled.append({
+                "name": tool["name"],
+                "description": tool["description"],
+                "input_schema": {
+                    "type": "object",
+                    "properties": tool["properties"],
+                    "required": tool.get("required", [])
+                }
+            })
+        else:
+            # OpenAI / vLLM Format
+            compiled.append({
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": {
+                        "type": "object",
+                        "properties": tool["properties"],
+                        "required": tool.get("required", [])
+                    }
+                }
+            })
+    return compiled
+
 # ==========================================
 # Helper Modules for LLM Interaction
 # ==========================================

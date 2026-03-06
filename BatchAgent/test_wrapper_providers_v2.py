@@ -1,6 +1,6 @@
 import os
 import asyncio
-from typing import Any, List
+from typing import Any, List, Tuple
 from pathlib import Path
 import sys
 from rich.console import Console
@@ -104,7 +104,7 @@ class PromptRegistry:
         goal: str,
         allowlist: List[str],
         max_context: int,
-        file_content_mock: str = "", # Added for testing without real disk I/O
+        file_content_mock: str = "", 
     ) -> str:
         """Builds the main Turn Prompt for the user message."""
         allow_txt = "\n".join(f"- {p}" for p in allowlist) if allowlist else "- (none)"
@@ -195,7 +195,12 @@ async def run_scenario_test(
                 
                 # Check if it matches expectation
                 if expected_action_type and isinstance(act, expected_action_type):
-                    console.print(f"✅ Successfully matched expected action type: {expected_action_type.__name__}")
+                    # Handle tuple of expected types gracefully
+                    if isinstance(expected_action_type, tuple):
+                        expected_names = " or ".join([t.__name__ for t in expected_action_type])
+                        console.print(f"✅ Successfully matched expected action type: {expected_names}")
+                    else:
+                        console.print(f"✅ Successfully matched expected action type: {expected_action_type.__name__}")
                     
     except Exception as e:
         console.print(f"[red]Execution Error: {e}[/red]")
@@ -206,82 +211,96 @@ async def run_scenario_test(
 # ==========================================
 
 async def main():
-    # Setup vLLM Local Client
+    console.print("[bold green]Starting Universal Agent Capability Test Suite...[/bold green]")
+
+    # ---------------------------------------------------------
+    # Test Block 1: Local vLLM (Qwen)
+    # Tests all 3 behaviors: Web Search, File Creation, File Modification
+    # ---------------------------------------------------------
     vllm_client = AsyncOpenAI(
         base_url="http://127.0.0.1:8000/v1", 
         api_key="EMPTY", 
     )
-    model_name = "qwen3.5-9b"
-    provider = "openai"
-    tools = OPENAI_TOOLS
-
-    console.print("[bold green]Starting Agent Capability Test Suite...[/bold green]")
-
-    # ---------------------------------------------------------
-    # Scenario 1: General Q&A / Web Search Request
-    # Expectation: Model recognizes it lacks real-time info and triggers web_search
-    # ---------------------------------------------------------
+    
     await run_scenario_test(
-        scenario_name="Task 1: News Search (Iran Conflict)",
+        scenario_name="vLLM Task 1: News Search (Artemis Mission)",
         client=vllm_client,
-        model=model_name,
-        provider=provider,
-        tools=tools,
-        goal="Search for the latest news regarding the recent Iran conflict/war in 2026 and provide a brief summary.",
-        allowlist=[], # Empty allowlist implies no file modifications
+        model="qwen3.5-9b",
+        provider="openai",
+        tools=OPENAI_TOOLS,
+        goal="Search for the latest news regarding the Artemis lunar mission in 2026 and provide a brief summary.",
+        allowlist=[], 
         expected_action_type=ActionToolCall
     )
 
-    # ---------------------------------------------------------
-    # Scenario 2: Create a New File
-    # Expectation: Model uses Format B (WRITE_FILE) since the file is new
-    # ---------------------------------------------------------
     await run_scenario_test(
-        scenario_name="Task 2: Generate New Code File",
+        scenario_name="vLLM Task 2: Generate New Code File",
         client=vllm_client,
-        model=model_name,
-        provider=provider,
-        tools=tools,
+        model="qwen3.5-9b",
+        provider="openai",
+        tools=OPENAI_TOOLS,
         goal="Write a complete Python script to calculate the Fibonacci sequence. It must include a main block.",
         allowlist=["fibonacci.py"], 
         expected_action_type=ActionWriteFile
     )
 
-    # ---------------------------------------------------------
-    # Scenario 3: Modify an Existing File
-    # Expectation: Model uses Format A (Diff) or Format B to apply changes
-    # ---------------------------------------------------------
     mock_existing_code = (
         "def get_fibonacci(n):\n"
         "    if n <= 1: return n\n"
         "    return get_fibonacci(n-1) + get_fibonacci(n-2)\n"
     )
+    
     await run_scenario_test(
-        scenario_name="Task 3: Modify Existing Code",
+        scenario_name="vLLM Task 3: Modify Existing Code",
         client=vllm_client,
-        model=model_name,
-        provider=provider,
-        tools=tools,
+        model="qwen3.5-9b",
+        provider="openai",
+        tools=OPENAI_TOOLS,
         goal="Add type hinting (int) to the existing get_fibonacci function and add a docstring.",
         allowlist=["fibonacci.py"],
         mock_content=mock_existing_code,
         expected_action_type=(ActionApplyDiff, ActionWriteFile) # Either diff or rewrite is acceptable
     )
 
+    # ---------------------------------------------------------
+    # Test Block 2: Official OpenAI API
+    # Testing fundamental tool calling capability
+    # ---------------------------------------------------------
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if openai_key:
+        openai_client = AsyncOpenAI(api_key=openai_key)
+        await run_scenario_test(
+            scenario_name="OpenAI Task: Tool Calling (gpt-4o-mini)", 
+            client=openai_client, 
+            model="gpt-4o-mini", 
+            provider="openai", 
+            tools=OPENAI_TOOLS,
+            goal="Search for the latest news regarding the Artemis lunar mission in 2026 and provide a brief summary.",
+            allowlist=[],
+            expected_action_type=ActionToolCall
+        )
+    else:
+        console.print("\n[dim]Skipping OpenAI tests (OPENAI_API_KEY not set).[/dim]")
+
+    # ---------------------------------------------------------
+    # Test Block 3: Official Anthropic API
+    # Testing fundamental tool calling capability
+    # ---------------------------------------------------------
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    if anthropic_key and AsyncAnthropic:
+        anthropic_client = AsyncAnthropic(api_key=anthropic_key)
+        await run_scenario_test(
+            scenario_name="Anthropic Task: Tool Calling (Claude 3.5 Sonnet)", 
+            client=anthropic_client, 
+            model="claude-3-5-sonnet-20241022", 
+            provider="anthropic", 
+            tools=ANTHROPIC_TOOLS,
+            goal="Search for the latest news regarding the Artemis lunar mission in 2026 and provide a brief summary.",
+            allowlist=[],
+            expected_action_type=ActionToolCall
+        )
+    else:
+        console.print("\n[dim]Skipping Anthropic tests (ANTHROPIC_API_KEY not set or library missing).[/dim]")
+
 if __name__ == "__main__":
     asyncio.run(main())
-
-"""
-VLLM_USE_V1=0 python -m vllm.entrypoints.openai.api_server \
-    --model Qwen/Qwen3.5-9B \
-    --served-model-name qwen3.5-9b \
-    --gpu-memory-utilization 0.90 \
-    --max-model-len 8192 \
-    --dtype bfloat16 \
-    --enable-prefix-caching \
-    --enable-auto-tool-choice \
-    --tool-call-parser qwen3_xml \
-    --trust-remote-code
-
-python BatchAgent/test_wrapper_providers.py
-"""

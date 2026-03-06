@@ -139,11 +139,12 @@ print("-" * 60)
 print("✅ All tests completed successfully!")
 
 """
+##8192 \
 VLLM_USE_V1=0 python -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen3.5-9B \
     --served-model-name qwen3.5-9b \
     --gpu-memory-utilization 0.90 \
-    --max-model-len 8192 \
+    --max-model-len 16384 \ 
     --dtype bfloat16 \
     --host 0.0.0.0 \
     --port 8000 \
