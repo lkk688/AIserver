@@ -14,7 +14,7 @@ console = Console()
 
 # 假设这些是你已有的工具函数
 from BatchAgent.mini_batch_agent_libs import (
-    estimate_tokens, compress_messages, compute_safe_max_tokens, now_stamp, write_jsonl
+    estimate_tokens, compress_messages, compute_safe_max_tokens, now_stamp, write_jsonl, robust_json_loads
 )
 from BatchAgent.mini_batch_agent import AgentAction, ActionWriteFile, ActionReplaceText, ActionToolCall, parse_text_actions
 
@@ -24,15 +24,15 @@ from typing import List, Dict, Any
 # 1. Base Tool Definitions (Single Source of Truth)
 # ==========================================
 BASE_TOOLS = [
-    {
-        "name": "write_file",
-        "description": "Create a new file or completely overwrite an existing file with new content. Use this for new files or when changes are too complex for search_and_replace.",
-        "properties": {
-            "path": {"type": "string", "description": "Relative path to the file"},
-            "content": {"type": "string", "description": "The complete file content to write"}
-        },
-        "required": ["path", "content"]
-    },
+    # {
+    #     "name": "write_file",
+    #     "description": "Create a new file or completely overwrite an existing file with new content. Use this for new files or when changes are too complex for search_and_replace.",
+    #     "properties": {
+    #         "path": {"type": "string", "description": "Relative path to the file"},
+    #         "content": {"type": "string", "description": "The complete file content to write"}
+    #     },
+    #     "required": ["path", "content"]
+    # },
     {
         "name": "search_code",
         "description": "Search for a string or regex pattern in the codebase.",
@@ -95,6 +95,38 @@ BASE_TOOLS = [
             "url": {"type": "string", "description": "The exact URL to fetch (must start with http:// or https://)."}
         },
         "required": ["url"]
+    },
+    {
+        "name": "submit_plan",
+        "description": "Break down a complex task into smaller subtasks. The framework will orchestrate and potentially parallelize them.",
+        "properties": {
+            "subtasks": {
+                "type": "array",
+                "description": "List of subtasks.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string", "description": "Unique ID, e.g., 'task_1'"},
+                        "description": {"type": "string", "description": "Detailed instruction for this subtask"},
+                        "depends_on": {
+                            "type": "array", 
+                            "items": {"type": "string"}, 
+                            "description": "List of task_ids this subtask depends on. Empty if it can run immediately."
+                        }
+                    },
+                    "required": ["task_id", "description", "depends_on"]
+                }
+            }
+        },
+        "required": ["subtasks"]
+    },
+    {
+        "name": "finish_task",
+        "description": "Call this tool ONLY when you have fully completed the user's goal and verified the results.",
+        "properties": {
+            "summary": {"type": "string", "description": "A brief summary of what was accomplished."}
+        },
+        "required": ["summary"]
     }
 ]
 
@@ -139,17 +171,21 @@ def get_compiled_tools(provider: str) -> List[Dict[str, Any]]:
 # ==========================================
 
 def _detect_repetition(text: str, tail_lines: int = 30) -> bool:
-    """Detects infinite loops in LLM generation tail."""
+    """Detects infinite loops in LLM generation tail, ignoring list numbers."""
     if not text or len(text) < 200: return False
     lines = text.splitlines()
     if len(lines) < tail_lines: return False
     
     tail = lines[-tail_lines:]
-    tail_str = "\n".join(tail)
     
-    if len(tail) >= 12:
-        chunk = "\n".join(tail[-5:-1])
-        if chunk.strip() and tail_str.count(chunk) >= 3:
+    # [NEW] Remove leading numbers (e.g. "15. ", "- ") for pattern matching
+    clean_tail = [re.sub(r'^(\d+\.|-|\*)\s*', '', line).strip() for line in tail if line.strip()]
+    
+    if len(clean_tail) >= 12:
+        # Check if the last 4 clean lines appear multiple times
+        chunk = "\n".join(clean_tail[-5:-1])
+        clean_tail_str = "\n".join(clean_tail)
+        if chunk.strip() and clean_tail_str.count(chunk) >= 3:
             return True
     return False
 
@@ -388,11 +424,18 @@ async def complete_with_continuation_async(
         if native_tcs:
             for tc in native_tcs:
                 try:
-                    args_dict = json.loads(tc["arguments"])
+                    #args_dict = json.loads(tc["arguments"])
+                    args_dict = robust_json_loads(tc["arguments"])
                     action = _parse_native_dict_to_action(tc["name"], args_dict, allowlist)
                     final_actions.append(action)
                 except json.JSONDecodeError:
-                    console.print(f"[red]Failed to parse native tool JSON: {tc['arguments']}[/red]")
+                    # console.print(f"[red]Failed to parse native tool JSON: {tc['arguments']}[/red]")
+                    # [NEW] 拦截失败的 JSON，创建一个伪装的 Action 强迫 LLM 看到错误
+                    console.print(f"[red]Failed to parse native tool JSON completely.[/red]")
+                    final_actions.append(ActionToolCall(
+                        name="json_parse_error", 
+                        args={"error": "The JSON tool call you provided was malformed or improperly escaped. Please try again, or use the Format B (WRITE_FILE) markdown text format instead."}
+                    ))
             
             # If we received native tool calls, we consider the turn complete (no need to parse text)
             if final_actions:

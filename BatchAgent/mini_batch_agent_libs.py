@@ -20,12 +20,58 @@ try:
 except ImportError:
     tiktoken = None
 
+import json
+import logging
+from typing import Dict, Any, Optional
+#pip install json-repair
+try:
+    import json_repair
+except ImportError:
+    json_repair = None
+
 console = Console()
 
 # ---------------------------
 # Utilities
 # ---------------------------
+def robust_json_loads(json_str: str) -> Optional[Dict[str, Any]]:
+    """
+    A globally reusable, highly fault-tolerant JSON parser.
+    Uses standard json first, falls back to json-repair for LLM hallucinations.
+    """
+    if not json_str or not isinstance(json_str, str):
+        return None
 
+    # 1. basic load
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        pass
+
+    # 2. try json-repair
+    if json_repair is not None:
+        try:
+            # return_objects=True return python dict
+            repaired_obj = json_repair.repair_json(json_str, return_objects=True)
+            
+            # make sure the repaired object is a dict (sometimes it can be a list of dicts if multiple repairs are possible)
+            if isinstance(repaired_obj, dict):
+                return repaired_obj
+            elif isinstance(repaired_obj, list) and len(repaired_obj) > 0 and isinstance(repaired_obj[0], dict):
+                # sometimes json-repair returns a list of possible repairs; take the first one if it's a dict
+                return repaired_obj[0]
+        except Exception as e:
+            logging.warning(f"json-repair failed to rescue JSON: {e}")
+    else:
+        logging.warning("json-repair package is not installed. Skipping advanced JSON rescue.")
+
+    # 3. last-ditch effort: Remove newlines and try again (some LLMs insert newlines that break parsing)
+    try:
+        clean_str = json_str.replace('\n', '\\n').replace('\r', '')
+        return json.loads(clean_str)
+    except Exception:
+        return None
+    
 def now_stamp() -> str:
     return time.strftime("%Y-%m-%d_%H%M%S")
 
@@ -627,6 +673,68 @@ def extract_all_diffs(text: str) -> Optional[str]:
     
     return None
 
+import re
+from typing import List, Tuple
+
+def extract_write_file_actions_v2(text: str) -> List[Tuple[str, str]]:
+    """
+    Extract WRITE_FILE actions with high-robustness regex.
+    Handles:
+    - Merged headers (e.g. 'code...WRITE_FILE: path')
+    - Malformed closers (CONTENT>>, CONTENT]>>)
+    - Truncated output (EOF)
+    - Prose injection (stops at '## Reasoning')
+    - Diff artifacts (ignores '-WRITE_FILE' or '-<<<CONTENT')
+    - [NEW in v2] XML tag leakage from underlying LLM tool templates (e.g., </parameter>)
+    """
+    results = []
+    
+    # Regex Breakdown:
+    # 1. (?:^|\n)(?!\-).*?WRITE_FILE: (Header, safe from diffs)
+    # 2. \s*(\S+)                      (Capture filepath)
+    # 3. .*?\n                         (Consume rest of header)
+    # 4. \s*<<<CONTENT\n               (Start Tag)
+    # 5. (.*?)                         (Content Capture)
+    # 6. Terminator Group              (Various exit conditions including EOF)
+    pattern = re.compile(
+        r'(?:^|\n)(?!\-).*?WRITE_FILE:\s*(\S+).*?\n'  
+        r'\s*<<<CONTENT\n'                            
+        r'(.*?)'                                      
+        r'(?:CONTENT>{2,3}|<<<CONTENT\s*$|(?=\n.*?WRITE_FILE:)|(?=\ndiff --git)|(?=\n\#\#\s)|(?=\n```)|$)',
+        re.DOTALL
+    )
+    
+    for m in pattern.finditer(text):
+        filepath = m.group(1).strip()
+        content = m.group(2)
+        
+        # --- POST-PROCESSING PIPELINE ---
+        
+        # 1. Strip accidentally captured proprietary closers
+        for strip_tag in ["CONTENT>>>", "<<<CONTENT"]:
+            if strip_tag in content:
+                content = content.replace(strip_tag, "")
+                
+        # 2. [NEW in v2] Scrub trailing XML tool-call artifacts
+        # This regex matches one or more closing XML tags (like </parameter>\n</function>)
+        # strictly at the very END of the file content, ignoring whitespace/newlines in between.
+        xml_artifact_pattern = r'(?:\s*</[a-zA-Z0-9_]+>)+\s*$'
+        content = re.sub(xml_artifact_pattern, '', content)
+        
+        # 3. Diff Artifact check (double safety)
+        # If the path looks like a diff path (a/foo.py, b/foo.py), ignore it
+        if filepath.startswith("a/") or filepath.startswith("b/") or filepath == "/dev/null":
+            continue
+            
+        # 4. Content validation
+        # If content is extremely short (< 15 chars), it's likely a parsing artifact or hallucination
+        if len(content.strip()) < 15:
+            continue
+            
+        # Ensure the file ends with a clean, single trailing newline (POSIX standard)
+        results.append((filepath, content.rstrip() + "\n"))
+        
+    return results
 
 def extract_write_file_actions(text: str) -> List[Tuple[str, str]]:
     """
@@ -1305,6 +1413,8 @@ def resolve_path(raw_path: str, allowlist: List[str], root_dir: Path = Path(".")
     return None
 
 
+from typing import List, Optional, Any
+
 def _determine_verify_cmd(
     allowlist: List[str], 
     modified_files: List[str], 
@@ -1312,36 +1422,43 @@ def _determine_verify_cmd(
     config: Any
 ) -> str:
     """
-    Determine the verification command.
+    Determine the verification command based on context and LLM output.
     Priority:
     1. Model's explicit 'Verification:' line.
     2. Python file found in 'modified_files' (the file just generated).
     3. Python file found in 'allowlist'.
     """
-    # 1. Start with Model Suggestion
     candidate = auto_verify_cmd
     
-    # 2. If no suggestion, look for a runnable Python file in modified files
+    # 2. Look for a runnable Python file in modified files
     if not candidate:
         py_files = [str(f) for f in modified_files if str(f).endswith('.py')]
         if py_files:
             candidate = f"python3 {py_files[0]}"
             
-    # 3. If still nothing, check allowlist
+    # 3. Check allowlist as a fallback
     if not candidate:
         py_files = [str(f) for f in allowlist if str(f).endswith('.py')]
         if py_files:
             candidate = f"python3 {py_files[0]}"
     
-    # Interactive Mode
-    if not config.auto_approve:
+    # ========================================================
+    # [FIXED] Graceful Config Compatibility
+    # ========================================================
+    # If using the new UniversalAgent architecture (require_approval), 
+    # the interactive prompt is handled at the Orchestrator level.
+    # We just return the candidate string purely.
+    if hasattr(config, 'require_approval'):
+        return candidate or ""
+
+    # Legacy Mode Compatibility (If other old scripts still call this)
+    auto_approve = getattr(config, 'auto_approve', True)
+    if not auto_approve:
+        from rich.prompt import Prompt, Confirm
         if Confirm.ask("Run verification?", default=True):
-            # Pre-fill the prompt with our best guess
-            # User can just hit Enter to accept "python3 task.py"
             return Prompt.ask("Command", default=candidate or "").strip()
         return ""
 
-    # Auto Mode
     return candidate or ""
 
 def run_linter(files: List[str]) -> Optional[str]:

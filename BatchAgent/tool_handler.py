@@ -14,7 +14,7 @@ import markdownify
 # Make sure these are accessible or adjust imports as needed
 from BatchAgent.mini_batch_agent_libs import (
     is_git_repo, apply_patch_guarded, apply_write_files, extract_all_diffs,
-    extract_write_file_actions, apply_fuzzy_patch, extract_files_from_diff,
+    extract_write_file_actions_v2, apply_fuzzy_patch, extract_files_from_diff,
     resolve_path, search_code, find_file, list_directory, read_file_chunk,
     run_bash_command
 )
@@ -89,7 +89,7 @@ def parse_text_actions(content: str, allowlist: List[str]) -> List[AgentAction]:
     actions = []
     
     # 1. WRITE_FILE (Format B)
-    write_actions = extract_write_file_actions(content)
+    write_actions = extract_write_file_actions_v2(content)
     if write_actions:
         for path, text in write_actions:
             target_path = resolve_path(path, allowlist)
@@ -139,18 +139,18 @@ def parse_text_actions(content: str, allowlist: List[str]) -> List[AgentAction]:
         actions.append(ActionToolCall(name="web_search", args={"query": match.group(1).strip(), "category": "general"}))
 
     # 4. Extreme Fallbacks if no explicit format found and we only have 1 target file
-    if not actions and len(allowlist) == 1:
-        code_blocks = re.findall(r'```(?:python)?\s*(.*?)```', content, re.DOTALL)
-        if len(code_blocks) == 1:
-            block = code_blocks[0].strip()
-            if "def " in block or "import " in block:
-                actions.append(ActionWriteFile(path=allowlist[0], content=block))
-        elif "def " in content or "import " in content:
-            clean = content.strip()
-            if clean.startswith("```python"): clean = clean[len("```python"):].strip()
-            elif clean.startswith("```"): clean = clean[3:].strip()
-            if clean.endswith("```"): clean = clean[:-3].strip()
-            actions.append(ActionWriteFile(path=allowlist[0], content=clean))
+    # if not actions and len(allowlist) == 1:
+    #     code_blocks = re.findall(r'```(?:python)?\s*(.*?)```', content, re.DOTALL)
+    #     if len(code_blocks) == 1:
+    #         block = code_blocks[0].strip()
+    #         if "def " in block or "import " in block:
+    #             actions.append(ActionWriteFile(path=allowlist[0], content=block))
+    #     elif "def " in content or "import " in content:
+    #         clean = content.strip()
+    #         if clean.startswith("```python"): clean = clean[len("```python"):].strip()
+    #         elif clean.startswith("```"): clean = clean[3:].strip()
+    #         if clean.endswith("```"): clean = clean[:-3].strip()
+    #         actions.append(ActionWriteFile(path=allowlist[0], content=clean))
             
     return actions
 
@@ -370,6 +370,9 @@ class UniversalToolHandler:
                         
                     elif name == "run_bash_command":
                         res = run_bash_command(args.get("command", ""))
+                    
+                    elif name == "json_parse_error":
+                        res = args.get("error", "JSON Parse Error")
                         
                     else:
                         res = f"Error: Unknown tool '{name}'"
