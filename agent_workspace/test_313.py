@@ -1,173 +1,341 @@
 #!/usr/bin/env python3
 """
-Python 3.13 Feature Demonstration Script
-This script demonstrates the new features introduced in Python 3.13
+Python 3.13 Features Demo Script
+
+This script demonstrates the new features introduced in Python 3.13.
+Note: Some features require Python 3.13+ and will be skipped on older versions.
 """
 
 import sys
-from typing import TypeVar, ParamSpec, TypeVarTuple, TypedDict
+import warnings
+import copy
+import base64
+import argparse
+import json
 
-# Python 3.13+ feature: TypeIs for type narrowing
+# Check Python version
+PYTHON_VERSION = sys.version_info
+print(f"Python Version: {PYTHON_VERSION.major}.{PYTHON_VERSION.minor}.{PYTHON_VERSION.micro}")
+
+# =============================================================================
+# Type Imports with Version Checks
+# =============================================================================
+
+# TypeIs and ReadOnly are only available in Python 3.13+
 try:
-    from typing import TypeIs
+    from typing import TypeVar, ParamSpec, TypeVarTuple, TypedDict, TypeIs, ReadOnly
     HAS_TYPEIS = True
 except ImportError:
     HAS_TYPEIS = False
+    from typing import TypeVar, ParamSpec, TypeVarTuple, TypedDict
 
-# Python 3.13+ feature: TypeVarTuple for variadic generics
+# Type parameter defaults (PEP 696) - Python 3.13+
 try:
-    from typing import TypeVarTuple, Unpack
-    HAS_TYPEVARTUPLE = True
-except ImportError:
-    HAS_TYPEVARTUPLE = False
+    from typing import TypeVar
+    HAS_TYPEVAR_DEFAULT = True
+except:
+    HAS_TYPEVAR_DEFAULT = False
 
-# Python 3.13+ feature: TypeGuard (enhanced)
-try:
-    from typing import TypeGuard
-    HAS_TYPEGUARD = True
-except ImportError:
-    HAS_TYPEGUARD = False
+# =============================================================================
+# 1. Type Parameter Defaults (PEP 696) - Python 3.13+
+# =============================================================================
 
-# Python 3.13+ feature: PEP 695 (Inline Type Aliases)
-try:
-    exec("MyList = list[int]")
-    HAS_INLINE_TYPE_ALIASES = True
-except SyntaxError:
-    HAS_INLINE_TYPE_ALIASES = False
-
-# Python 3.13+ feature: PEP 702 (Match Scopes)
-try:
-    exec("""
-def test_match_scope():
-    match 1:
-        case 1:
-            x = 100  # x is scoped to this case
-    return x  # This would fail in Python 3.12
-""")
-    HAS_MATCH_SCOPES = True
-except SyntaxError:
-    HAS_MATCH_SCOPES = False
-
-# Python 3.13+ feature: PEP 727 (TypedDict total=False)
-try:
-    from typing import TypedDict
+def demonstrate_type_parameter_defaults():
+    """Demonstrate type parameters with default values."""
+    print("\n" + "="*60)
+    print("1. Type Parameter Defaults (PEP 696)")
+    print("="*60)
     
-    class Config(TypedDict, total=False):
-        name: str
-        age: int
+    if not HAS_TYPEVAR_DEFAULT:
+        print("  SKIPPED: Type parameter defaults require Python 3.13+")
+        print("  This feature allows TypeVar to have default values.")
+        print("  Example: T = TypeVar('T', default=int)")
+        return
     
-    HAS_TYPEDDICT_TOTAL = True
-except Exception:
-    HAS_TYPEDDICT_TOTAL = False
-
-# Python 3.13+ feature: PEP 742 (TypeAliasType)
-try:
-    from typing import TypeAliasType
+    # TypeVar with default
+    T = TypeVar('T', default=int)
     
-    MyInt = TypeAliasType("MyInt", int)
-    HAS_TYPEALIAS_TYPE = True
-except ImportError:
-    HAS_TYPEALIAS_TYPE = False
+    # Generic function with default type parameter
+    def identity(x: T) -> T:
+        return x
+    
+    # Can call without specifying type parameter
+    result = identity(42)
+    print(f"  identity(42) = {result} (type: {type(result).__name__})")
+    
+    # Can still specify explicitly
+    result_str = identity[str]("hello")
+    print(f"  identity[str]('hello') = {result_str}")
 
-# Python 3.13+ feature: PEP 748 (TypeIs)
-if HAS_TYPEIS:
-    def is_positive(x: int) -> TypeIs[int]:
-        """Type narrowing using TypeIs"""
-        return x > 0
+# =============================================================================
+# 2. Deprecated Decorator (PEP 614) - Python 3.13+
+# =============================================================================
 
-# Python 3.13+ feature: PEP 742 (TypeAliasType)
-if HAS_TYPEALIAS_TYPE:
-    def process_int(x: MyInt) -> MyInt:
-        """Using TypeAliasType"""
+def demonstrate_deprecated_decorator():
+    """Demonstrate the @deprecated decorator."""
+    print("\n" + "="*60)
+    print("2. Deprecated Decorator (PEP 614)")
+    print("="*60)
+    
+    if PYTHON_VERSION < (3, 13):
+        print("  SKIPPED: @deprecated decorator requires Python 3.13+")
+        print("  This decorator marks functions as deprecated.")
+        print("  Example: @deprecated('Use new_function instead')")
+        return
+    
+    from typing import deprecated
+    
+    @deprecated("Use new_function instead")
+    def old_function(x: int) -> int:
         return x * 2
+    
+    print("  old_function(5) = ", end="")
+    try:
+        result = old_function(5)
+        print(result)
+    except Exception as e:
+        print(f"Error: {e}")
+    
+    def new_function(x: int) -> int:
+        return x * 2
+    
+    print("  new_function(5) = ", end="")
+    try:
+        result = new_function(5)
+        print(result)
+    except Exception as e:
+        print(f"Error: {e}")
+
+# =============================================================================
+# 3. ReadOnly Type Annotation (PEP 705) - Python 3.13+
+# =============================================================================
+
+def demonstrate_readonly():
+    """Demonstrate the ReadOnly type annotation."""
+    print("\n" + "="*60)
+    print("3. ReadOnly Type Annotation (PEP 705)")
+    print("="*60)
+    
+    if not HAS_TYPEIS:
+        print("  SKIPPED: ReadOnly requires Python 3.13+")
+        print("  This annotation marks fields as read-only.")
+        print("  Example: data: dict[str, ReadOnly[int]]")
+        return
+    
+    from typing import ReadOnly
+    
+    class Config:
+        # ReadOnly field - cannot be reassigned after initialization
+        max_size: ReadOnly[int] = 100
+    
+    config = Config()
+    print(f"  Config.max_size = {config.max_size}")
+    
+    # This would raise an error in a real implementation
+    # config.max_size = 200  # Type error: cannot assign to ReadOnly
+
+# =============================================================================
+# 4. TypeIs (PEP 742) - Python 3.13+
+# =============================================================================
+
+def demonstrate_type_is():
+    """Demonstrate TypeIs for type narrowing."""
+    print("\n" + "="*60)
+    print("4. TypeIs (PEP 742)")
+    print("="*60)
+    
+    if not HAS_TYPEIS:
+        print("  SKIPPED: TypeIs requires Python 3.13+")
+        print("  This allows type narrowing based on runtime checks.")
+        print("  Example: def is_positive(x: int | None) -> TypeIs[int]:")
+        print("              if x is not None: return x")
+        return
+    
+    from typing import TypeIs
+    
+    def is_positive(x: int | None) -> TypeIs[int]:
+        """Return x if positive, else None."""
+        if x is not None and x > 0:
+            return x
+        return None
+    
+    result = is_positive(42)
+    print(f"  is_positive(42) = {result}")
+    print(f"  Type of result: {type(result).__name__}")
+
+# =============================================================================
+# 5. copy.replace() (Python 3.13+)
+# =============================================================================
+
+def demonstrate_copy_replace():
+    """Demonstrate the new copy.replace() function."""
+    print("\n" + "="*60)
+    print("5. copy.replace() (Python 3.13+)")
+    print("="*60)
+    
+    if PYTHON_VERSION < (3, 13):
+        print("  SKIPPED: copy.replace() requires Python 3.13+")
+        print("  This creates a shallow copy with specified changes.")
+        print("  Example: new_dict = copy.replace(old_dict, key='new_value')")
+        return
+    
+    # Create a dictionary
+    original = {"a": 1, "b": 2, "c": 3}
+    print(f"  Original: {original}")
+    
+    # Use copy.replace() to create a modified copy
+    modified = copy.replace(original, "b", 20)
+    print(f"  Modified (b=20): {modified}")
+    print(f"  Original unchanged: {original}")
+
+# =============================================================================
+# 6. base64.z85encode/decode (Python 3.13+)
+# =============================================================================
+
+def demonstrate_z85():
+    """Demonstrate base64.z85encode/decode."""
+    print("\n" + "="*60)
+    print("6. base64.z85encode/decode (Python 3.13+)")
+    print("="*60)
+    
+    if PYTHON_VERSION < (3, 13):
+        print("  SKIPPED: base64.z85encode/decode requires Python 3.13+")
+        print("  This provides Z85 encoding/decoding for base64.")
+        print("  Example: base64.z85encode(b'hello')")
+        return
+    
+    data = b"Hello, Python 3.13!"
+    encoded = base64.z85encode(data)
+    decoded = base64.z85decode(encoded)
+    
+    print(f"  Original: {data}")
+    print(f"  Encoded: {encoded}")
+    print(f"  Decoded: {decoded}")
+    print(f"  Match: {data == decoded}")
+
+# =============================================================================
+# 7. argparse deprecation support (Python 3.13+)
+# =============================================================================
+
+def demonstrate_argparse_deprecation():
+    """Demonstrate argparse's deprecation support."""
+    print("\n" + "="*60)
+    print("7. argparse deprecation support (Python 3.13+)")
+    print("="*60)
+    
+    if PYTHON_VERSION < (3, 13):
+        print("  SKIPPED: argparse deprecation support requires Python 3.13+")
+        print("  This allows marking arguments as deprecated.")
+        print("  Example: parser.add_argument('--old', deprecated=True)")
+        return
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--new', help='New argument')
+    parser.add_argument('--old', help='Deprecated argument', deprecated=True)
+    
+    args = parser.parse_args([])
+    print(f"  Parsed arguments: {args}")
+    print("  The 'deprecated' attribute can be checked on arguments")
+
+# =============================================================================
+# 8. Improved error messages (Python 3.13+)
+# =============================================================================
+
+def demonstrate_improved_errors():
+    """Demonstrate improved error messages in Python 3.13."""
+    print("\n" + "="*60)
+    print("8. Improved error messages (Python 3.13+)")
+    print("="*60)
+    
+    if PYTHON_VERSION < (3, 13):
+        print("  SKIPPED: Improved error messages require Python 3.13+")
+        print("  Python 3.13 provides better error messages for:")
+        print("  - Type errors with more context")
+        print("  - Syntax errors with better location info")
+        print("  - Import errors with clearer paths")
+        return
+    
+    # Example: Better type error messages
+    try:
+        x: int = "not an int"
+    except TypeError as e:
+        print(f"  Type error example: {e}")
+    
+    # Example: Better syntax error messages
+    try:
+        exec("x = 1\ny = 2\nz = 3\n")
+    except SyntaxError as e:
+        print(f"  Syntax error example: {e}")
+
+# =============================================================================
+# 9. locals() mutation semantics (PEP 667) - Python 3.13+
+# =============================================================================
+
+def demonstrate_locals_mutation():
+    """Demonstrate improved locals() mutation semantics."""
+    print("\n" + "="*60)
+    print("9. locals() mutation semantics (PEP 667)")
+    print("="*60)
+    
+    if PYTHON_VERSION < (3, 13):
+        print("  SKIPPED: locals() mutation improvements require Python 3.13+")
+        print("  PEP 667 clarifies that modifying locals() in a function")
+        print("  does NOT affect the local variables.")
+        return
+    
+    def test_locals():
+        x = 1
+        locals()['x'] = 2
+        return x
+    
+    result = test_locals()
+    print(f"  test_locals() = {result}")
+    print("  Modifying locals() does NOT affect local variables")
+
+# =============================================================================
+# 10. Free-threaded interpreter (Python 3.13+)
+# =============================================================================
+
+def demonstrate_free_threaded():
+    """Demonstrate the free-threaded interpreter option."""
+    print("\n" + "="*60)
+    print("10. Free-threaded interpreter (Python 3.13+)")
+    print("="*60)
+    
+    if PYTHON_VERSION < (3, 13):
+        print("  SKIPPED: Free-threaded interpreter requires Python 3.13+")
+        print("  Use: python3.13 -X faulthandler your_script.py")
+        print("  This removes the GIL for better parallelism.")
+        return
+    
+    print(f"  Python version: {sys.version_info}")
+    print("  Python 3.13 introduces a free-threaded interpreter option")
+    print("  Use: python3.13 -X faulthandler your_script.py")
+    print("  This removes the GIL for better parallelism")
+
+# =============================================================================
+# Main
+# =============================================================================
 
 def main():
-    print("=" * 60)
-    print("Python 3.13 Feature Demonstration")
-    print("=" * 60)
-    print(f"Python version: {sys.version}")
-    print()
+    print("\n" + "#"*60)
+    print("# Python 3.13 Features Demo")
+    print("#"*60)
     
-    # Check which features are available
-    features = [
-        ("TypeIs", HAS_TYPEIS),
-        ("TypeVarTuple", HAS_TYPEVARTUPLE),
-        ("TypeGuard", HAS_TYPEGUARD),
-        ("Inline Type Aliases (PEP 695)", HAS_INLINE_TYPE_ALIASES),
-        ("Match Scopes (PEP 702)", HAS_MATCH_SCOPES),
-        ("TypedDict total=False", HAS_TYPEDDICT_TOTAL),
-        ("TypeAliasType (PEP 742)", HAS_TYPEALIAS_TYPE),
-    ]
+    demonstrate_type_parameter_defaults()
+    demonstrate_deprecated_decorator()
+    demonstrate_readonly()
+    demonstrate_type_is()
+    demonstrate_copy_replace()
+    demonstrate_z85()
+    demonstrate_argparse_deprecation()
+    demonstrate_improved_errors()
+    demonstrate_locals_mutation()
+    demonstrate_free_threaded()
     
-    print("Available Python 3.13+ Features:")
-    print("-" * 40)
-    for name, available in features:
-        status = "✓" if available else "✗"
-        print(f"  {status} {name}")
-    print()
-    
-    # Demonstrate features that are available
-    
-    if HAS_TYPEIS:
-        print("1. TypeIs (Type Narrowing)")
-        print("-" * 40)
-        values = [-5, 0, 5, 10]
-        for v in values:
-            if is_positive(v):
-                print(f"   {v} is positive (type narrowed)")
-        print()
-    
-    if HAS_TYPEVARTUPLE:
-        print("2. TypeVarTuple (Variadic Generics)")
-        print("-" * 40)
-        
-        # Define a variadic type
-        class Point(TypedDict):
-            x: int
-            y: int
-        
-        print("   Example: Using TypeVarTuple for variadic generics")
-        print("   (Full example would use variadic generics)")
-        print()
-    
-    if HAS_INLINE_TYPE_ALIASES:
-        print("3. Inline Type Aliases (PEP 695)")
-        print("-" * 40)
-        print("   MyList = list[int]")
-        print("   MyDict = dict[str, int]")
-        print("   MySet = set[int]")
-        print()
-    
-    if HAS_MATCH_SCOPES:
-        print("4. Match Scopes (PEP 702)")
-        print("-" * 40)
-        def test_scope():
-            match 1:
-                case 1:
-                    x = 100  # x is scoped to this case
-            return x  # x is accessible here
-        
-        result = test_scope()
-        print(f"   Match scope test: {result}")
-        print()
-    
-    if HAS_TYPEDDICT_TOTAL:
-        print("5. TypedDict with total=False")
-        print("-" * 40)
-        config = Config(name="Alice")
-        print(f"   Config with partial fields: {config}")
-        print()
-    
-    if HAS_TYPEALIAS_TYPE:
-        print("6. TypeAliasType (PEP 742)")
-        print("-" * 40)
-        result = process_int(42)
-        print(f"   Processed value: {result}")
-        print()
-    
-    print("=" * 60)
-    print("Demonstration Complete!")
-    print("=" * 60)
+    print("\n" + "#"*60)
+    print("# Demo Complete!")
+    print("#"*60 + "\n")
 
 if __name__ == "__main__":
     main()
