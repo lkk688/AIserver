@@ -10,6 +10,11 @@ import httpx
 from bs4 import BeautifulSoup
 import markdownify
 
+import sys
+from pathlib import Path
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 # Import necessary components from your codebase
 # Make sure these are accessible or adjust imports as needed
 from BatchAgent.mini_batch_agent_libs import (
@@ -393,8 +398,18 @@ class UniversalToolHandler:
                     elif name == "json_parse_error":
                         res = args.get("error", "JSON Parse Error")
                         
+                    # [NEW] 拦截并执行领域特定工具
                     else:
-                        res = f"Error: Unknown tool '{name}'"
+                        from BatchAgent.domain_tools import DOMAIN_FUNCTIONS
+                        if name in DOMAIN_FUNCTIONS:
+                            try:
+                                func = DOMAIN_FUNCTIONS[name]
+                                # 动态解包字典参数并调用函数
+                                res = func(**args) 
+                            except Exception as e:
+                                res = f"Error executing domain tool {name}: {e}"
+                        else:
+                            res = f"Error: Unknown tool '{name}'"
                         
                     # Format the observation block for the LLM
                     tool_results.append(f"### Result for {name}\n```text\n{res}\n```")

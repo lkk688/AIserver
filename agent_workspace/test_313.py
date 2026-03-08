@@ -30,11 +30,7 @@ except ImportError:
     from typing import TypeVar, ParamSpec, TypeVarTuple, TypedDict
 
 # Type parameter defaults (PEP 696) - Python 3.13+
-try:
-    from typing import TypeVar
-    HAS_TYPEVAR_DEFAULT = True
-except:
-    HAS_TYPEVAR_DEFAULT = False
+HAS_TYPEVAR_DEFAULT = PYTHON_VERSION >= (3, 13)
 
 # =============================================================================
 # 1. Type Parameter Defaults (PEP 696) - Python 3.13+

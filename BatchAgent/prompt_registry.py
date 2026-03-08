@@ -2,6 +2,7 @@ from typing import List
 from pathlib import Path
 import sys
 from pathlib import Path
+from typing import List, Dict, Tuple, Any
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from BatchAgent.mini_batch_agent_libs import (
@@ -94,7 +95,7 @@ class PromptRegistry_old:
     
 class PromptRegistry:
     @classmethod
-    def get_system_prompt(cls, strategy: str, tools_list: list) -> str:
+    def get_system_prompt_v1(cls, strategy: str, tools_list: list) -> str:
         """
         Dynamically generates the system prompt based on the chosen Tool Strategy.
         """
@@ -148,6 +149,92 @@ class PromptRegistry:
         )
         
         return base_prompt + mode_prompt + verify_prompt
+
+    @classmethod
+    def get_system_prompt(cls, strategy: str, base_tools_list: List[Dict[str, Any]], domain: str = "general", location: str = "California, United States") -> str:
+        """
+        Dynamically generates the system prompt based on the chosen Tool Strategy.
+        Ensures the agent is completely clear on HOW to call tools.
+        """
+        #base_prompt = "You are an elite, general-purpose AI Agent. You operate in a structured environment.\n\n"
+        # [NEW] 时空感知 (Spatio-temporal Awareness)
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z")
+        
+        base_prompt = (
+            f"You are an elite, general-purpose AI Agent.\n"
+            f"**Current System Time**: {current_time}\n"
+            f"**Assumed Location**: {location}\n\n"
+        )
+        
+        if domain != "general":
+            base_prompt += f"**Domain Profile**: You are operating as a specialist in the '{domain.upper()}' domain. Use your domain-specific tools effectively.\n\n"
+
+        # -------------------------------------------------------------
+        # 1. 组装特定模式的指令
+        # -------------------------------------------------------------
+        mode_prompt = ""
+        
+        if strategy == "native_all":
+            # NATIVE_ALL 模式：绝对不能提任何关于 XML 的内容！
+            mode_prompt = (
+                "## 1. Execution Mode: NATIVE_ALL\n"
+                "You are operating in an environment that fully supports native JSON Function/Tool Calling.\n"
+                "- You MUST use the provided JSON functions (tools) for ALL interactions, including reading files, searching, and WRITING files.\n"
+                "- Do NOT use markdown code blocks to write code. You MUST use the `write_file` or `search_and_replace` tools.\n"
+                "- For general chat or thinking, just reply in plain text.\n\n"
+            )
+            # 在这种模式下，不需要手动列出工具，底层 API 会通过系统层传递 Schema 给模型
+            
+        elif strategy == "hybrid":
+            # HYBRID 模式：只允许 Markdown 写文件，其余查资料用原生工具
+            mode_prompt = (
+                "## 1. Execution Mode: HYBRID (Native Tools + Markdown Coding)\n"
+                "You have access to native JSON tools via the API for gathering information and finishing tasks.\n"
+                "However, to write or modify code, you MUST use Markdown formats instead of JSON tools.\n\n"
+                "### Modifying Files (Use Markdown ONLY)\n"
+                "**Format A: Unified Diff** (For modifying existing files)\n"
+                "```diff\n--- a/file.py\n+++ b/file.py\n@@ -1,2 +1,3 @@\n def main():\n-  pass\n+  print('hi')\n```\n\n"
+                "**Format B: WRITE_FILE** (For new files or massive rewrites)\n"
+                "WRITE_FILE: path/to/file.ext\n<<<CONTENT\n... code ...\nCONTENT>>>\n\n"
+            )
+            
+        elif strategy == "text_only":
+            # TEXT_ONLY 模式：没有原生工具，必须全部靠手打 XML
+            # 动态生成 XML 工具文档
+            xml_docs = ""
+            for t in base_tools_list:
+                name = t.get("name")
+                desc = t.get("description", "")
+                args_xml = "".join([f"<{k}>...</{k}>" for k in t.get("properties", {}).keys()])
+                xml_docs += f"`<tool_call><{name}>{args_xml}</{name}></tool_call>`\n  - {desc}\n"
+
+            mode_prompt = (
+                "## 1. Execution Mode: TEXT_ONLY\n"
+                "You do NOT have native JSON tools. You must output specific XML formats in your text to interact.\n\n"
+                "### Using Interactive Tools\n"
+                "To gather info, execute bash, or finish a task, output EXACTLY this XML format:\n"
+                f"{xml_docs}\n"
+                "⚠️ CRITICAL FORMATTING RULES:\n"
+                "- ❌ WRONG: `web_search(query='...')` (Do not use Python syntax)\n"
+                "- ❌ WRONG: `<web_search query=\"...\">` (Do not use XML attributes)\n"
+                "- ✅ CORRECT: `<tool_call><web_search><query>...</query></web_search></tool_call>` (Use nested XML tags)\n\n"
+                "### Modifying Files\n"
+                "**Format A: Unified Diff** (Start with `## Action` followed by ```diff block)\n"
+                "**Format B: WRITE_FILE** (`WRITE_FILE: path\\n<<<CONTENT\\n...\\nCONTENT>>>`)\n\n"
+            )
+
+        # -------------------------------------------------------------
+        # 2. 追加通用规则
+        # -------------------------------------------------------------
+        general_rules = (
+            "## 2. Information Gathering & Verification Rules (CRITICAL)\n"
+            "1. **Never Guess Code**: Check `Provided File Context` first. If missing, use tools to read files.\n"
+            "2. **Search for Unknowns**: Use `web_search` for unknown libraries or APIs.\n"
+            "3. **Verification**: After modifying code, you MUST run a verification command (e.g., `python3 script.py`).\n"
+            "4. Use the `finish_task` tool ONLY when you have verified the solution works.\n"
+        )
+        
+        return base_prompt + mode_prompt + general_rules
 
     @staticmethod
     def format_task(goal: str, allowlist: List[str], context_files: List[str], workspace_dir: str, content_injector) -> str:

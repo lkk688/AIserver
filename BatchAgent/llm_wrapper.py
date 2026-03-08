@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from rich.console import Console
 import sys
+from collections import Counter
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -169,8 +170,52 @@ from typing import List, Dict, Any
 # ==========================================
 # Helper Modules for LLM Interaction
 # ==========================================
+def _detect_repetition(text: str, window_size: int = 50, threshold: int = 4) -> bool:
+    """
+    Advanced Repetition Detector.
+    Catches exact looping phrases AND structural loops (like incrementing numbers in the same sentence).
+    """
+    if len(text) < 500:
+        return False
 
-def _detect_repetition(text: str, tail_lines: int = 30) -> bool:
+    # 1. 检测最常见的“尾部文字无限循环”
+    # 取最后的 500 个字符，按行分割
+    tail_lines = text[-500:].strip().split('\n')
+    if len(tail_lines) >= 4:
+        # 如果最后 4 行完全一模一样
+        if len(set(tail_lines[-4:])) == 1 and len(tail_lines[-1]) > 5:
+            return True
+
+    # 2. 检测“模式重复”（结构一样，只有数字不同）
+    # 把文本中的数字全部替换为占位符 <NUM>
+    normalized_text = re.sub(r'\d+', '<NUM>', text)
+    
+    # 将标准化的文本分成 Token (这里为了简单，用空格分词)
+    tokens = normalized_text.split()
+    
+    if len(tokens) < window_size * 2:
+        return False
+        
+    # 使用 N-Gram 统计频率 (N = 15 words)
+    n = 15
+    if len(tokens) < n:
+        return False
+        
+    ngrams = [" ".join(tokens[i:i+n]) for i in range(len(tokens) - n)]
+    ngram_counts = Counter(ngrams)
+    
+    # 如果某一段 15 个词的结构在文本中重复出现了超过 5 次，必定是模型退化了！
+    most_common = ngram_counts.most_common(1)
+    if most_common and most_common[0][1] > 5:
+        # Debug 打印，让你知道它因为什么被熔断了
+        print(f"\n[bold red]⚠️ Repetition Circuit Breaker Fused![/bold red]")
+        print(f"[dim]Detected repeating pattern: '{most_common[0][0]}' ({most_common[0][1]} times)[/dim]")
+        return True
+        
+    return False
+
+# deprecated    
+def _detect_repetition_v1(text: str, tail_lines: int = 30) -> bool:
     """Detects infinite loops in LLM generation tail, ignoring list numbers."""
     if not text or len(text) < 200: return False
     lines = text.splitlines()
@@ -231,18 +276,12 @@ async def _execute_openai_async(
     client: Any, model: str, messages: List[Dict[str, str]], 
     temperature: float, max_tokens: int, stream: bool,
     tools: Optional[List[Dict[str, Any]]] = None,
-    verbose: bool = False # [NEW] 传入 verbose 决定是否要在终端实时打印
+    verbose: bool = False
 ) -> Tuple[str, str, Dict[str, int], List[Dict[str, Any]]]:
-    """
-    Handles OpenAI/vLLM format. 
-    Includes complex state machine for reconstructing streamed tool calls and terminal streaming.
-    """
+    
     kwargs = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stream": stream,
+        "model": model, "messages": messages, "temperature": temperature,
+        "max_tokens": max_tokens, "stream": stream,
     }
     if tools: kwargs["tools"] = tools
     if stream: kwargs["stream_options"] = {"include_usage": True}
@@ -252,48 +291,54 @@ async def _execute_openai_async(
     content = ""
     finish_reason = "stop"
     usage_info = {}
-    native_tool_calls = [] # Structured as: [{"name": str, "arguments": str}]
+    native_tool_calls = []
     
     if stream:
         tc_dict = {}
+        chunk_counter = 0  # [NEW] 记录收到的 chunk 数量
+        
         async for chunk in resp:
-            # 提取 Usage 信息 (通常在最后一个空的 choices chunk 中)
+            chunk_counter += 1
+            
             if not chunk.choices:
                 if hasattr(chunk, 'usage') and chunk.usage:
-                    usage_info = {
-                        "prompt_tokens": chunk.usage.prompt_tokens, 
-                        "completion_tokens": chunk.usage.completion_tokens
-                    }
+                    usage_info = {"prompt_tokens": chunk.usage.prompt_tokens, "completion_tokens": chunk.usage.completion_tokens}
                 continue
                 
             delta = chunk.choices[0].delta
             
-            # --- [FIX 1: 实现真正的终端打字机流式输出] ---
             if delta.content:
                 content += delta.content
                 if verbose:
-                    # 实时打印到终端，flush=True 强制立即刷新缓冲区
-                    print(delta.content, end="", flush=True) 
+                    print(delta.content, end="", flush=True)
                 
-            # --- [FIX 2: 修复流式 Tool Call 拼接的空指针陷阱] ---
+                # =================================================================
+                # [NEW] 实时流式熔断 (Real-time Stream Circuit Breaker)
+                # 每收到 40 个字块，且总长度大于 500 时，抽样检测一次是否发疯
+                # =================================================================
+                if chunk_counter % 40 == 0 and len(content) > 500:
+                    if _detect_repetition(content):
+                        if verbose:
+                            print("\n\n[bold red]⚠️ [Stream Interrupted] Repetition Loop Detected! Connection severed.[/bold red]")
+                        finish_reason = "repetition"  # 标记特殊结束原因
+                        break # 强行跳出 async for，中断网络流，省时省钱！
+                        
+            # (后续解析 Tool Call 的逻辑保持不变)
             if delta.tool_calls:
                 for tc in delta.tool_calls:
                     idx = tc.index
                     if idx not in tc_dict:
-                        # 注意：tc.function.name 在后续的 chunk 中可能是 None，必须做安全 fallback
                         func_name = tc.function.name if tc.function and tc.function.name else "unknown_tool"
                         tc_dict[idx] = {"name": func_name, "arguments": ""}
-                    
                     if tc.function and tc.function.arguments:
                         tc_dict[idx]["arguments"] += tc.function.arguments
                         
             if chunk.choices[0].finish_reason:
                 finish_reason = chunk.choices[0].finish_reason
                 
-        if verbose and content:
-            print() # 流式输出结束后换行，保持终端整洁
+        if verbose and content and finish_reason != "repetition":
+            print()
             
-        # Convert stitched dictionary to list
         native_tool_calls = list(tc_dict.values())
         
     else:
@@ -416,7 +461,8 @@ async def complete_with_continuation_async(
     final_actions: List[AgentAction] = []
     
     # Decide if we inject tools into the API payload based on strategy
-    active_tools = tools if tool_strategy in ["native", "auto"] else None
+    #active_tools = tools if tool_strategy in ["native", "auto"] else None
+    active_tools = tools if tool_strategy in ["native_all", "auto", "hybrid"] else None
     
     for i in range(max_loops):
         if i > 0: console.print(f"[dim]Generation loop {i+1}/{max_loops}...[/dim]")
@@ -496,8 +542,15 @@ async def complete_with_continuation_async(
         full_content += content
         
         # Guardrail: Circuit Breaker for repetitive generation loops
+        # if _detect_repetition(full_content):
+        #     console.print("[bold red]Repetition loop detected! Fusing circuit breaker.[/bold red]")
+        #     break
+        # --- [FIX: 如果检测到发疯，直接熔断并抛弃最后的狂暴内容] ---
         if _detect_repetition(full_content):
             console.print("[bold red]Repetition loop detected! Fusing circuit breaker.[/bold red]")
+            # 稍微往回退一点，把最近生成的几百个字符切掉（因为通常检测到的时候，尾巴已经是垃圾了）
+            safe_length = max(0, len(full_content) - 1000)
+            full_content = full_content[:safe_length] + "\n\n[SYSTEM: OUTPUT TRUNCATED DUE TO REPETITION LOOP]"
             break
             
         # 5. Process Native Tool Calls (If Any)

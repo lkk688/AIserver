@@ -1,4 +1,10 @@
 from typing import List, Dict, Any
+import sys
+from pathlib import Path
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from BatchAgent.domain_tools import DOMAIN_REGISTRY
 
 # ==========================================
 # all tools are defined here in a provider-agnostic way, then compiled to specific formats in get_active_tools() based on strategy and provider.
@@ -98,6 +104,92 @@ MUTATION_TOOLS = [
     }
 ]
 
+# 动态提取 domain_tools.py 中的领域名称，作为 Enum 给大模型参考
+DOMAIN_NAMES = list(DOMAIN_REGISTRY.keys())
+
+META_TOOLS = [
+    {
+        "name": "load_domain_tools",
+        "description": "If your task requires specialized knowledge (e.g., medical, academic, finance), use this tool to load the specific domain plugin into your context. This unlocks advanced tools.",
+        "properties": {
+            "domain": {
+                "type": "string",
+                "enum": DOMAIN_NAMES,
+                "description": "The specific domain plugin to load."
+            }
+        },
+        "required": ["domain"]
+    }
+]
+
+def get_base_tools(strategy: str, enable_parallel: bool = False, domain: str = "general") -> List[Dict[str, Any]]:
+    """
+    Step 1: Get the raw tool schemas based on the execution strategy and features.
+    This list is used to dynamically generate the System Prompt.
+    """
+    # 基础观察工具 (所有模式都可用)
+    active_tools = OBSERVATION_TOOLS.copy()
+    
+    # 动态注入并行思考工具
+    if enable_parallel:
+        active_tools.append({
+            "name": "brainstorm_solutions",
+            "description": "Trigger parallel LLM thinking. Use this when facing a complex problem to brainstorm multiple distinct approaches simultaneously before writing code.",
+            "properties": {
+                "problem_statement": {"type": "string"},
+                "n_variations": {"type": "integer", "description": "Number of parallel approaches to generate (max 4)."}
+            },
+            "required": ["problem_statement", "n_variations"]
+        })
+
+    # [NEW] 动态注入领域专属工具
+    # 动态注入领域专属工具
+    if domain != "auto" and domain != "general" and domain in DOMAIN_REGISTRY:
+        active_tools.extend(DOMAIN_REGISTRY[domain])
+        
+    # 只有在 native_all 模式下，才把写文件的工具注册为 JSON Schema
+    # 在 hybrid 和 text_only 下，模型使用 Markdown 写文件，因此不提供原生 JSON 写入工具
+    if strategy == "native_all":
+        active_tools.extend(MUTATION_TOOLS)
+        
+    return active_tools
+
+def compile_tools_for_provider(base_tools: List[Dict[str, Any]], provider: str, strategy: str) -> List[Dict[str, Any]]:
+    """
+    Step 2: Compile raw schemas into the specific format expected by the LLM Provider API.
+    """
+    # [FIX] 如果是纯文本模式，向 API 注册空工具列表，强制关闭底层 Function Calling
+    if strategy == "text_only":
+        return []
+        
+    compiled = []
+    for tool in base_tools:
+        if provider == "anthropic":
+            compiled.append({
+                "name": tool["name"],
+                "description": tool["description"],
+                "input_schema": {
+                    "type": "object",
+                    "properties": tool.get("properties", {}),
+                    "required": tool.get("required", [])
+                }
+            })
+        else: # OpenAI / vLLM Format
+            compiled.append({
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": {
+                        "type": "object",
+                        "properties": tool.get("properties", {}),
+                        "required": tool.get("required", [])
+                    }
+                }
+            })
+    return compiled
+
+# [DEPRECATED] 
 def get_active_tools(strategy: str, provider: str) -> List[Dict[str, Any]]:
     """
     Compile the active tool list based on the chosen strategy and provider format.

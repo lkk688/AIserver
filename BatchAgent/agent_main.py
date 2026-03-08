@@ -27,8 +27,10 @@ from BatchAgent.mini_batch_agent_libs import (
     _handle_missing_modules, top_level_tree, read_file, estimate_tokens, truncate_to_tokens, robust_json_loads
 )
 from BatchAgent.mini_batch_agent import ActionApplyDiff, ActionToolCall, ActionWriteFile, ActionReplaceText
-from BatchAgent.tools_registry import get_active_tools
+from BatchAgent.tools_registry import get_base_tools, compile_tools_for_provider #get_active_tools
 from BatchAgent.prompt_registry import PromptRegistry
+
+from BatchAgent.domain_tools import DOMAIN_REGISTRY
 
 console = Console()
 
@@ -46,11 +48,14 @@ class AgentConfig:
     require_approval: bool
     agent_dir: Path
     tool_strategy: str  # [NEW] 'native_all', 'hybrid', 'text_only'
+    parallel_thinking: bool = False  # [NEW] 开关：是否允许并发思维分叉
     provider: str = "openai"
     sandbox_container: Optional[str] = None
     verbose: bool = False
     max_retries: int = 4
     serper_api_key: str = ""
+    domain: str = "general"
+    location: str = "California, United States"
 
 
 
@@ -60,9 +65,9 @@ class AgentConfig:
 # ==========================================
 class UniversalAgent:
     """
-    An Object-Oriented Autonomous Agent implementing a Single-Track Parallel ReAct Loop.
+    Modular, RL-friendly Autonomous Agent with Batched Parallel Thinking.
     """
-    def __init__(self, config: AgentConfig, system_message: str, tools: List[Dict[str, Any]]):
+    def __init__(self, config: Any, system_message: str, tools: List[Dict[str, Any]]):
         self.config = config
         self.system_message = system_message
         self.tools = tools
@@ -114,7 +119,307 @@ class UniversalAgent:
                 
         return "\n\n".join(combined_results)
 
+    
+    def _prune_memory(self):
+        """防止 Death Spiral 的滑动窗口内存管理"""
+        if len(self.messages) > 8:
+            self.messages = [self.messages[0], self.messages[1]] + self.messages[-4:]
+            console.print("[dim]🧹 Memory window pruned to prevent context overflow.[/dim]")
+
+    async def _execute_batch_brainstorm(self, action: ActionToolCall, allowlist: List[str]) -> str:
+        """
+        核心重构：将复杂的子 Agent 降级为廉价且纯粹的 Batch LLM Calls。
+        利用 vLLM 的连续批处理能力，并发请求，汇总为纯文本。
+        """
+        problem = action.args.get('problem_statement', 'Help me solve this task.')
+        n_vars = min(4, max(2, int(action.args.get('n_variations', 3))))
+        
+        console.print(f"\n[bold magenta]🧠 Launching {n_vars} Batch LLM Calls for Parallel Thinking...[/bold magenta]")
+        
+        # 构造一个纯净的 Prompt，不要给工具，只要它“想”
+        bs_messages = self.messages + [{
+            "role": "user", 
+            "content": f"Please brainstorm a unique strategy to solve: '{problem}'. Do NOT write final code. Just provide the step-by-step logic."
+        }]
+        
+        async def _fetch_idea(idx: int) -> str:
+            # 动态调整温度以增加策略多样性
+            div_temp = min(0.9, getattr(self.config, 'temperature', 0.2) + 0.3 + (idx * 0.15))
+            
+            # 从外部引入你的 complete_with_continuation_async
+            from BatchAgent.llm_wrapper import complete_with_continuation_async
+            
+            content, _ = await complete_with_continuation_async(
+                client=self.config.client,
+                model=self.config.model,
+                messages=bs_messages,
+                temperature=div_temp,
+                max_output_tokens=1024, # 限制思维发散的长度
+                model_max_context=self.config.max_context,
+                provider=self.config.provider,
+                stream=False,   # 屏蔽子调用的终端打印
+                verbose=False,
+                tool_strategy="text", # 强制纯文本模式
+                allowlist=allowlist
+            )
+            return f"### Approach {idx + 1} (Temp {div_temp:.2f}):\n{content}\n"
+
+        bs_start = time.time()
+        # 万箭齐发，榨干 vLLM
+        ideas = await asyncio.gather(*(_fetch_idea(i) for i in range(n_vars)), return_exceptions=True)
+        
+        valid_ideas = [idea for idea in ideas if not isinstance(idea, Exception)]
+        combined_ideas = "\n\n".join(valid_ideas)
+        
+        console.print(f"[dim]Batch Brainstorming completed in {time.time() - bs_start:.1f}s[/dim]")
+        
+        return (
+            f"### Parallel Brainstorming Results\n{combined_ideas}\n\n"
+            f"Please review these options, select the best approach (or a combination), and proceed with your format (Format A or B)."
+        )
+
+    def _verify_mutations(self, content: str, mutation_actions: List[Any], allowlist: List[str], turn_dir: Path) -> Tuple[bool, str]:
+        """
+        独立的沙盒验证模块
+        返回: (is_success, feedback_string)
+        """
+        # 1. 提取被修改的文件
+        modified_files = []
+        for a in mutation_actions:
+            if hasattr(a, 'path'): modified_files.append(a.path)
+            elif isinstance(a, ActionApplyDiff):
+                paths = re.findall(r'^\+\+\+ b/(.+)$', getattr(a, 'diff_text', ''), re.MULTILINE)
+                modified_files.extend(paths)
+        modified_files = list(set(modified_files))
+        
+        # 2. 推断验证命令
+        auto_verify_cmd = re.search(r"^Verification:\s*(.+)$", content, re.MULTILINE)
+        v_cmd = auto_verify_cmd.group(1).strip() if auto_verify_cmd else None
+        verify_cmd = _determine_verify_cmd(allowlist, modified_files, v_cmd, self.config)
+        
+        if not verify_cmd:
+            console.print("[yellow]No verification command found/needed. Assuming Success.[/yellow]")
+            return True, ""
+            
+        # 3. 用户授权检查
+        if getattr(self.config, 'require_approval', False):
+            console.print(f"\n[bold red]⚠️ Agent intends to run a command: [/bold red] `[white]{verify_cmd}[/white]`")
+            from rich.prompt import Confirm
+            if not Confirm.ask("Do you approve executing this command?"):
+                return True, "User bypassed verification."
+
+        # 4. 执行命令
+        console.print(f"[cyan]-> Running Verification Sandbox...[/cyan]")
+        code, out = run_shell(verify_cmd, cap=20000, sandbox_container=getattr(self.config, 'sandbox_container', None))
+        (turn_dir / "verify_stdout.txt").write_text(out, encoding='utf-8')
+        
+        if code == 0:
+            console.print("[bold green]✅ Verification PASSED![/bold green]")
+            if getattr(self.config, 'verbose', False): console.print(f"[dim]{out}[/dim]")
+            return True, ""
+        else:
+            console.print(f"[bold red]❌ Verification Failed (exit={code})[/bold red]")
+            from CodeAgent.codeagent_libs import build_debug_prompt
+            smart_error = build_debug_prompt(out, root_dir=str(self.config.workspace_dir))
+            
+            error_feedback = (
+                f"⚠️ [Verification Failed] Exit Code: {code}\n"
+                f"Command: {verify_cmd}\n"
+                f"{smart_error}\n"
+                f"Please analyze the error. You may use observation tools to investigate, then provide a fix."
+            )
+            return False, error_feedback
+
+    # =========================================================
+    # THE MAIN LOOP (Now incredibly clean and readable)
+    # =========================================================
     async def execute_task(self, task_goal: str, task_idx: int, allowlist: List[str], prompt_md: str) -> bool:
+        
+        console.print(f"\n[bold green]=== Starting Agent Task {task_idx+1} ===[/bold green]")
+        self.messages = [{"role": "system", "content": self.system_message}, {"role": "user", "content": prompt_md}]
+        self._log_rl("system", self.system_message)
+        self._log_rl("user", prompt_md)
+
+        MAX_REACT_TURNS = 15
+        from BatchAgent.llm_wrapper import complete_with_continuation_async # Local import
+        
+        for current_turn in range(MAX_REACT_TURNS):
+            self._prune_memory()
+            
+            turn_dir = self.config.session_dir / f"{task_idx * 100 + current_turn:04d}"
+            turn_dir.mkdir(parents=True, exist_ok=True)
+
+            # ===============================================================
+            # [NEW] 1. 落盘：完整的 Prompt 上下文 (最关键的调试文件)
+            # ===============================================================
+            (turn_dir / "full_prompt_context.json").write_text(
+                json.dumps(self.messages, indent=2, ensure_ascii=False), 
+                encoding="utf-8"
+            )
+            # 保留一个人类易读的版本，只看最新的一条指令
+            (turn_dir / "latest_instruction.md").write_text(self.messages[-1]["content"], encoding="utf-8")
+            
+            console.print(f"\n[bold yellow]>>> ReAct Turn {current_turn + 1} / {MAX_REACT_TURNS}[/bold yellow]")
+            
+            # --- 1. LLM Generation ---
+            content, actions = await complete_with_continuation_async(
+                client=self.config.client, model=self.config.model, messages=self.messages,
+                temperature=getattr(self.config, 'temperature', 0.2), max_output_tokens=self.config.max_output,
+                model_max_context=self.config.max_context, provider=self.config.provider,
+                stream=True, verbose=self.config.verbose, session_dir=self.config.session_dir,
+                tools=self.tools, tool_strategy=self.config.tool_strategy, allowlist=allowlist
+            )
+            
+            (turn_dir / "response.md").write_text(content, encoding="utf-8")
+            self._log_rl("assistant", content)
+
+            # ===============================================================
+            # [NEW] 2. 落盘：引擎解析出的 Action 列表
+            # ===============================================================
+            action_logs = []
+            for a in actions:
+                if hasattr(a, 'name') and hasattr(a, 'args'): # ActionToolCall
+                    action_logs.append({"type": "Native/XML Tool", "name": a.name, "args": a.args})
+                else: # File Mutations
+                    action_logs.append({"type": a.__class__.__name__, "path": getattr(a, 'path', 'N/A')})
+            
+            (turn_dir / "parsed_actions.json").write_text(
+                json.dumps(action_logs, indent=2, ensure_ascii=False), 
+                encoding="utf-8"
+            )
+            
+            # --- 2. Check for Conclusion ---
+            if next((a for a in actions if getattr(a, 'name', '') == 'finish_task'), None):
+                console.print("[bold green]🏁 Agent explicitly finished the task.[/bold green]")
+                self._save_trajectory_to_disk(task_idx, reward=1.0)
+                return True
+                
+            if not actions:
+                console.print("[yellow]Agent outputted nothing useful. Forcing format switch.[/yellow]")
+                
+                # [FIX 2: 动态错误反馈，防止逻辑冲突]
+                if self.config.tool_strategy == "native_all":
+                    feedback = (
+                        "⚠️ System Warning: No valid tool calls detected.\n"
+                        "You MUST use your native JSON function calling capabilities to execute tools (e.g. `web_search`, `write_file`). "
+                        "Do NOT output JSON in plain text code blocks."
+                    )
+                elif self.config.tool_strategy == "text_only":
+                    feedback = (
+                        "⚠️ System Warning: No valid XML tool calls detected.\n"
+                        "Please use the exact XML tags (e.g., `<tool_call><web_search>...</web_search></tool_call>`) to use tools, "
+                        "or use Format B to write files."
+                    )
+                else: # hybrid
+                    feedback = (
+                        "⚠️ System Warning: No valid tool calls or file modifications were detected.\n"
+                        "Use native JSON tools for searching/reading, and **Format B (WRITE_FILE)** directly in the Markdown text for writing code.\n"
+                        "If you are finished, invoke the `finish_task` tool."
+                    )
+
+                self.messages.extend([{"role": "assistant", "content": content}, {"role": "user", "content": feedback}])
+                self._log_rl("user", feedback)
+                current_turn += 1
+                continue
+                
+            # --- 3. Action Segregation ---
+            info_actions = [a for a in actions if isinstance(a, ActionToolCall)]
+            mutation_actions = [a for a in actions if isinstance(a, (ActionWriteFile, ActionApplyDiff, ActionReplaceText))]
+            feedback_blocks = []
+
+            # =====================================================================
+            # [NEW] 插件系统：动态加载领域工具 (Hot-Swapping)
+            # =====================================================================
+            load_domain_action = next((a for a in info_actions if getattr(a, 'name', '') == 'load_domain_tools'), None)
+            
+            if load_domain_action:
+                new_domain = load_domain_action.args.get('domain', '')
+                console.print(f"\n[bold green]🔌 Agent is hot-swapping domain plugin: [white]{new_domain}[/white][/bold green]")
+                
+                if new_domain in DOMAIN_REGISTRY:
+                    # 1. 更新 Config 状态
+                    self.config.domain = new_domain
+                    
+                    # 2. 重新获取并编译包含新领域工具的列表
+                    new_base_tools = get_base_tools(
+                        strategy=self.config.tool_strategy, 
+                        enable_parallel=getattr(self.config, 'parallel_thinking', False), 
+                        domain=new_domain
+                    )
+                    self.tools = compile_tools_for_provider(new_base_tools, self.config.provider, self.config.tool_strategy)
+                    
+                    # 3. 重新生成 System Prompt (不仅包含新工具的 XML 描述，还包含新的人设 Domain Profile)
+                    self.system_message = PromptRegistry.get_system_prompt(self.config.tool_strategy, new_base_tools, new_domain)
+                    
+                    # 4. 【核心魔术】修改第一条历史记录，悄无声息地替换 Agent 的大脑设定！
+                    self.messages[0]["content"] = self.system_message
+                    
+                    tool_names = [t['name'] for t in DOMAIN_REGISTRY[new_domain]]
+                    load_feedback = (
+                        f"✅ Successfully loaded the '{new_domain}' plugin!\n"
+                        f"**New tools available**: {', '.join(tool_names)}.\n"
+                        f"Please proceed to use these new tools to complete your task."
+                    )
+                else:
+                    load_feedback = f"❌ Failed to load domain. '{new_domain}' is not a valid domain plugin."
+                
+                # 记录这轮操作并继续循环，让模型在下一轮立即使用新工具
+                self.messages.extend([{"role": "assistant", "content": content}, {"role": "user", "content": load_feedback}])
+                self._log_rl("user", load_feedback)
+                current_turn += 1
+                continue
+            # =====================================================================
+
+            # --- 4. Handle Parallel Brainstorming (Optional / Configurable) ---
+            # 只有在 config 开启了 enable_parallel_thinking 时，才会注入这个工具并处理
+            brainstorm_action = next((a for a in info_actions if getattr(a, 'name', '') == 'brainstorm_solutions'), None)
+            if brainstorm_action and getattr(self.config, 'enable_parallel_thinking', False):
+                bs_feedback = await self._execute_batch_brainstorm(brainstorm_action, allowlist)
+                self.messages.extend([{"role": "assistant", "content": content}, {"role": "user", "content": bs_feedback}])
+                self._log_rl("user", bs_feedback)
+                continue # 拿到思路后进入下一轮，不执行其他工具
+
+            # --- 5. Execute Standard Tools (Concurrently) ---
+            # 过滤掉特殊的元工具
+            standard_info_actions = [a for a in info_actions if a.name not in ['brainstorm_solutions', 'finish_task']]
+            if standard_info_actions:
+                concurrent_results = await self._execute_tools_concurrently(standard_info_actions, turn_dir, allowlist)
+                feedback_blocks.append(f"### Tool Execution Results\n{concurrent_results}")
+                
+            # --- 6. Execute Mutations & Verify ---
+            if mutation_actions:
+                handler = UniversalToolHandler(self.config, turn_dir, allowlist)
+                has_mutation, mutation_res = handler.execute(mutation_actions, content)
+                feedback_blocks.append(mutation_res)
+                
+                if has_mutation:
+                    v_success, v_feedback = self._verify_mutations(content, mutation_actions, allowlist, turn_dir)
+                    if v_success:
+                        self._save_trajectory_to_disk(task_idx, reward=1.0)
+                        return True
+                    else:
+                        feedback_blocks.append(v_feedback)
+
+            # --- 7. Loop Feedback ---
+            combined_feedback = "\n\n".join(feedback_blocks)
+            if not mutation_actions and standard_info_actions:
+                combined_feedback += "\nAnalyze the results and continue."
+            
+            # ===============================================================
+            # [NEW] 3. 落盘：工具执行的返回结果 (Feedback)
+            # ===============================================================
+            if combined_feedback:
+                (turn_dir / "tool_execution_results.md").write_text(combined_feedback, encoding="utf-8")
+
+            self.messages.extend([{"role": "assistant", "content": content}, {"role": "user", "content": combined_feedback}])
+            self._log_rl("user", combined_feedback)
+
+        console.print("[bold red]Max ReAct turns exceeded. Task aborted.[/bold red]")
+        self._save_trajectory_to_disk(task_idx, reward=-1.0)
+        return False
+
+    # [old version]
+    async def execute_task_v1(self, task_goal: str, task_idx: int, allowlist: List[str], prompt_md: str) -> bool:
         """The core ReAct State Machine."""
         console.print(f"\n[bold green]=== Starting Agent Task {task_idx+1} ===[/bold green]")
         
@@ -461,7 +766,7 @@ async def main_async():
     # Provider & Env
     parser.add_argument("--tool-strategy", 
                         choices=["native_all", "hybrid", "text_only"], 
-                        default="hybrid",
+                        default="native_all",
                         help="Choose how the LLM interacts with tools.")
     parser.add_argument("--provider", default="openai", choices=["openai", "anthropic"], help="LLM Provider")
     parser.add_argument("--model", default=os.environ.get("VLLM_MODEL", "qwen3.5-9b"))
@@ -470,11 +775,19 @@ async def main_async():
     parser.add_argument("--serper-key", default=os.environ.get("SERPER_API_KEY", ""), help="API key for Web Search")
     
     # System Features (New Additions)
+    parser.add_argument("--parallel-thinking", action="store_true", help="Enable Batched LLM calls for branching thoughts (Free for local vLLM, expensive for APIs).")
     parser.add_argument("--output-dir", default="./agent_workspace", help="Default directory for agent to write files")
     parser.add_argument("--sandbox", default=None, help="Docker container name for sandbox execution (e.g. 'my_container')")
     parser.add_argument("--require-approval", action="store_true", help="Require user confirmation before writing files or executing commands")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging of LLM responses and tool outputs")
     parser.add_argument("--max-context", type=int, default=16384, help="Fallback context length if auto-detect fails")
+    
+    parser.add_argument("--domain", default="auto", 
+                        choices=["general", "medical", "academic", "news", 
+                                 "software_eng", "math", "science", "language", 
+                                 "business", "assistant", "sales_support"], 
+                        help="Inject domain-specific tools.")
+    parser.add_argument("--location", default="California, United States", help="Location for time-sensitive tasks")
     
     args = parser.parse_args()
 
@@ -530,10 +843,13 @@ async def main_async():
         require_approval=args.require_approval,
         agent_dir=agent_dir,
         tool_strategy=args.tool_strategy,
+        parallel_thinking=args.parallel_thinking,
         provider=args.provider,
         sandbox_container=args.sandbox,
         verbose=args.verbose,
-        serper_api_key=args.serper_key
+        serper_api_key=args.serper_key,
+        domain=args.domain,
+        location=args.location
     )
 
     # --- Goal Collection ---
@@ -549,8 +865,28 @@ async def main_async():
     # =======================================================
     # Based on the selected strategy, setup System Prompt and Tools
     # =======================================================
-    compiled_tools = get_active_tools(config.tool_strategy, config.provider)
-    system_prompt = PromptRegistry.get_system_prompt(config.tool_strategy, compiled_tools)
+    # 1. 获取基础工具 Schema (同时支持根据参数开启并行能力)
+    base_tools = get_base_tools(
+        strategy=config.tool_strategy, 
+        enable_parallel=getattr(config, 'parallel_thinking', False)
+    )
+    
+    # 2. 编译为 API 所需格式 (如果是 text_only，这里会自动变成 [])
+    compiled_tools = compile_tools_for_provider(
+        base_tools=base_tools, 
+        provider=config.provider, 
+        strategy=config.tool_strategy
+    )
+    
+    # 3. 生成系统提示词 (传入 base_tools 供它动态生成 XML 说明)
+    system_prompt = PromptRegistry.get_system_prompt(
+        strategy=config.tool_strategy, 
+        base_tools_list=base_tools,
+        domain=config.domain,
+        location=config.location
+    )
+    # compiled_tools = get_active_tools(config.tool_strategy, config.provider)
+    # system_prompt = PromptRegistry.get_system_prompt(config.tool_strategy, compiled_tools)
     
     #compiled_tools = get_compiled_tools(config.provider)
     #system_prompt = PromptRegistry.get_system_prompt(BASE_TOOLS)
