@@ -20,13 +20,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # ---------------------------------------------------------
 # Import our newly refactored robust components
 # ---------------------------------------------------------
-from BatchAgent.llm_wrapper import complete_with_continuation_async, get_compiled_tools, BASE_TOOLS
+from BatchAgent.llm_wrapper import complete_with_continuation_async #, get_compiled_tools, BASE_TOOLS
 from BatchAgent.tool_handler import UniversalToolHandler
 from BatchAgent.mini_batch_agent_libs import (
-    now_stamp, ensure_dirs, run_shell, _determine_verify_cmd, 
+    now_stamp, ensure_dirs, run_shell, _determine_verify_cmd, build_debug_prompt,
     _handle_missing_modules, top_level_tree, read_file, estimate_tokens, truncate_to_tokens, robust_json_loads
 )
 from BatchAgent.mini_batch_agent import ActionApplyDiff, ActionToolCall, ActionWriteFile, ActionReplaceText
+from BatchAgent.tools_registry import get_active_tools
+from BatchAgent.prompt_registry import PromptRegistry
 
 console = Console()
 
@@ -43,94 +45,14 @@ class AgentConfig:
     max_output: int
     require_approval: bool
     agent_dir: Path
+    tool_strategy: str  # [NEW] 'native_all', 'hybrid', 'text_only'
     provider: str = "openai"
     sandbox_container: Optional[str] = None
     verbose: bool = False
     max_retries: int = 4
     serper_api_key: str = ""
 
-# ==========================================
-# 2. Prompt Registry
-# ==========================================
-class PromptRegistry:
-    """
-    Centralized manager for all LLM prompts.
-    Defines strict output formats, verification rules, and tool usages.
-    """
-    @classmethod
-    def get_system_prompt(cls, tools_list: list) -> str:
-        """Dynamically generates the system prompt based on available tools."""
-        base_prompt = (
-            "You are an elite, general-purpose AI Agent. You can write code, author documentation, and answer complex questions.\n"
-            "You operate in a structured generation environment.\n\n"
-            "## Output Format (STRICT)\n"
-            "You MUST output in ONE of these three formats per response. Never mix them.\n\n"
-            "### Format A: Unified Diff (For small code edits)\n"
-            "1. Start with `## Action` followed by a SINGLE fenced diff block (`diff --git ...`).\n\n"
-            "### Format B: WRITE_FILE (For new files, full rewrites, or writing Documents)\n"
-            "WRITE_FILE: path/to/file.ext\n"
-            "<<<CONTENT\n...\nCONTENT>>>\n\n"
-            "### Format C: Direct Response (For Q&A, Summaries, and Tutorials)\n"
-            "Output directly in Markdown.\n\n"
-            "## Information Gathering & Anti-Hallucination Rules (CRITICAL)\n"
-            "1. **Never Guess Code**: Check the `Provided File Context` section first.\n"
-            "2. **Read Before Act**: If a requested file is NOT in the context, you MUST use `read_file_chunk` or `find_file` before modifying it.\n"
-            "3. **Search for Unknowns**: Use `web_search` for unknown libraries, APIs, or events.\n\n"
-            "## Verification & Environment Rules (CRITICAL)\n"
-            "1. **Mandatory Verification**: If you write executable code, include a verification command on a standalone line:\n"
-            "   `Verification: <command>` (e.g., `Verification: python3 script.py`)\n"
-            "2. **Environment Limitations**: If the environment lacks dependencies (e.g., requires Python 3.13 but environment has 3.12):\n"
-            "   - Write the correct code anyway.\n"
-            "   - Use Format C to provide a step-by-step setup tutorial.\n"
-            "   - Do NOT output a `Verification:` command that is guaranteed to fail.\n\n"
-        )
 
-        tool_section = "## Interactive Tools\nIf you lack context, output an XML tool call to pause and wait for data:\n"
-        for t in tools_list:
-            name = t.get("name")
-            desc = t.get("description", "")
-            # Construct dummy XML example
-            args_xml = "".join([f"<{k}>...</{k}>" for k in t.get("properties", {}).keys()])
-            tool_section += f"`<tool_call><{name}>{args_xml}</{name}></tool_call>`\n  - {desc}\n"
-
-        return base_prompt + tool_section
-
-    @staticmethod
-    def format_task(goal: str, allowlist: List[str], context_files: List[str], notes: str, workspace_dir: str) -> str:
-        """Builds the main Turn Prompt for the user message."""
-        allow_txt = "\n".join(f"- {p}" for p in allowlist) if allowlist else "- (none)"
-        
-        all_new_files = all(not Path(f).exists() for f in allowlist) if allowlist else False
-        format_hint = ""
-        if not allowlist or all_new_files:
-            format_hint = "\n> **HINT**: You are creating NEW files or answering a query. Use **Format B (WRITE_FILE)** or **Format C**.\n"
-        elif len(allowlist) > 1:
-            format_hint = "\n> **HINT**: You are modifying multiple files. Use **Format B (WRITE_FILE)** to avoid diff truncation.\n"
-
-        base_md = (
-            f"# Agent Task\n\n"
-            f"## Goal\n{goal}\n\n"
-            f"## Workspace Context\n"
-            f"Directory: `./` (inside `{workspace_dir}/`)\n\n"
-            f"## Target Files (Allowlist)\n{allow_txt}\n{format_hint}\n"
-            f"## Notes & Constraints\n{notes if notes else '(none)'}\n\n"
-            f"## Output Contract Reminder\n"
-            f"1. Choose ONE format: Format A (Diff), Format B (Write), or Format C (Direct Answer).\n"
-            f"2. If generating code, remember the `Verification: <cmd>` rule.\n"
-        )
-        
-        files_md = ""
-        for f in list(dict.fromkeys(allowlist + context_files)):
-            content = read_file(str(f))
-            if content and not content.startswith("[MISSING FILE]"):
-                if estimate_tokens(content) > 8000:
-                    content = truncate_to_tokens(content, 8000)
-                files_md += f"### File: {f}\n```text\n{content}\n```\n"
-                
-        if files_md:
-            base_md += f"\n## Provided File Context\n{files_md}"
-
-        return base_md
 
 
 # ==========================================
@@ -207,6 +129,14 @@ class UniversalAgent:
         current_turn = 0
 
         while current_turn < MAX_REACT_TURNS:
+            # --- [FIX: Sliding Window Memory] ---
+            # If multiple round, cut the memory to avoid the (Death Spiral)
+            # Keep System(0), Goal(1)，latest 4 message (latest 2 Turn)
+            if len(self.messages) > 8:
+                self.messages = [self.messages[0], self.messages[1]] + self.messages[-4:]
+                console.print("[dim]🧹 Memory window pruned to prevent context overflow and restore token budget.[/dim]")
+            # --------------------------------------------------------
+            
             turn_dir = self.config.session_dir / f"{task_idx * 100 + current_turn:04d}"
             turn_dir.mkdir(parents=True, exist_ok=True)
             (turn_dir / "prompt.md").write_text(self.messages[-1]["content"], encoding="utf-8")
@@ -271,20 +201,29 @@ class UniversalAgent:
             # 3B. Execute Mutation Actions (Sequentially)
             has_mutation = False
             if mutation_actions:
+                # --- UI Polish: Print mutations cleanly ---
+                console.print("\n[cyan]📝 Planning Code Mutations:[/cyan]")
+                for act in mutation_actions:
+                    if isinstance(act, ActionWriteFile):
+                        path = getattr(act, 'path', 'Unknown')
+                        size = len(getattr(act, 'content', ''))
+                        console.print(f"  [dim]- WRITE_FILE: {path} ({size} chars)[/dim]")
+                    elif isinstance(act, ActionApplyDiff):
+                        size = len(getattr(act, 'diff_text', ''))
+                        console.print(f"  [dim]- APPLY_DIFF: ({size} chars)[/dim]")
+
                 # Human-in-the-loop Approval check
                 if self.config.require_approval:
-                    console.print("\n[bold red]⚠️ Agent intends to modify files on your disk.[/bold red]")
-                    for act in mutation_actions:
-                        path = getattr(act, 'path', 'Unknown Path')
-                        console.print(f"  - Modifying: [cyan]{path}[/cyan]")
-                    if not Confirm.ask("Do you approve these changes?"):
+                    if not Confirm.ask("[bold red]⚠️ Approve these file modifications?[/bold red]"):
                         console.print("[yellow]Changes rejected by user.[/yellow]")
                         feedback_blocks.append("### User Override\nThe user REJECTED your file modifications. Please explain your approach or ask for clarification.")
                         mutation_actions = [] # Clear mutations
                 
                 if mutation_actions:
-                    console.print("[cyan]📝 Applying Code Mutations to Disk (Atomic)...[/cyan]")
+                    console.print("[cyan]💾 Applying to Disk (Atomic)...[/cyan]")
                     handler = UniversalToolHandler(self.config, turn_dir, allowlist)
+                    # We pass the actions to the handler. 
+                    # Ensure the handler itself doesn't print the raw content!
                     has_mutation, mutation_res = handler.execute(mutation_actions, content)
                     feedback_blocks.append(mutation_res)
             
@@ -329,11 +268,15 @@ class UniversalAgent:
                     return True
                 else:
                     console.print(f"[bold red]❌ Verification Failed (exit={code})[/bold red]")
+                    
+                    # [FIX 3]: filter the output to extract only relevant error messages, and provide actionable feedback to the agent
+                    smart_error_context = build_debug_prompt(out, root_dir=str(self.config.workspace_dir))
+                    
                     error_feedback = (
                         f"⚠️ [Verification Failed] Exit Code: {code}\n"
                         f"Command: {verify_cmd}\n"
-                        f"Output:\n```text\n{out[-4000:]}\n```\n"
-                        f"Please analyze the error. Use tools (`search_code`, `read_file_chunk`, `web_search`) "
+                        f"{smart_error_context}\n"
+                        f"Please analyze the error. Use tools (`search_code`, `read_file_chunk`) "
                         f"to investigate if necessary, then provide a fix using Format A (Diff) or Format B (WRITE_FILE)."
                     )
                     feedback_blocks.append(error_feedback)
@@ -400,6 +343,10 @@ async def main_async():
     parser.add_argument("--notes", help="Extra notes/constraints", default="")
     
     # Provider & Env
+    parser.add_argument("--tool-strategy", 
+                        choices=["native_all", "hybrid", "text_only"], 
+                        default="hybrid",
+                        help="Choose how the LLM interacts with tools.")
     parser.add_argument("--provider", default="openai", choices=["openai", "anthropic"], help="LLM Provider")
     parser.add_argument("--model", default=os.environ.get("VLLM_MODEL", "qwen3.5-9b"))
     parser.add_argument("--base-url", default=os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000/v1"))
@@ -466,6 +413,7 @@ async def main_async():
         max_output=4096,
         require_approval=args.require_approval,
         agent_dir=agent_dir,
+        tool_strategy=args.tool_strategy,
         provider=args.provider,
         sandbox_container=args.sandbox,
         verbose=args.verbose,
@@ -482,10 +430,28 @@ async def main_async():
     context_files = [x.strip() for x in args.context.split(",") if x.strip()]
 
     # --- Agent Initialization & Execution ---
-    compiled_tools = get_compiled_tools(config.provider)
-    system_prompt = PromptRegistry.get_system_prompt(BASE_TOOLS)
-    task_prompt = PromptRegistry.format_task(goal, allowlist, context_files, args.notes, workspace_dir.name)
+    # =======================================================
+    # Based on the selected strategy, setup System Prompt and Tools
+    # =======================================================
+    compiled_tools = get_active_tools(config.tool_strategy, config.provider)
+    system_prompt = PromptRegistry.get_system_prompt(config.tool_strategy, compiled_tools)
+    
+    #compiled_tools = get_compiled_tools(config.provider)
+    #system_prompt = PromptRegistry.get_system_prompt(BASE_TOOLS)
+    #task_prompt = PromptRegistry.format_task(goal, allowlist, context_files, args.notes, workspace_dir.name)
+    def content_injector(files: list) -> str:
+        files_md = ""
+        for f in list(dict.fromkeys(files)):
+            content = read_file(str(f))
+            if content and not content.startswith("[MISSING FILE]"):
+                if estimate_tokens(content) > 8000:
+                    content = truncate_to_tokens(content, 8000)
+                files_md += f"### File: {f}\n```text\n{content}\n```\n"
+        return files_md
 
+    task_prompt = PromptRegistry.format_task(goal, [], [], workspace_dir.name, content_injector)
+    
+    
     agent = UniversalAgent(config=config, system_message=system_prompt, tools=compiled_tools)
     
     success = await agent.execute_task(
@@ -508,6 +474,13 @@ if __name__ == "__main__":
         console.print("\n[bold red]Operation manually interrupted by user. Shutting down...[/bold red]")
 
 """
+python agent_main.py --provider anthropic --model claude-3-5-sonnet-20241022 --tool-strategy native_all
+
+python agent_main.py --model qwen2.5-coder-7b --tool-strategy native_all
+
+python agent_main.py --model qwen2.5-coder-7b --tool-strategy hybrid
+
+
 VLLM_USE_V1=0 python -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen3.5-9B \
     --served-model-name qwen3.5-9b \

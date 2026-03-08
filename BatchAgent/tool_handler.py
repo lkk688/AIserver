@@ -335,26 +335,40 @@ class UniversalToolHandler:
 
         for action in actions:
             try:
-                # --- Read / Search Tools ---
+                # -----------------------------------------
+                # 1. Read / Search Tools (The "Eyes")
+                # -----------------------------------------
                 if isinstance(action, ActionToolCall):
                     res = ""
                     name = action.name
                     args = action.args
                     
-                    console.print(f"[bold magenta]🛠️ Tool Execution:[/bold magenta] {name}({args})")
+                    # === [防洪补丁]：终端显示截断 ===
+                    # 遍历 args，把超过 80 字符的超长字符串截断，保护终端 UI
+                    safe_args = {}
+                    for k, v in args.items():
+                        val_str = str(v)
+                        safe_args[k] = val_str[:80] + "... [TRUNCATED]" if len(val_str) > 80 else v
                     
+                    console.print(f"[bold magenta]🛠️ Tool Execution:[/bold magenta] {name}({safe_args})")
+                    
+                    # === [防线补丁 1]：拦截捏造的 XML 写入工具 ===
+                    if name.upper() in ["WRITE_FILE", "WRITE", "CREATE_FILE"]:
+                        res = "System Guardrail: Do NOT use XML tool calls for writing files. You MUST use the pure Markdown Format B (`WRITE_FILE: filepath\\n<<<CONTENT...`) outside of any XML tags."
+                        tool_results.append(f"### Result for {name}\n```text\n{res}\n```")
+                        continue
+
+                    # --- 正常工具路由 ---
                     if name == "web_search":
-                        # Now uses the advanced domain-aware search
                         query = args.get("query", "")
                         category = args.get("category", "general")
-                        res = perform_domain_aware_search(query, category, self.config.serper_api_key)
+                        res = perform_domain_aware_search(query, category, getattr(self.config, 'serper_api_key', ''))
                     
-                    # [NEW] Add the read_url handler here
                     elif name == "read_url":
                         url = args.get("url", "")
                         console.print(f"[dim]Fetching webpage: {url}[/dim]")
-                        # Assuming you put fetch_and_parse_url in this file
-                        res = fetch_and_parse_url(url)
+                        # 如果没有 fetch_and_parse_url 函数，请确保导入或替换
+                        res = fetch_and_parse_url(url) if 'fetch_and_parse_url' in globals() else f"read_url not implemented for {url}"
                         
                     elif name == "search_code":
                         res = search_code(args.get("query", ""))
@@ -369,7 +383,12 @@ class UniversalToolHandler:
                         res = list_directory(args.get("dir_path", "."))
                         
                     elif name == "run_bash_command":
-                        res = run_bash_command(args.get("command", ""))
+                        cmd = args.get("command", "")
+                        # === [防线补丁 2]：封杀使用 Bash 写长代码（保护上下文） ===
+                        if len(cmd) > 300 and ("cat >" in cmd or "echo " in cmd):
+                            res = "System Guardrail: Command too long. Writing files via bash is strictly forbidden. Use Markdown Format B (`WRITE_FILE: ...`) instead."
+                        else:
+                            res = run_bash_command(cmd)
                     
                     elif name == "json_parse_error":
                         res = args.get("error", "JSON Parse Error")
@@ -380,7 +399,9 @@ class UniversalToolHandler:
                     # Format the observation block for the LLM
                     tool_results.append(f"### Result for {name}\n```text\n{res}\n```")
 
-                # --- Write / Patch Tools ---
+                # -----------------------------------------
+                # 2. Write / Patch Tools (The "Hands")
+                # -----------------------------------------
                 elif isinstance(action, (ActionWriteFile, ActionApplyDiff, ActionReplaceText)):
                     has_mutation = True
                     mutation_actions.append(action)

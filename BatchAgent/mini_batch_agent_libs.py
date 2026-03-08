@@ -34,38 +34,111 @@ console = Console()
 # ---------------------------
 # Utilities
 # ---------------------------
-def robust_json_loads(json_str: str) -> Optional[Dict[str, Any]]:
+import re
+import os
+from typing import Dict, Set
+
+def build_debug_prompt(traceback_str: str, window_size: int = 15, root_dir: str = ".") -> str:
     """
-    A globally reusable, highly fault-tolerant JSON parser.
-    Uses standard json first, falls back to json-repair for LLM hallucinations.
+    Automatically extracts file skeletons and context from errors to build high-quality LLM prompts.
     """
-    if not json_str or not isinstance(json_str, str):
+    tb_pattern = re.compile(r'File\s+"([^"]+)",\s+line\s+(\d+)')
+    error_locations: Dict[str, Set[int]] = {}
+    
+    for match in tb_pattern.finditer(traceback_str):
+        filepath = match.group(1)
+        line_num = int(match.group(2))
+        
+        abs_path = os.path.abspath(filepath)
+        abs_root = os.path.abspath(root_dir)
+        if not abs_path.startswith(abs_root) or "site-packages" in abs_path:
+            continue
+            
+        if os.path.exists(filepath) and os.path.isfile(filepath):
+            if filepath not in error_locations:
+                error_locations[filepath] = set()
+            error_locations[filepath].add(line_num)
+
+    # If no local files matched, just return the truncated traceback
+    if not error_locations:
+        return f"## Error Output\n```text\n{traceback_str[-2000:]}\n```\n"
+
+    prompt_parts = []
+    prompt_parts.append("## Error Traceback\n```text\n" + traceback_str[-2000:].strip() + "\n```\n")
+
+    for filepath, lines in error_locations.items():
+        rel_path = os.path.relpath(filepath, root_dir)
+        prompt_parts.append(f"## Context for `{rel_path}`\n")
+        
+        # Make sure you have _generate_ast_map_from_file and _extract_snippets_from_string defined!
+        try:
+            # Assuming these functions exist in your libs
+            from CodeAgent.codeagent_libs import _generate_ast_map_from_file, _extract_snippets_from_string
+            
+            ast_map = _generate_ast_map_from_file(filepath)
+            if ast_map:
+                prompt_parts.append("### File Map (Structure)\n```python\n" + ast_map + "\n```\n")
+            
+            with open(filepath, 'r', encoding='utf-8') as f:
+                source = f.read()
+            snippets = _extract_snippets_from_string(source, lines, window_size)
+            prompt_parts.append("### Error Context Snippets\n```python\n" + snippets + "\n```\n")
+            
+        except Exception as e:
+            prompt_parts.append(f"> [Warning] Could not extract detailed AST/snippets: {e}\n")
+
+    return "\n".join(prompt_parts)
+
+def robust_json_loads(json_str: str, tool_name: str = "") -> Optional[Dict[str, Any]]:
+    """
+    A highly fault-tolerant JSON parser.
+    Uses standard json first, falls back to json-repair for LLM hallucinations,
+    and includes a violent regex fallback specifically for 'write_file' tools.
+    """
+    if not json_str or not isinstance(json_str, str): 
         return None
 
-    # 1. basic load
+    # 1. 原生解析 (最快)
     try:
         return json.loads(json_str)
     except json.JSONDecodeError:
         pass
 
-    # 2. try json-repair
+    # 2. json-repair 抢救 (如果安装了的话)
     if json_repair is not None:
         try:
-            # return_objects=True return python dict
-            repaired_obj = json_repair.repair_json(json_str, return_objects=True)
-            
-            # make sure the repaired object is a dict (sometimes it can be a list of dicts if multiple repairs are possible)
-            if isinstance(repaired_obj, dict):
-                return repaired_obj
-            elif isinstance(repaired_obj, list) and len(repaired_obj) > 0 and isinstance(repaired_obj[0], dict):
-                # sometimes json-repair returns a list of possible repairs; take the first one if it's a dict
-                return repaired_obj[0]
-        except Exception as e:
-            logging.warning(f"json-repair failed to rescue JSON: {e}")
-    else:
-        logging.warning("json-repair package is not installed. Skipping advanced JSON rescue.")
+            repaired = json_repair.repair_json(json_str, return_objects=True)
+            if isinstance(repaired, dict): 
+                return repaired
+            if isinstance(repaired, list) and len(repaired) > 0 and isinstance(repaired[0], dict):
+                return repaired[0]
+        except Exception:
+            pass
 
-    # 3. last-ditch effort: Remove newlines and try again (some LLMs insert newlines that break parsing)
+    # 3. 【终极防线】针对 write_file 的暴力正则提取
+    # 专门处理大模型在 content 里输出了未转义换行符导致整个 JSON 崩溃的情况
+    if tool_name == "write_file":
+        logging.warning("JSON parsing failed. Attempting violent regex extraction for write_file.")
+        try:
+            # 提取 path: 匹配 "path": "xxx"
+            path_match = re.search(r'"path"\s*:\s*"([^"]+)"', json_str)
+            # 提取 content: 匹配 "content": "xxx" 一直到结尾的 } 或字符串末尾
+            content_match = re.search(r'"content"\s*:\s*"(.*)"\s*}?\s*$', json_str, re.DOTALL)
+            
+            if path_match and content_match:
+                path = path_match.group(1)
+                raw_content = content_match.group(1)
+                
+                # 还原基本的转义符
+                clean_content = raw_content.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+                # 切除可能漏掉的结尾引号和括号
+                clean_content = re.sub(r'"\s*}\s*$', '', clean_content)
+                
+                return {"path": path, "content": clean_content}
+        except Exception as e:
+            logging.error(f"Violent regex extraction failed: {e}")
+
+    # 4. 最后的挣扎：简单的换行符清洗
     try:
         clean_str = json_str.replace('\n', '\\n').replace('\r', '')
         return json.loads(clean_str)
