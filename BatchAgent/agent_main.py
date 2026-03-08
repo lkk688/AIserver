@@ -192,7 +192,123 @@ class UniversalAgent:
             mutation_actions = [a for a in actions if isinstance(a, (ActionWriteFile, ActionApplyDiff, ActionReplaceText))]
             
             feedback_blocks = []
+
+            # =====================================================================
+            # [NEW] 核心架构：并行分支与懒加载 (Agentic Map-Reduce)
+            # =====================================================================
+            parallel_action = next((a for a in info_actions if getattr(a, 'name', '') == 'execute_parallel_branches'), None)
+            inspect_action = next((a for a in info_actions if getattr(a, 'name', '') == 'inspect_branch_details'), None)
             
+            if parallel_action:
+                branches = parallel_action.args.get('branches', [])
+                console.print(f"\n[bold magenta]🚀 Launching {len(branches)} Parallel Branches...[/bold magenta]")
+                
+                # 初始化全局分支记录字典 (如果还不存在的话)
+                if not hasattr(self, 'branch_records'):
+                    self.branch_records = {}
+
+                async def _run_branch(branch: dict) -> str:
+                    b_id = branch.get('branch_id', 'unknown')
+                    b_inst = branch.get('instruction', '')
+                    
+                    # 1. 为子分支创建物理隔离的 Workspace，防止并行写文件冲突
+                    b_workspace = self.config.workspace_dir / b_id
+                    b_workspace.mkdir(parents=True, exist_ok=True)
+                    
+                    # 2. 继承配置，但指向新的工作区。为了防止无限递归，关闭子 Agent 的并发能力
+                    b_config = AgentConfig(**{**self.config.__dict__, "workspace_dir": b_workspace, "verbose": False})
+                    
+                    # 3. 剥离并行工具，防止子 Agent 再次召唤孙子 Agent 导致死循环
+                    b_tools = [t for t in self.tools if t.get('name') not in ['execute_parallel_branches', 'inspect_branch_details']]
+                    
+                    # 4. 构造子 Agent Prompt
+                    b_goal = f"MAIN TASK CONTEXT: {task_goal}\n\nYOUR SPECIFIC BRANCH MISSION: {b_inst}\n\nIMPORTANT: You are running in an isolated directory `{b_id}/`. Write code, test it, and use `finish_task` to provide a detailed summary of your results, test outputs, and discoveries."
+                    b_prompt = PromptRegistry.format_task(b_goal, [], [], b_workspace.name, content_injector)
+                    
+                    # 5. 执行子 Agent
+                    sub_agent = UniversalAgent(config=b_config, system_message=self.system_message, tools=b_tools)
+                    success = await sub_agent.execute_task(task_goal=b_goal, task_idx=task_idx+100, allowlist=[], prompt_md=b_prompt)
+                    
+                    # 6. 提取精华：子 Agent 的最后一个 finish_task summary 或最后的回复
+                    last_msg = next((m['content'] for m in reversed(sub_agent.messages) if m['role'] == 'assistant'), "")
+                    
+                    # 7. 保存全量状态到内存，供后续 inspect_branch_details 懒加载
+                    self.branch_records[b_id] = {
+                        "instruction": b_inst,
+                        "workspace": str(b_workspace),
+                        "full_trajectory": "\n".join([f"[{m['role'].upper()}]: {m['content']}" for m in sub_agent.messages]),
+                        "success": success
+                    }
+                    
+                    # 8. 只返回轻量级摘要给主 Agent
+                    status_emoji = "✅" if success else "❌"
+                    return f"### Branch: {b_id} {status_emoji}\n**Instruction**: {b_inst}\n**Summary**: {last_msg[:800]}..."
+
+                # 并发执行所有分支
+                branch_start = time.time()
+                branch_results = await asyncio.gather(*(_run_branch(b) for b in branches), return_exceptions=True)
+                
+                valid_summaries = [res for res in branch_results if not isinstance(res, Exception)]
+                errors = [str(res) for res in branch_results if isinstance(res, Exception)]
+                
+                combined_report = "\n\n".join(valid_summaries)
+                if errors: combined_report += f"\n\n**Framework Errors:**\n" + "\n".join(errors)
+                
+                console.print(f"[dim]Parallel Branches completed in {time.time() - branch_start:.1f}s[/dim]")
+                
+                feedback = (
+                    f"### Parallel Execution Report\n"
+                    f"The branches have completed. Below are their high-level summaries. Their files are saved in subdirectories named after their `branch_id`.\n\n"
+                    f"{combined_report}\n\n"
+                    f"**Next Steps**:\n"
+                    f"- If you need to see the exact code, tests, or full search text from a branch, use `<tool_call><inspect_branch_details><branch_id>...</branch_id></inspect_branch_details>`.\n"
+                    f"- Once you have enough info, you can copy the best code to the main directory using bash, or synthesize the final report using Format B / Format C."
+                )
+                
+                self.messages.append({"role": "assistant", "content": content})
+                self.messages.append({"role": "user", "content": feedback})
+                self._log_rl("user", feedback)
+                
+                current_turn += 1
+                continue
+
+            elif inspect_action:
+                # =====================================================================
+                # [NEW] 懒加载查阅工具处理
+                # =====================================================================
+                b_id = inspect_action.args.get('branch_id', '')
+                console.print(f"\n[cyan]📖 Agent is inspecting details of branch: {b_id}[/cyan]")
+                
+                if hasattr(self, 'branch_records') and b_id in self.branch_records:
+                    record = self.branch_records[b_id]
+                    # 我们不仅返回它的轨迹，还可以自动去它的目录下读取所有文件内容
+                    import glob
+                    files_content = ""
+                    for filepath in glob.glob(f"{record['workspace']}/**/*", recursive=True):
+                        if os.path.isfile(filepath) and not filepath.endswith('.pyc'):
+                            try:
+                                with open(filepath, 'r') as f:
+                                    files_content += f"\n--- File: {os.path.basename(filepath)} ---\n```\n{f.read()[:4000]}\n```" # 截断防爆
+                            except Exception: pass
+                    
+                    feedback = (
+                        f"### Details for Branch: {b_id}\n"
+                        f"**Workspace**: `{record['workspace']}/`\n"
+                        f"**Generated Files**: {files_content if files_content else 'No files generated.'}\n\n"
+                        f"**Execution Trajectory Snippet**:\n"
+                        f"{record['full_trajectory'][-3000:]}" # 只给最后 3000 字符，通常包含最终代码和测试结果
+                    )
+                else:
+                    feedback = f"Error: Branch ID '{b_id}' not found. Please check the ID."
+
+                self.messages.append({"role": "assistant", "content": content})
+                self.messages.append({"role": "user", "content": feedback})
+                self._log_rl("user", feedback)
+                
+                current_turn += 1
+                continue
+            
+            ## Back to Normal processing
             # 3A. Execute Info Actions (Concurrently)
             if info_actions:
                 concurrent_results = await self._execute_tools_concurrently(info_actions, turn_dir, allowlist)

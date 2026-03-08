@@ -45,6 +45,33 @@ OBSERVATION_TOOLS = [
         "description": "Call this tool ONLY when you have fully completed the user's goal and verified the results.",
         "properties": {"summary": {"type": "string", "description": "A brief summary of what was accomplished."}},
         "required": ["summary"]
+    },
+    {
+        "name": "execute_parallel_branches",
+        "description": "Execute multiple independent exploration, research, or coding paths simultaneously. Each branch runs in an isolated workspace and reports back a summary. Use this for brainstorming, testing different algorithms, or parallel web searching.",
+        "properties": {
+            "branches": {
+                "type": "array",
+                "description": "List of parallel branches to execute.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "branch_id": {"type": "string", "description": "Unique alphanumeric ID for this branch, e.g., 'branch_a_quick_sort'"},
+                        "instruction": {"type": "string", "description": "Highly specific instruction for what this branch should do (e.g., 'Write and test a QuickSort algorithm', or 'Search for Python 3.13 typing features')."}
+                    },
+                    "required": ["branch_id", "instruction"]
+                }
+            }
+        },
+        "required": ["branches"]
+    },
+    {
+        "name": "inspect_branch_details",
+        "description": "Retrieve the full details, generated code, and test results of a specific branch executed previously.",
+        "properties": {
+            "branch_id": {"type": "string", "description": "The ID of the branch you want to inspect."}
+        },
+        "required": ["branch_id"]
     }
 ]
 
