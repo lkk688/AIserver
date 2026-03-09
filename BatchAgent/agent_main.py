@@ -13,7 +13,7 @@ from rich.prompt import Prompt, Confirm
 from rich.panel import Panel
 from rich.status import Status
 from rich.text import Text
-
+import time
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -48,7 +48,7 @@ class AgentConfig:
     require_approval: bool
     agent_dir: Path
     tool_strategy: str  # [NEW] 'native_all', 'hybrid', 'text_only'
-    parallel_thinking: bool = False  # [NEW] 开关：是否允许并发思维分叉
+    parallel_thinking: bool = False  # [NEW] switch for enabling the Batch Brainstorming feature
     provider: str = "openai"
     sandbox_container: Optional[str] = None
     verbose: bool = False
@@ -74,7 +74,7 @@ class UniversalAgent:
         self.messages: List[Dict[str, str]] = []
         self.rl_trajectory: List[Dict[str, str]] = []
         
-        # [NEW] 动态自定义工具库
+        # [NEW] dynamic tools
         self.dynamic_tools_schema: List[Dict[str, Any]] = []
         self.dynamic_tools_mapping: Dict[str, str] = {} # tool_name -> script_path
 
@@ -125,35 +125,34 @@ class UniversalAgent:
 
     
     def _prune_memory(self):
-        """智能滑动窗口：保留系统提示词、最初的 Goal、以及最近的推理轨迹"""
-        # 放宽历史记忆的条数，从 8 条放宽到 12 条，给它更多的思考空间
+        """intelligent sliding window with strategic retention of key information"""
         if len(self.messages) > 12:
-            # 保留: System Prompt (0), User Goal (1)
-            # 保留: 最近的 10 条交互 (确保它能记得自己刚刚发现了什么)
+            # Keep: System Prompt (0), User Goal (1)
+            # Keep: latest 10 messages (to preserve recent context and instructions)
             self.messages = [self.messages[0], self.messages[1]] + self.messages[-10:]
             console.print("[dim]🧹 Memory window gracefully pruned (kept last 10 turns).[/dim]")
 
     async def _execute_batch_brainstorm(self, action: ActionToolCall, allowlist: List[str]) -> str:
         """
-        核心重构：将复杂的子 Agent 降级为廉价且纯粹的 Batch LLM Calls。
-        利用 vLLM 的连续批处理能力，并发请求，汇总为纯文本。
+        Batch LLM Calls。
+        leverage vLLM or any async-compatible LLM wrapper to run multiple parallel calls with different temperatures or random seeds, to generate a diverse set of strategies for the same problem statement.
         """
         problem = action.args.get('problem_statement', 'Help me solve this task.')
         n_vars = min(4, max(2, int(action.args.get('n_variations', 3))))
         
         console.print(f"\n[bold magenta]🧠 Launching {n_vars} Batch LLM Calls for Parallel Thinking...[/bold magenta]")
         
-        # 构造一个纯净的 Prompt，不要给工具，只要它“想”
+        # pure prompts for brainstorming, no tool calls allowed to maximize creativity and minimize parsing errors
         bs_messages = self.messages + [{
             "role": "user", 
             "content": f"Please brainstorm a unique strategy to solve: '{problem}'. Do NOT write final code. Just provide the step-by-step logic."
         }]
         
         async def _fetch_idea(idx: int) -> str:
-            # 动态调整温度以增加策略多样性
+            # adjust temperature for each branch to encourage diversity. The first branch is the most focused (lowest temp), and later branches get more creative freedom.
             div_temp = min(0.9, getattr(self.config, 'temperature', 0.2) + 0.3 + (idx * 0.15))
             
-            # 从外部引入你的 complete_with_continuation_async
+            # import complete_with_continuation_async
             from BatchAgent.llm_wrapper import complete_with_continuation_async
             
             content, _ = await complete_with_continuation_async(
@@ -161,18 +160,18 @@ class UniversalAgent:
                 model=self.config.model,
                 messages=bs_messages,
                 temperature=div_temp,
-                max_output_tokens=1024, # 限制思维发散的长度
+                max_output_tokens=1024, # limit the length of each brainstormed idea to save tokens
                 model_max_context=self.config.max_context,
                 provider=self.config.provider,
-                stream=False,   # 屏蔽子调用的终端打印
+                stream=False,   # disable streaming for batch calls to simplify aggregation
                 verbose=False,
-                tool_strategy="text", # 强制纯文本模式
+                tool_strategy="text", # text only for brainstorming to avoid parsing issues and encourage free-form thinking
                 allowlist=allowlist
             )
             return f"### Approach {idx + 1} (Temp {div_temp:.2f}):\n{content}\n"
 
         bs_start = time.time()
-        # 万箭齐发，榨干 vLLM
+        # launch parallel vLLM calls and gather results
         ideas = await asyncio.gather(*(_fetch_idea(i) for i in range(n_vars)), return_exceptions=True)
         
         valid_ideas = [idea for idea in ideas if not isinstance(idea, Exception)]
@@ -187,10 +186,10 @@ class UniversalAgent:
 
     def _verify_mutations(self, content: str, mutation_actions: List[Any], allowlist: List[str], turn_dir: Path) -> Tuple[bool, str]:
         """
-        独立的沙盒验证模块
-        返回: (is_success, feedback_string)
+        sandbox verification
+        return: (is_success, feedback_string)
         """
-        # 1. 提取被修改的文件
+        # 1. extract modified file paths from mutation actions for verification context
         modified_files = []
         for a in mutation_actions:
             if hasattr(a, 'path'): modified_files.append(a.path)
@@ -199,29 +198,34 @@ class UniversalAgent:
                 modified_files.extend(paths)
         modified_files = list(set(modified_files))
         
-        # 2. 推断验证命令
+        # 2. infer the verification command from the agent's response or use a default one based on modified files
         auto_verify_cmd = re.search(r"^Verification:\s*(.+)$", content, re.MULTILINE)
         v_cmd = auto_verify_cmd.group(1).strip() if auto_verify_cmd else None
         verify_cmd = _determine_verify_cmd(allowlist, modified_files, v_cmd, self.config)
         
         if not verify_cmd:
             console.print("[yellow]No verification command found/needed. Assuming Success.[/yellow]")
-            # MUST return a string, not a tuple!
-            return "✅ File modifications applied successfully. No verification command was specified or required for this action."
+            # [FIX] give agent clear next steps instead of just returning True, to prevent it from getting stuck in a loop of rewriting files without understanding the verification process
+            return (
+                "✅ File modifications successfully applied to disk.\n"
+                "**System Prompt**: No code execution was required for these files. "
+                "If you have completed the user's analytical or writing task, you MUST invoke the `<tool_call><finish_task>...` tool IMMEDIATELY in your next response to conclude the task. "
+                "Do NOT rewrite the files unless you found an error."
+            )
             
-        # 3. 用户授权检查
+        # 3. check approaval
         if getattr(self.config, 'require_approval', False):
             console.print(f"\n[bold red]⚠️ Agent intends to run a command: [/bold red] `[white]{verify_cmd}[/white]`")
             from rich.prompt import Confirm
             if not Confirm.ask("Do you approve executing this command?"):
                 return f"⚠️ User bypassed verification for command: {verify_cmd}"
 
-        # 4. 执行命令
+        # 4. execute the verification command in a sandboxed environment and capture output
         console.print(f"[cyan]-> Running Verification Sandbox...[/cyan]")
         code, out = run_shell(verify_cmd, cap=20000, sandbox_container=getattr(self.config, 'sandbox_container', None))
         (turn_dir / "verify_stdout.txt").write_text(out, encoding='utf-8')
         
-        # [FIX] 不再武断地 return True。把裁判权交给 Agent！
+        # [FIX] not just return True。The Agent will judge the results！
         if code == 0:
             console.print("[bold green]✅ Verification Script Executed (Exit 0)[/bold green]")
             if getattr(self.config, 'verbose', False): console.print(f"[dim]{out}[/dim]")
@@ -264,13 +268,13 @@ class UniversalAgent:
             turn_dir.mkdir(parents=True, exist_ok=True)
 
             # ===============================================================
-            # [NEW] 1. 落盘：完整的 Prompt 上下文 (最关键的调试文件)
+            # [NEW] 1. complete Prompt for debug
             # ===============================================================
             (turn_dir / "full_prompt_context.json").write_text(
                 json.dumps(self.messages, indent=2, ensure_ascii=False), 
                 encoding="utf-8"
             )
-            # 保留一个人类易读的版本，只看最新的一条指令
+            # Human readable version of the prompt for easier debugging
             (turn_dir / "latest_instruction.md").write_text(self.messages[-1]["content"], encoding="utf-8")
             
             console.print(f"\n[bold yellow]>>> ReAct Turn {current_turn + 1} / {MAX_REACT_TURNS}[/bold yellow]")
@@ -288,7 +292,7 @@ class UniversalAgent:
             self._log_rl("assistant", content)
 
             # ===============================================================
-            # [NEW] 2. 落盘：引擎解析出的 Action 列表
+            # [NEW] 2. extract the actions for this turn and log them in a structured way for better interpretability and debugging. This also allows us to analyze the agent's decision-making process and tool usage patterns over time.
             # ===============================================================
             action_logs = []
             for a in actions:
@@ -311,7 +315,7 @@ class UniversalAgent:
             if not actions:
                 console.print("[yellow]Agent outputted nothing useful. Forcing format switch.[/yellow]")
                 
-                # [FIX 2: 动态错误反馈，防止逻辑冲突]
+                # [FIX 2: dynamic error feedback based on tool strategy] Instead of a generic message, provide specific guidance based on the current tool strategy to help the agent course-correct more effectively.
                 if self.config.tool_strategy == "native_all":
                     feedback = (
                         "⚠️ System Warning: No valid tool calls detected.\n"
@@ -342,7 +346,7 @@ class UniversalAgent:
             feedback_blocks = []
 
             # =====================================================================
-            # [NEW] 插件系统：动态加载领域工具 (Hot-Swapping)
+            # [NEW]load domain-specific Hot-Swapping tools
             # =====================================================================
             load_domain_action = next((a for a in info_actions if getattr(a, 'name', '') == 'load_domain_tools'), None)
             
@@ -351,10 +355,10 @@ class UniversalAgent:
                 console.print(f"\n[bold green]🔌 Agent is hot-swapping domain plugin: [white]{new_domain}[/white][/bold green]")
                 
                 if new_domain in DOMAIN_REGISTRY:
-                    # 1. 更新 Config 状态
+                    # 1. update Config
                     self.config.domain = new_domain
                     
-                    # 2. 重新获取并编译包含新领域工具的列表
+                    # 2. get the new domain's tools and recompile them for the current provider
                     new_base_tools = get_base_tools(
                         strategy=self.config.tool_strategy, 
                         enable_parallel=getattr(self.config, 'parallel_thinking', False), 
@@ -362,10 +366,10 @@ class UniversalAgent:
                     )
                     self.tools = compile_tools_for_provider(new_base_tools, self.config.provider, self.config.tool_strategy)
                     
-                    # 3. 重新生成 System Prompt (不仅包含新工具的 XML 描述，还包含新的人设 Domain Profile)
+                    # 3. re-generate System Prompt to include the new tools' usage instructions
                     self.system_message = PromptRegistry.get_system_prompt(self.config.tool_strategy, new_base_tools, new_domain)
                     
-                    # 4. 【核心魔术】修改第一条历史记录，悄无声息地替换 Agent 的大脑设定！
+                    # 4. change the first message in the conversation to the new system prompt, so that the agent can immediately pick up on the new tools and instructions in the next turn without needing a full reset or restart
                     self.messages[0]["content"] = self.system_message
                     
                     tool_names = [t['name'] for t in DOMAIN_REGISTRY[new_domain]]
@@ -377,7 +381,7 @@ class UniversalAgent:
                 else:
                     load_feedback = f"❌ Failed to load domain. '{new_domain}' is not a valid domain plugin."
                 
-                # 记录这轮操作并继续循环，让模型在下一轮立即使用新工具
+                # record this hot-swapping event in the trajectory with the new system prompt and feedback, to help the agent understand the change in its capabilities and instructions
                 self.messages.extend([{"role": "assistant", "content": content}, {"role": "user", "content": load_feedback}])
                 self._log_rl("user", load_feedback)
                 current_turn += 1
@@ -385,23 +389,22 @@ class UniversalAgent:
             # =====================================================================
 
             # --- 4. Handle Parallel Brainstorming (Optional / Configurable) ---
-            # 只有在 config 开启了 enable_parallel_thinking 时，才会注入这个工具并处理
+            # only config enabled enable_parallel_thinking, add this tool
             brainstorm_action = next((a for a in info_actions if getattr(a, 'name', '') == 'brainstorm_solutions'), None)
             if brainstorm_action and getattr(self.config, 'enable_parallel_thinking', False):
                 bs_feedback = await self._execute_batch_brainstorm(brainstorm_action, allowlist)
                 self.messages.extend([{"role": "assistant", "content": content}, {"role": "user", "content": bs_feedback}])
                 self._log_rl("user", bs_feedback)
-                continue # 拿到思路后进入下一轮，不执行其他工具
+                continue # get all the ideas, then let the agent decide how to proceed in the next turn, instead of rushing into tool execution or file mutations
 
             # --- 5. Execute Standard Tools (Concurrently) ---
-            # 过滤掉特殊的元工具
             standard_info_actions = [a for a in info_actions if a.name not in ['brainstorm_solutions', 'finish_task']]
             if standard_info_actions:
                 concurrent_results = await self._execute_tools_concurrently(standard_info_actions, turn_dir, allowlist)
                 feedback_blocks.append(f"### Tool Execution Results\n{concurrent_results}")
             
             # =====================================================================
-            # [NEW] 创造者模式：注册并热重载自定义工具
+            # [NEW] Create and register Custom Tools on the Fly
             # =====================================================================
             register_action = next((a for a in info_actions if getattr(a, 'name', '') == 'register_custom_tool'), None)
             
@@ -411,7 +414,7 @@ class UniversalAgent:
                 
                 console.print(f"\n[bold green]🛠️ Agent created a new tool: [white]{t_name}[/white][/bold green]")
                 
-                # 构建原生 API 需要的 Schema 格式
+                # Create the tool schema based on the agent's input. We expect the agent to provide a clear schema with name, description, properties, and required args. This allows the agent to effectively teach itself new capabilities during the task.
                 new_schema = {
                     "name": t_name,
                     "description": args.get("description", ""),
@@ -419,23 +422,23 @@ class UniversalAgent:
                     "required": args.get("required_args", [])
                 }
                 
-                # 存入动态记忆库
+                # save to dynamic tools registry (in-memory for now, can be extended to disk if needed)
                 self.dynamic_tools_schema.append(new_schema)
                 self.dynamic_tools_mapping[t_name] = args.get("script_path", "")
                 
-                # 热重载：重新编译工具并更新 System Prompt
+                # recompile the full tool list for the current provider, including both the static base tools and the newly added dynamic tool, to update the agent's capabilities immediately without needing a restart
                 from tools_registry import compile_tools_for_provider
                 from prompt_registry import PromptRegistry
                 
-                # 获取基础工具并追加刚刚创建的新工具
+                # get the base tools for the current strategy and domain, then append the new dynamic tool to it. This ensures that the agent retains access to all its original tools while also gaining the new one it just created, allowing for seamless integration of self-generated capabilities.
                 from tools_registry import get_base_tools
                 current_base_tools = get_base_tools(self.config.tool_strategy, getattr(self.config, 'parallel_thinking', False), getattr(self.config, 'domain', 'auto'))
                 current_base_tools.extend(self.dynamic_tools_schema)
                 
-                # 更新底层大模型的可用工具
+                # update the useful tools that will be passed to the LLM in the next turn, so that the agent can start using the new tool it just created right away in the next turn's response
                 self.tools = compile_tools_for_provider(current_base_tools, self.config.provider, self.config.tool_strategy)
                 
-                # 更新系统提示词中的教学 XML (如果它是 text_only 或 hybrid)
+                # update system prompt to reflect the new tool in the instructions, so that the agent can understand how to use it properly in the next turn. This is crucial for enabling the agent to effectively leverage its newly created capabilities without needing explicit human intervention or retraining.
                 self.system_message = PromptRegistry.get_system_prompt(self.config.tool_strategy, current_base_tools, getattr(self.config, 'domain', 'auto'))
                 self.messages[0]["content"] = self.system_message
                 
@@ -456,7 +459,7 @@ class UniversalAgent:
                 feedback_blocks.append(mutation_res)
                 
                 if has_mutation:
-                    # [FIX] 收集沙盒输出，并不中断循环
+                    # [FIX] get the output from sandbox verification and provide it as feedback to the agent, instead of just returning True/False. This allows the agent to understand the results of its actions and learn from any mistakes, rather than just blindly trying again without guidance.
                     v_feedback = self._verify_mutations(content, mutation_actions, allowlist, turn_dir)
                     if v_feedback:
                         feedback_blocks.append(v_feedback)
@@ -473,7 +476,7 @@ class UniversalAgent:
                 combined_feedback += "\nAnalyze the results and continue."
             
             # ===============================================================
-            # [NEW] 3. 落盘：工具执行的返回结果 (Feedback)
+            # [NEW] 3. tool execution results (Feedback)
             # ===============================================================
             if combined_feedback:
                 (turn_dir / "tool_execution_results.md").write_text(combined_feedback, encoding="utf-8")
@@ -566,7 +569,7 @@ class UniversalAgent:
             feedback_blocks = []
 
             # =====================================================================
-            # [NEW] 核心架构：并行分支与懒加载 (Agentic Map-Reduce)
+            # [NEW] New Core: Parallel thinking and lazy load (Agentic Map-Reduce)
             # =====================================================================
             parallel_action = next((a for a in info_actions if getattr(a, 'name', '') == 'execute_parallel_branches'), None)
             inspect_action = next((a for a in info_actions if getattr(a, 'name', '') == 'inspect_branch_details'), None)
@@ -575,7 +578,7 @@ class UniversalAgent:
                 branches = parallel_action.args.get('branches', [])
                 console.print(f"\n[bold magenta]🚀 Launching {len(branches)} Parallel Branches...[/bold magenta]")
                 
-                # 初始化全局分支记录字典 (如果还不存在的话)
+                # initialize branch records if not exist, to store the full trajectory and results of each branch for later inspection. This allows us to keep the main agent's memory clean and focused on high-level summaries, while still retaining access to the detailed execution history of each branch when needed.
                 if not hasattr(self, 'branch_records'):
                     self.branch_records = {}
 
@@ -583,7 +586,7 @@ class UniversalAgent:
                     b_id = branch.get('branch_id', 'unknown')
                     b_inst = branch.get('instruction', '')
                     
-                    # 1. 为子分支创建物理隔离的 Workspace，防止并行写文件冲突
+                    # 1. Create isolated workspace for the branch to prevent file conflicts and ensure clean execution environments. Each branch operates in its own directory named after its `branch_id`, allowing for parallel execution without interference and easy retrieval of results and artifacts.
                     b_workspace = self.config.workspace_dir / b_id
                     b_workspace.mkdir(parents=True, exist_ok=True)
                     
