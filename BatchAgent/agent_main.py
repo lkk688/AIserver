@@ -206,14 +206,15 @@ class UniversalAgent:
         
         if not verify_cmd:
             console.print("[yellow]No verification command found/needed. Assuming Success.[/yellow]")
-            return True, ""
+            # MUST return a string, not a tuple!
+            return "✅ File modifications applied successfully. No verification command was specified or required for this action."
             
         # 3. 用户授权检查
         if getattr(self.config, 'require_approval', False):
             console.print(f"\n[bold red]⚠️ Agent intends to run a command: [/bold red] `[white]{verify_cmd}[/white]`")
             from rich.prompt import Confirm
             if not Confirm.ask("Do you approve executing this command?"):
-                return True, "User bypassed verification."
+                return f"⚠️ User bypassed verification for command: {verify_cmd}"
 
         # 4. 执行命令
         console.print(f"[cyan]-> Running Verification Sandbox...[/cyan]")
@@ -227,9 +228,10 @@ class UniversalAgent:
             return (
                 f"### Verification Execution Result (Exit Code: 0)\n"
                 f"```text\n{out}\n```\n"
-                f"**System Prompt**: The script executed without crashing. Please review the output above. "
-                f"If the output indicates the task is fully complete and correct, use the `finish_task` tool to conclude. "
-                f"If the output shows logical errors or API failures, please debug and fix them."
+                f"**System Prompt**: The script executed without crashing. Please carefully review the output above against the ORIGINAL USER GOAL.\n"
+                f"- Did the output explicitly fulfill ALL constraints requested by the user? (e.g., quantity of items, specific formats?)\n"
+                f"- If the task is only partially complete, write more code or take further actions.\n"
+                f"- ONLY if every single requirement is met, use the `finish_task` tool to conclude."
             )
         else:
             console.print(f"[bold red]❌ Verification Failed (exit={code})[/bold red]")
@@ -456,7 +458,8 @@ class UniversalAgent:
                 if has_mutation:
                     # [FIX] 收集沙盒输出，并不中断循环
                     v_feedback = self._verify_mutations(content, mutation_actions, allowlist, turn_dir)
-                    feedback_blocks.append(v_feedback)
+                    if v_feedback:
+                        feedback_blocks.append(v_feedback)
                     # v_success, v_feedback = self._verify_mutations(content, mutation_actions, allowlist, turn_dir)
                     # if v_success:
                     #     self._save_trajectory_to_disk(task_idx, reward=1.0)
