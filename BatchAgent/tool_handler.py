@@ -21,7 +21,7 @@ from BatchAgent.mini_batch_agent_libs import (
     is_git_repo, apply_patch_guarded, apply_write_files, extract_all_diffs,
     extract_write_file_actions_v2, apply_fuzzy_patch, extract_files_from_diff,
     resolve_path, search_code, find_file, list_directory, read_file_chunk,
-    run_bash_command
+    run_bash_command, run_shell
 )
 from BatchAgent.mini_batch_agent import (
     AgentAction, ActionToolCall, ActionWriteFile, ActionApplyDiff, ActionReplaceText
@@ -238,10 +238,11 @@ class UniversalToolHandler:
     Central dispatcher that takes AgentActions (parsed from JSON or Text)
     and executes them in the local environment or via external APIs.
     """
-    def __init__(self, config, turn_dir: Path, allowlist: List[str]):
+    def __init__(self, config, turn_dir: Path, allowlist: List[str], dynamic_tools_mapping: dict = None):
         self.config = config
         self.turn_dir = turn_dir
         self.allowlist = allowlist
+        self.dynamic_tools_mapping = dynamic_tools_mapping or {}
 
     def _execute_code_mutations(self, actions: List[AgentAction], full_content: str) -> bool:
         """
@@ -397,7 +398,30 @@ class UniversalToolHandler:
                     
                     elif name == "json_parse_error":
                         res = args.get("error", "JSON Parse Error")
+                    
+                    # =========================================================
+                    # [NEW] 动态执行自定义工具 (沙盒执行，保障绝对安全)
+                    # =========================================================
+                    elif name in self.dynamic_tools_mapping:
+                        script_path = self.dynamic_tools_mapping[name]
+                        target_script = self.config.workspace_dir / script_path
                         
+                        if not target_script.exists():
+                            res = f"System Error: Cannot find the script '{script_path}'. Did you write the file first?"
+                        else:
+                            import json
+                            # 将大模型传来的 JSON arguments 序列化，作为命令行参数传给脚本
+                            args_json = json.dumps(args).replace("'", "'\\''") # 简单的 Bash 单引号转义
+                            cmd = f"python3 {script_path} '{args_json}'"
+                            
+                            # 调用系统的沙盒命令行执行，完美杜绝危险代码直接污染母舰内存
+                            code, out = run_shell(cmd, cap=10000, sandbox_container=getattr(self.config, 'sandbox_container', None))
+                            
+                            if code == 0:
+                                res = out.strip()
+                            else:
+                                res = f"[Custom Tool Execution Error (Exit {code})]:\n{out}"
+                                
                     # [NEW] 拦截并执行领域特定工具
                     else:
                         from BatchAgent.domain_tools import DOMAIN_FUNCTIONS

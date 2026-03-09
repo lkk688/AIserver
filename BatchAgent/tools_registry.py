@@ -119,6 +119,18 @@ META_TOOLS = [
             }
         },
         "required": ["domain"]
+    },
+    {
+        "name": "register_custom_tool",
+        "description": "Create and register a custom tool mid-flight! FIRST, write a Python script that takes a JSON string from sys.argv[1], processes it, and prints the result. THEN, use this tool to register it.",
+        "properties": {
+            "tool_name": {"type": "string", "description": "Name of the new tool (lowercase, underscores)."},
+            "description": {"type": "string", "description": "What the tool does. Be descriptive so you know when to use it later."},
+            "schema_properties": {"type": "object", "description": "The JSON schema 'properties' object for the tool's arguments."},
+            "required_args": {"type": "array", "items": {"type": "string"}, "description": "List of required argument names."},
+            "script_path": {"type": "string", "description": "The relative path to the Python script you wrote (e.g., 'custom_tools/math_solver.py')."}
+        },
+        "required": ["tool_name", "description", "schema_properties", "script_path"]
     }
 ]
 

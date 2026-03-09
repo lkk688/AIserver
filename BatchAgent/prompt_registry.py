@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 from pathlib import Path
 from typing import List, Dict, Tuple, Any
+import datetime
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from BatchAgent.mini_batch_agent_libs import (
@@ -164,6 +165,10 @@ class PromptRegistry:
             f"You are an elite, general-purpose AI Agent.\n"
             f"**Current System Time**: {current_time}\n"
             f"**Assumed Location**: {location}\n\n"
+            f"⚠️ **ENVIRONMENT RULES (CRITICAL)**:\n"
+            f"- You are already inside the target workspace directory.\n"
+            f"- ALL file paths you read, write, or execute must be RELATIVE to your current directory (e.g., `./script.py`).\n"
+            f"- NEVER use `cd` in bash commands. Execute directly (e.g., `python3 script.py`, not `cd dir && python3 script.py`).\n\n"
         )
         
         if domain != "general":
@@ -245,7 +250,8 @@ class PromptRegistry:
             f"# Agent Task\n\n"
             f"## Goal\n{goal}\n\n"
             f"## Workspace Context\n"
-            f"Directory: `./` (inside `{workspace_dir}/`)\n\n"
+            f"Absolute Directory Path: `{workspace_dir}`\n"
+            f"Working Directory: `./` (You are ALREADY here. Do not try to cd into it.)\n\n"
             f"## Target Files (Allowlist)\n{allow_txt}\n\n"
         )
         

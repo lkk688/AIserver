@@ -73,6 +73,10 @@ class UniversalAgent:
         self.tools = tools
         self.messages: List[Dict[str, str]] = []
         self.rl_trajectory: List[Dict[str, str]] = []
+        
+        # [NEW] 动态自定义工具库
+        self.dynamic_tools_schema: List[Dict[str, Any]] = []
+        self.dynamic_tools_mapping: Dict[str, str] = {} # tool_name -> script_path
 
     def _log_rl(self, role: str, content: str):
         self.rl_trajectory.append({"role": role, "content": content})
@@ -121,10 +125,13 @@ class UniversalAgent:
 
     
     def _prune_memory(self):
-        """防止 Death Spiral 的滑动窗口内存管理"""
-        if len(self.messages) > 8:
-            self.messages = [self.messages[0], self.messages[1]] + self.messages[-4:]
-            console.print("[dim]🧹 Memory window pruned to prevent context overflow.[/dim]")
+        """智能滑动窗口：保留系统提示词、最初的 Goal、以及最近的推理轨迹"""
+        # 放宽历史记忆的条数，从 8 条放宽到 12 条，给它更多的思考空间
+        if len(self.messages) > 12:
+            # 保留: System Prompt (0), User Goal (1)
+            # 保留: 最近的 10 条交互 (确保它能记得自己刚刚发现了什么)
+            self.messages = [self.messages[0], self.messages[1]] + self.messages[-10:]
+            console.print("[dim]🧹 Memory window gracefully pruned (kept last 10 turns).[/dim]")
 
     async def _execute_batch_brainstorm(self, action: ActionToolCall, allowlist: List[str]) -> str:
         """
@@ -213,22 +220,27 @@ class UniversalAgent:
         code, out = run_shell(verify_cmd, cap=20000, sandbox_container=getattr(self.config, 'sandbox_container', None))
         (turn_dir / "verify_stdout.txt").write_text(out, encoding='utf-8')
         
+        # [FIX] 不再武断地 return True。把裁判权交给 Agent！
         if code == 0:
-            console.print("[bold green]✅ Verification PASSED![/bold green]")
+            console.print("[bold green]✅ Verification Script Executed (Exit 0)[/bold green]")
             if getattr(self.config, 'verbose', False): console.print(f"[dim]{out}[/dim]")
-            return True, ""
+            return (
+                f"### Verification Execution Result (Exit Code: 0)\n"
+                f"```text\n{out}\n```\n"
+                f"**System Prompt**: The script executed without crashing. Please review the output above. "
+                f"If the output indicates the task is fully complete and correct, use the `finish_task` tool to conclude. "
+                f"If the output shows logical errors or API failures, please debug and fix them."
+            )
         else:
             console.print(f"[bold red]❌ Verification Failed (exit={code})[/bold red]")
-            from CodeAgent.codeagent_libs import build_debug_prompt
             smart_error = build_debug_prompt(out, root_dir=str(self.config.workspace_dir))
             
-            error_feedback = (
+            return (
                 f"⚠️ [Verification Failed] Exit Code: {code}\n"
                 f"Command: {verify_cmd}\n"
                 f"{smart_error}\n"
                 f"Please analyze the error. You may use observation tools to investigate, then provide a fix."
             )
-            return False, error_feedback
 
     # =========================================================
     # THE MAIN LOOP (Now incredibly clean and readable)
@@ -385,20 +397,72 @@ class UniversalAgent:
             if standard_info_actions:
                 concurrent_results = await self._execute_tools_concurrently(standard_info_actions, turn_dir, allowlist)
                 feedback_blocks.append(f"### Tool Execution Results\n{concurrent_results}")
+            
+            # =====================================================================
+            # [NEW] 创造者模式：注册并热重载自定义工具
+            # =====================================================================
+            register_action = next((a for a in info_actions if getattr(a, 'name', '') == 'register_custom_tool'), None)
+            
+            if register_action:
+                args = register_action.args
+                t_name = args.get("tool_name", "custom_tool")
                 
+                console.print(f"\n[bold green]🛠️ Agent created a new tool: [white]{t_name}[/white][/bold green]")
+                
+                # 构建原生 API 需要的 Schema 格式
+                new_schema = {
+                    "name": t_name,
+                    "description": args.get("description", ""),
+                    "properties": args.get("schema_properties", {}),
+                    "required": args.get("required_args", [])
+                }
+                
+                # 存入动态记忆库
+                self.dynamic_tools_schema.append(new_schema)
+                self.dynamic_tools_mapping[t_name] = args.get("script_path", "")
+                
+                # 热重载：重新编译工具并更新 System Prompt
+                from tools_registry import compile_tools_for_provider
+                from prompt_registry import PromptRegistry
+                
+                # 获取基础工具并追加刚刚创建的新工具
+                from tools_registry import get_base_tools
+                current_base_tools = get_base_tools(self.config.tool_strategy, getattr(self.config, 'parallel_thinking', False), getattr(self.config, 'domain', 'auto'))
+                current_base_tools.extend(self.dynamic_tools_schema)
+                
+                # 更新底层大模型的可用工具
+                self.tools = compile_tools_for_provider(current_base_tools, self.config.provider, self.config.tool_strategy)
+                
+                # 更新系统提示词中的教学 XML (如果它是 text_only 或 hybrid)
+                self.system_message = PromptRegistry.get_system_prompt(self.config.tool_strategy, current_base_tools, getattr(self.config, 'domain', 'auto'))
+                self.messages[0]["content"] = self.system_message
+                
+                feedback = (
+                    f"✅ Successfully compiled and registered the new tool `{t_name}`!\n"
+                    f"The tool is now loaded into your context. You can call it immediately just like any other native tool."
+                )
+                
+                self.messages.extend([{"role": "assistant", "content": content}, {"role": "user", "content": feedback}])
+                self._log_rl("user", feedback)
+                current_turn += 1
+                continue
+            
             # --- 6. Execute Mutations & Verify ---
             if mutation_actions:
-                handler = UniversalToolHandler(self.config, turn_dir, allowlist)
+                handler = UniversalToolHandler(self.config, turn_dir, allowlist, dynamic_tools_mapping=self.dynamic_tools_mapping)
                 has_mutation, mutation_res = handler.execute(mutation_actions, content)
                 feedback_blocks.append(mutation_res)
                 
                 if has_mutation:
-                    v_success, v_feedback = self._verify_mutations(content, mutation_actions, allowlist, turn_dir)
-                    if v_success:
-                        self._save_trajectory_to_disk(task_idx, reward=1.0)
-                        return True
-                    else:
-                        feedback_blocks.append(v_feedback)
+                    # [FIX] 收集沙盒输出，并不中断循环
+                    v_feedback = self._verify_mutations(content, mutation_actions, allowlist, turn_dir)
+                    feedback_blocks.append(v_feedback)
+                    # v_success, v_feedback = self._verify_mutations(content, mutation_actions, allowlist, turn_dir)
+                    # if v_success:
+                    #     self._save_trajectory_to_disk(task_idx, reward=1.0)
+                    #     return True
+                    # else:
+                    #     feedback_blocks.append(v_feedback)
 
             # --- 7. Loop Feedback ---
             combined_feedback = "\n\n".join(feedback_blocks)
@@ -945,7 +1009,13 @@ VLLM_USE_V1=0 python -m vllm.entrypoints.openai.api_server \
     --trust-remote-code
 
 export SERPER_API_KEY="your_serper_api_key_here"   
-python BatchAgent/agent_main.py
+python BatchAgent/agent_main.py --verbose
 
 Search the web for the latest Python 3.13 features, and then write a python script named test_313.py demonstrating the new features.
+
+Create a tool that fetches the current price of a cryptocurrency from online API, register the tool, and then use it to tell me the price of BTC and ETH.
+
+Create a tool that fetches the English word definition online like a dictionary, test the code, and then use this tool to find some definitions of popular GRE words (<10).
+
+Search the web for the recent crude oil price and its trend, then write a brief analysis report in markdown format.
 """
