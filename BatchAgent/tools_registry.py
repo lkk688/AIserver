@@ -36,8 +36,40 @@ OBSERVATION_TOOLS = [
     },
     {
         "name": "web_search",
-        "description": "Search the internet for real-time documentation or solutions.",
-        "properties": {"query": {"type": "string"}, "category": {"type": "string", "enum": ["general", "code"]}},
+        "description": (
+            "Search the internet for real-time information. Use the 'category' field to route "
+            "the query to authoritative domain-specific sources for best results."
+        ),
+        "properties": {
+            "query": {"type": "string", "description": "The search query."},
+            "category": {
+                "type": "string",
+                "enum": [
+                    "general",       # Default: no site filter
+                    "news",          # Reuters, AP, BBC, Bloomberg, Guardian
+                    "code",          # GitHub, StackOverflow, PyPI, docs.python.org
+                    "academic",      # arXiv, Google Scholar, SemanticScholar, PubMed
+                    "medical",       # PubMed, NIH, MayoClinic, WebMD
+                    "software_eng",  # SO, GitHub, dev.to, PyPI
+                    "math",          # AoPS, Math.SE, MathWorld, KhanAcademy, Brilliant
+                    "science",       # Nature, ScienceDirect, Phys.org, WolframAlpha
+                    "language",      # Wiktionary, LanguageGuide, Italki
+                    "business",      # SEC, Yahoo Finance, Bloomberg, Investopedia
+                    "assistant",     # SuperUser, AskUbuntu, ServerFault, Apple.SE
+                    "sales_support", # Zendesk, HubSpot, Salesforce, Freshdesk
+                    "research",      # arXiv, SemanticScholar, Scholar, JSTOR
+                    "finance",       # Alias for business
+                    "health",        # Alias for medical
+                    "programming",   # Alias for code
+                ],
+                "description": (
+                    "Domain category to focus the search. Pick the most specific match: "
+                    "use 'math' for math problems (AoPS, MathWorld), 'academic' for papers, "
+                    "'medical' for health queries, 'news' for current events, 'code'/'software_eng' "
+                    "for programming. Default to 'general' when unsure."
+                )
+            }
+        },
         "required": ["query"]
     },
     {

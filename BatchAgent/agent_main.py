@@ -840,7 +840,7 @@ async def main_async():
                         help="Choose how the LLM interacts with tools.")
     parser.add_argument("--provider", default="openai", choices=["openai", "anthropic"], help="LLM Provider")
     parser.add_argument("--model", default=os.environ.get("VLLM_MODEL", "qwen3.5-9b"))
-    parser.add_argument("--base-url", default=os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000/v1"))
+    parser.add_argument("--base-url", default=os.environ.get("VLLM_BASE_URL", "http://100.110.236.127:8000/v1")) #100.110.236.127 http://127.0.0.1:8000/v1
     parser.add_argument("--api-key", default=os.environ.get("VLLM_API_KEY", "EMPTY"))
     parser.add_argument("--serper-key", default=os.environ.get("SERPER_API_KEY", ""), help="API key for Web Search")
     
@@ -1024,4 +1024,6 @@ Create a tool that fetches the current price of a cryptocurrency from online API
 Create a tool that fetches the English word definition online like a dictionary, test the code, and then use this tool to find some definitions of popular GRE words (<10).
 
 Search the web for the recent crude oil price and its trend, then write a brief analysis report in markdown format.
+
+create 10 questions based on the book of "art of problem solving - prealgebra chapter 1" into one document
 """

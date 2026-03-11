@@ -5,10 +5,25 @@ import traceback
 from typing import List, Tuple, Dict, Any, Optional
 from pathlib import Path
 from rich.console import Console
-#pip install beautifulsoup4 markdownify httpx
+#pip install beautifulsoup4 markdownify httpx pypdf playwright
 import httpx
 from bs4 import BeautifulSoup
 import markdownify
+
+# Optional: pypdf for PDF extraction
+try:
+    from pypdf import PdfReader
+    import io
+    _PYPDF_AVAILABLE = True
+except ImportError:
+    _PYPDF_AVAILABLE = False
+
+# Optional: playwright for JS-heavy page fallback
+try:
+    from playwright.sync_api import sync_playwright
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    _PLAYWRIGHT_AVAILABLE = False
 
 import sys
 from pathlib import Path
@@ -29,58 +44,184 @@ from BatchAgent.mini_batch_agent import (
 
 console = Console()
 
+# ---- Content cleaning constants ----
+_NOISE_TAGS = ["script", "style", "nav", "footer", "header", "aside",
+               "noscript", "iframe", "svg", "form", "button"]
+_NOISE_PATTERNS = [
+    re.compile(r'(cookie|gdpr|privacy|consent|subscribe|newsletter)', re.I),
+    re.compile(r'^\s{0,4}[\|\-\–\•→✓✗★☆©®™]{1,3}\s*$'),  # icon-only lines
+]
+_MAX_CONTENT_CHARS = 15000
+_PLAYWRIGHT_THRESHOLD = 300  # chars — below this, try playwright fallback
+
+
+def _clean_text_content(text: str) -> str:
+    """Shared post-processing: collapse blank lines, filter noise lines, truncate."""
+    lines = text.splitlines()
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        # Drop very short lines that are likely nav/menu artifacts (< 3 words AND < 25 chars)
+        if len(stripped) < 25 and len(stripped.split()) < 3 and stripped:
+            continue
+        # Drop lines matching noise patterns (cookie banners, GDPR boilerplate)
+        if any(p.search(stripped) for p in _NOISE_PATTERNS):
+            continue
+        cleaned.append(line)
+
+    text = '\n'.join(cleaned)
+    # Collapse 3+ consecutive blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text).strip()
+    # Truncate
+    if len(text) > _MAX_CONTENT_CHARS:
+        text = text[:_MAX_CONTENT_CHARS] + "\n\n... [Content Truncated] ..."
+    return text
+
+
+def _extract_pdf_text(raw_bytes: bytes) -> str:
+    """Extract text from a PDF binary using pypdf."""
+    if not _PYPDF_AVAILABLE:
+        return "Error: pypdf is not installed. Run: pip install pypdf"
+    try:
+        reader = PdfReader(io.BytesIO(raw_bytes))
+        pages = []
+        for i, page in enumerate(reader.pages):
+            page_text = page.extract_text() or ""
+            if page_text.strip():
+                pages.append(f"--- Page {i+1} ---\n{page_text.strip()}")
+        if not pages:
+            return "Error: PDF appears to have no extractable text (may be image-only/scanned)."
+        full_text = "\n\n".join(pages)
+        return _clean_text_content(full_text)
+    except Exception as e:
+        return f"Error extracting PDF text: {e}"
+
+
+def _fetch_via_playwright(url: str) -> str:
+    """Fallback: use a headless browser to render JS-heavy pages."""
+    if not _PLAYWRIGHT_AVAILABLE:
+        return ""
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0.0.0 Safari/537.36"
+            )
+            page.goto(url, timeout=20000, wait_until="domcontentloaded")
+            # Extract visible text from body after JS execution
+            text = page.evaluate("() => document.body.innerText")
+            browser.close()
+        return _clean_text_content(text or "")
+    except Exception as e:
+        console.print(f"[dim]Playwright fallback failed: {e}[/dim]")
+        return ""
+
+
 def fetch_and_parse_url(url: str) -> str:
     """
-    Fetches a webpage and converts its main content to clean Markdown.
+    Fetches a URL and returns clean text content.
+    Handles: HTML pages, PDFs, plain text files.
+    Falls back to Playwright for JS-heavy pages with thin content.
     """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml,application/pdf;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
     try:
-        # We use a browser-like User-Agent to avoid basic anti-bot blocks
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        
-        # Use httpx for a robust synchronous request (or async if you prefer)
-        with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+        with httpx.Client(timeout=20.0, follow_redirects=True) as client:
             response = client.get(url, headers=headers)
             response.raise_for_status()
-            
-        html_content = response.text
-        
-        # Parse with BeautifulSoup to remove junk
-        soup = BeautifulSoup(html_content, 'html.parser')
-        
-        # Remove scripts, styles, footers, navbars
-        for element in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
-            element.decompose()
-            
-        # Try to find the main content area to reduce noise
-        main_content = soup.find('main') or soup.find('article') or soup.find(id=re.compile('content|main', re.I)) or soup.body
-        
-        if not main_content:
-            return "Error: Could not parse the main content of the page."
+            content_type = response.headers.get("content-type", "").lower()
+            raw_bytes = response.content
 
-        # Convert the cleaned HTML to Markdown
-        # We turn off image links and truncate very long lines
-        md_text = markdownify.markdownify(
-            str(main_content), 
-            heading_style="ATX", 
-            strip=['img', 'a'] # Strip links and images to save tokens, we only want text
+        # ── Layer 1: File-type detection ──────────────────────────────────
+        url_path = url.split("?")[0].lower()
+        is_pdf = (
+            url_path.endswith(".pdf")
+            or "application/pdf" in content_type
+            or "pdf" in content_type
         )
-        
-        # Clean up excessive blank lines
-        md_text = re.sub(r'\n{3,}', '\n\n', md_text).strip()
-        
-        # Truncate to a reasonable length to prevent context overflow (e.g., 10,000 chars)
-        max_chars = 15000 
-        if len(md_text) > max_chars:
-            md_text = md_text[:max_chars] + "\n\n... [Content Truncated due to length] ..."
-            
+        is_plaintext = any(url_path.endswith(ext) for ext in (".txt", ".md", ".csv", ".log", ".rst"))
+
+        if is_pdf:
+            console.print(f"[dim]Detected PDF, extracting text via pypdf...[/dim]")
+            return _extract_pdf_text(raw_bytes)
+
+        if is_plaintext:
+            console.print(f"[dim]Detected plain text file, decoding...[/dim]")
+            text = raw_bytes.decode("utf-8", errors="replace")
+            return _clean_text_content(text)
+
+        # ── Layer 2: HTML parsing ─────────────────────────────────────────
+        try:
+            html_content = raw_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            html_content = response.text
+
+        soup = BeautifulSoup(html_content, 'html.parser')
+
+        # Remove noisy elements
+        for tag in _NOISE_TAGS:
+            for el in soup.find_all(tag):
+                el.decompose()
+        # Also remove elements with cookie/ad-related classes or IDs
+        for el in soup.find_all(True, attrs={"class": re.compile(r'cookie|consent|banner|popup|overlay|ad-|ads-', re.I)}):
+            el.decompose()
+        for el in soup.find_all(True, attrs={"id": re.compile(r'cookie|consent|banner|popup|overlay', re.I)}):
+            el.decompose()
+
+        # Find the richest content container
+        main_content = (
+            soup.find('article')
+            or soup.find('main')
+            or soup.find(id=re.compile(r'content|main|body|post', re.I))
+            or soup.find(class_=re.compile(r'content|main|article|post|entry', re.I))
+            or soup.body
+        )
+
+        if main_content:
+            md_text = markdownify.markdownify(
+                str(main_content),
+                heading_style="ATX",
+                strip=['img', 'a'],
+            )
+        else:
+            # Last-resort: raw text extraction from soup
+            md_text = soup.get_text(separator='\n', strip=True)
+
+        md_text = _clean_text_content(md_text)
+
+        # ── Layer 3: Playwright fallback for thin/empty content ───────────
+        if len(md_text) < _PLAYWRIGHT_THRESHOLD and _PLAYWRIGHT_AVAILABLE:
+            console.print(f"[dim]Content too thin ({len(md_text)} chars), trying Playwright fallback...[/dim]")
+            playwright_text = _fetch_via_playwright(url)
+            if len(playwright_text) > len(md_text):
+                console.print(f"[dim]Playwright returned {len(playwright_text)} chars, using that.[/dim]")
+                return playwright_text
+
+        if not md_text:
+            return "Error: Could not extract any meaningful content from this page."
+
         return md_text
-        
+
+    except httpx.HTTPStatusError as e:
+        # For PDFs behind auth walls, try playwright
+        if _PLAYWRIGHT_AVAILABLE:
+            console.print(f"[dim]HTTP {e.response.status_code} error, trying Playwright...[/dim]")
+            result = _fetch_via_playwright(url)
+            if result:
+                return result
+        return f"HTTP Error {e.response.status_code} while fetching URL: {url}"
     except httpx.HTTPError as e:
         return f"Network error while fetching URL: {str(e)}"
     except Exception as e:
-        return f"Failed to parse URL: {str(e)}"
+        return f"Failed to parse URL: {str(e)}\n{traceback.format_exc(limit=3)}"
     
 # ==========================================
 # 1. Action Parsers
@@ -166,63 +307,117 @@ def parse_text_actions(content: str, allowlist: List[str]) -> List[AgentAction]:
 
 def perform_domain_aware_search(query: str, category: str, api_key: str) -> str:
     """
-    Advanced search that routes queries to specific domains based on the category
-    suggested by the LLM.
+    Advanced search that routes queries to specific domains based on the category.
+    Category values match DOMAIN_REGISTRY keys in domain_tools.py plus common aliases.
     """
     if not api_key or api_key == "EMPTY":
         return "System Error: SERPER_API_KEY is not configured."
 
-    # Google Dorks specific to domains
-    domain_filters = {
-        "news": "site:reuters.com OR site:apnews.com OR site:bloomberg.com OR site:bbc.com/news",
-        "code": "site:github.com OR site:stackoverflow.com OR site:docs.python.org",
-        "academic": "site:arxiv.org OR site:nature.com OR site:sciencedirect.com",
-        "general": ""
+    # ── Domain filter map (covers all DOMAIN_REGISTRY keys + common aliases) ──
+    # Filters are deliberately broad — multiple high-quality sources, not single-site
+    domain_filters: Dict[str, str] = {
+        # Core DOMAIN_REGISTRY keys
+        "news":         "site:reuters.com OR site:apnews.com OR site:bbc.com OR site:bloomberg.com OR site:theguardian.com",
+        "academic":     "site:arxiv.org OR site:scholar.google.com OR site:semanticscholar.org OR site:pubmed.ncbi.nlm.nih.gov OR site:researchgate.net",
+        "medical":      "site:pubmed.ncbi.nlm.nih.gov OR site:medlineplus.gov OR site:nih.gov OR site:mayoclinic.org OR site:webmd.com",
+        "software_eng": "site:stackoverflow.com OR site:github.com OR site:dev.to OR site:docs.python.org OR site:pypi.org",
+        "math":         "site:math.stackexchange.com OR site:artofproblemsolving.com OR site:mathworld.wolfram.com OR site:khanacademy.org OR site:brilliant.org",
+        "science":      "site:nature.com OR site:sciencedirect.com OR site:phys.org OR site:science.org OR site:wolframalpha.com",
+        "language":     "site:en.wiktionary.org OR site:languageguide.org OR site:bbc.co.uk/languages OR site:italki.com",
+        "business":     "site:sec.gov OR site:finance.yahoo.com OR site:bloomberg.com OR site:investopedia.com OR site:marketwatch.com",
+        "assistant":    "site:superuser.com OR site:askubuntu.com OR site:serverfault.com OR site:apple.stackexchange.com",
+        "sales_support":"site:zendesk.com OR site:hubspot.com OR site:salesforce.com OR site:freshdesk.com",
+        # Common aliases
+        "code":         "site:github.com OR site:stackoverflow.com OR site:docs.python.org OR site:pypi.org OR site:realpython.com",
+        "finance":      "site:sec.gov OR site:finance.yahoo.com OR site:bloomberg.com OR site:investopedia.com",
+        "health":       "site:pubmed.ncbi.nlm.nih.gov OR site:nih.gov OR site:mayoclinic.org OR site:webmd.com",
+        "programming":  "site:stackoverflow.com OR site:github.com OR site:realpython.com OR site:docs.python.org",
+        "research":     "site:arxiv.org OR site:semanticscholar.org OR site:scholar.google.com OR site:jstor.org",
+        # Default fallback
+        "general":      "",
     }
-    
-    # Normalize category, default to general
+
+    # ── Category alias normalisation ──────────────────────────────────────────
+    _aliases: Dict[str, str] = {
+        "software":            "software_eng",
+        "software_engineering":"software_eng",
+        "engineering":         "software_eng",
+        "medicine":            "medical",
+        "biology":             "medical",
+        "physics":             "science",
+        "chemistry":           "science",
+        "mathematics":         "math",
+        "maths":               "math",
+        "statistics":          "math",
+        "economics":           "business",
+        "stock":               "business",
+        "stocks":              "business",
+        "investment":          "business",
+        "support":             "sales_support",
+        "crm":                 "sales_support",
+        "system":              "assistant",
+        "computer":            "assistant",
+        "paper":               "academic",
+        "papers":              "academic",
+        "python":              "code",
+        "javascript":          "code",
+        "js":                  "code",
+    }
+
     cat = category.lower().strip()
+    cat = _aliases.get(cat, cat)  # resolve alias first
     if cat not in domain_filters:
-        cat = "general"
-        
+        cat = "general"  # safe fallback
+
     filter_str = domain_filters[cat]
-    final_query = f"{query} {filter_str}".strip()
-    
+    # Only append site filter when non-empty (avoids polluting general queries)
+    final_query = f"{query} {filter_str}".strip() if filter_str else query
+
     console.print(f"[dim]Routing search -> Category: '{cat}', Final Query: '{final_query}'[/dim]")
-    
+
     url = "https://google.serper.dev/search"
     req = urllib.request.Request(url, method="POST")
     req.add_header("X-API-KEY", api_key)
     req.add_header("Content-Type", "application/json")
-    
-    # Fetch 8 results if it's general, fewer if it's highly specific
-    num_results = 8 if cat == "general" else 5
+
+    # Tune result count by category — dense domains get more results
+    if cat == "general":
+        num_results = 8
+    elif cat in ("math", "academic", "science", "medical"):
+        num_results = 6  # more results for research-heavy domains
+    else:
+        num_results = 5
+
     data = json.dumps({"q": final_query, "num": num_results}).encode("utf-8")
-    
+
     try:
         with urllib.request.urlopen(req, data=data, timeout=15) as response:
             res_data = json.loads(response.read().decode("utf-8"))
-            
+
             organic = res_data.get("organic", [])
             answer_box = res_data.get("answerBox", {})
-            
+            knowledge_graph = res_data.get("knowledgeGraph", {})
+
             results = []
-            
-            # Prioritize Google's direct answer box if available
+
+            # Prioritize Google's direct answer box
             if answer_box and "snippet" in answer_box:
                 results.append(f"⭐ [Direct Answer]: {answer_box['snippet']}\n")
-                
+
+            # Surface knowledge graph description when available (great for math/science)
+            if knowledge_graph and "description" in knowledge_graph:
+                results.append(f"📚 [Knowledge Panel]: {knowledge_graph['description']}\n")
+
             for i, item in enumerate(organic):
                 title = item.get("title", "")
                 snippet = item.get("snippet", "")
                 link = item.get("link", "")
                 date = item.get("date", "")
-                
                 date_str = f" ({date})" if date else ""
                 results.append(f"[{i+1}] {title}{date_str}\n{snippet}\nURL: {link}\n")
-                
+
             return "\n".join(results) if results else f"No results found for '{final_query}'."
-            
+
     except urllib.error.URLError as e:
         return f"Network Error during search: {str(e)}"
     except Exception as e:
