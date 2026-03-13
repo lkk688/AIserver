@@ -253,7 +253,7 @@ def _fix_urls(text: str) -> str:
     )
     text = re.sub(
         r"(https://github\.com/)([A-Za-z0-9 _-]+)\s*/\s*([A-Za-z0-9_.-]+)",
-        lambda m: f"{m.group(1)}{re.sub(r'\\s+', '', m.group(2))}/{m.group(3)}",
+        lambda m: m.group(1) + re.sub(r'\s+', '', m.group(2)) + '/' + m.group(3),
         text,
         flags=re.IGNORECASE,
     )

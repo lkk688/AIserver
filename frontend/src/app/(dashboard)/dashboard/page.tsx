@@ -5,7 +5,7 @@ import { Upload, FileText, History, Settings, CloudUpload } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchDocuments, Document } from "@/lib/api";
 
-function QuickActionCard({ icon: Icon, title, description, href }: { icon: any, title: string, description: string, href: string }) {
+function QuickActionCard({ icon: Icon, title, description, href }: { icon: React.ElementType, title: string, description: string, href: string }) {
   return (
     <Link href={href} className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 hover:shadow-md transition-shadow flex items-start gap-4">
       <div className="bg-indigo-50 p-3 rounded-lg">

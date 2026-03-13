@@ -191,9 +191,12 @@ def get_base_tools(strategy: str, enable_parallel: bool = False, domain: str = "
     if domain != "auto" and domain != "general" and domain in DOMAIN_REGISTRY:
         active_tools.extend(DOMAIN_REGISTRY[domain])
         
-    # 只有在 native_all 模式下，才把写文件的工具注册为 JSON Schema
-    # 在 hybrid 和 text_only 下，模型使用 Markdown 写文件，因此不提供原生 JSON 写入工具
-    if strategy == "native_all":
+    # Mutation tools (write_file, search_and_replace):
+    # - native_all  : exposed as JSON schema tools to the API
+    # - text_only   : NOT exposed to API (compile_tools_for_provider returns [])
+    #                 but IS included here so prompt_registry can document them as XML tags
+    # - hybrid      : same as text_only — JSON for observation, XML for mutations
+    if strategy in ("native_all", "text_only", "hybrid"):
         active_tools.extend(MUTATION_TOOLS)
         
     return active_tools

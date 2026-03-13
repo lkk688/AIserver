@@ -2,7 +2,7 @@ import time
 import re
 import asyncio
 import json
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Callable, Awaitable
 from pathlib import Path
 from rich.console import Console
 import sys
@@ -16,8 +16,8 @@ console = Console()
 from BatchAgent.mini_batch_agent_libs import (
     estimate_tokens, compress_messages, compute_safe_max_tokens, now_stamp, write_jsonl, robust_json_loads
 )
-from BatchAgent.mini_batch_agent import AgentAction, ActionWriteFile, ActionReplaceText, ActionToolCall, parse_text_actions
-
+from BatchAgent.mini_batch_agent import AgentAction, ActionWriteFile, ActionReplaceText, ActionToolCall #, parse_text_actions
+from BatchAgent.tool_handler import parse_text_actions
 from typing import List, Dict, Any
 
 # ==========================================
@@ -275,13 +275,22 @@ async def _execute_openai_async(
     client: Any, model: str, messages: List[Dict[str, str]], 
     temperature: float, max_tokens: int, stream: bool,
     tools: Optional[List[Dict[str, Any]]] = None,
-    verbose: bool = False
+    verbose: bool = False,
+    on_event: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    backend: str = "openai",
+    enable_thinking: bool = True,
 ) -> Tuple[str, str, Dict[str, int], List[Dict[str, Any]]]:
     
     kwargs = {
         "model": model, "messages": messages, "temperature": temperature,
         "max_tokens": max_tokens, "stream": stream,
     }
+    
+    # ── Inject specific parameters for vllm/llama.cpp ──
+    if backend in ["llama.cpp", "vllm"] and enable_thinking is not None:
+        kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": enable_thinking}}
+        kwargs["stop"] = ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
+        
     if tools: kwargs["tools"] = tools
     if stream: kwargs["stream_options"] = {"include_usage": True}
         
@@ -291,10 +300,17 @@ async def _execute_openai_async(
     finish_reason = "stop"
     usage_info = {}
     native_tool_calls = []
+    tc_dict = {}
     
     if stream:
-        tc_dict = {}
-        chunk_counter = 0  # [NEW] 记录收到的 chunk 数量
+        chunk_counter = 0
+        
+        # State machine for suppressing XML tool prints & handling thinking
+        in_think = False
+        in_tool = False
+        buffer = ""
+        tool_args_buffer = ""
+        tool_name_buffer = ""
         
         async for chunk in resp:
             chunk_counter += 1
@@ -306,10 +322,73 @@ async def _execute_openai_async(
                 
             delta = chunk.choices[0].delta
             
-            if delta.content:
-                content += delta.content
+            # --- 1. Extract Llama.cpp / Custom backends reasonings ---
+            reasoning = delta.model_dump().get("reasoning_content")
+            if reasoning:
                 if verbose:
-                    print(delta.content, end="", flush=True)
+                    sys.stdout.write(f"\033[90m{reasoning}\033[0m")
+                    sys.stdout.flush()
+                if on_event:
+                    await on_event({"type": "think", "data": reasoning})
+            
+            # --- 2. Extract standard content ---
+            if delta.content:
+                text_chunk = delta.content
+                content += text_chunk
+                buffer += text_chunk
+                
+                # Tag detector
+                if not in_think and "<think>" in buffer:
+                    in_think = True
+                    buffer = buffer.split("<think>")[-1]
+                    
+                if in_think and "</think>" in buffer:
+                    in_think = False
+                    buffer = buffer.split("</think>")[-1]
+                    
+                if not in_tool and "<tool_call>" in buffer:
+                    in_tool = True
+                    buffer = buffer.split("<tool_call>")[-1]
+                    
+                if in_tool and "</tool_call>" in buffer:
+                    in_tool = False
+                    buffer = ""
+                    tool_args_buffer = ""
+                    tool_name_buffer = ""
+                
+                # Strip XML control tags from the visible text before emitting
+                clean_chunk = re.sub(r'</?think>|</?tool_call>', '', text_chunk)
+
+                # Text processing logic
+                if in_think:
+                    if verbose:
+                        sys.stdout.write(f"\033[90m{clean_chunk}\033[0m")
+                        sys.stdout.flush()
+                    if on_event and clean_chunk:
+                        await on_event({"type": "think", "data": clean_chunk})
+                elif in_tool:
+                    # Accumulate tool text silently
+                    tool_args_buffer += text_chunk
+
+                    # Try to extract the tool name if we haven't yet (simple regex logic)
+                    if not tool_name_buffer and ">" in tool_args_buffer:
+                        # e.g., <web_search> or <write_file>
+                        match = re.search(r"<([a-zA-Z0-9_]+)>", tool_args_buffer)
+                        if match:
+                            tool_name_buffer = match.group(1)
+                            if verbose:
+                                console.print(f"\n[bold magenta]🛠️ Parsing Tool: {tool_name_buffer}...[/bold magenta]")
+
+                    if on_event:
+                        await on_event({"type": "tool", "status": "streaming", "data": text_chunk})
+                else:
+                    # Normal message token — strip any stray tag fragments before emitting
+                    if clean_chunk:
+                        if verbose:
+                            sys.stdout.write(clean_chunk)
+                            sys.stdout.flush()
+                        if on_event:
+                            await on_event({"type": "message", "data": clean_chunk})
                 
                 # =================================================================
                 # [NEW] 实时流式熔断 (Real-time Stream Circuit Breaker)
@@ -329,8 +408,18 @@ async def _execute_openai_async(
                     if idx not in tc_dict:
                         func_name = tc.function.name if tc.function and tc.function.name else "unknown_tool"
                         tc_dict[idx] = {"name": func_name, "arguments": ""}
+                        if on_event:
+                            await on_event({"type": "tool", "name": func_name, "status": "started"})
+                        if verbose:
+                            console.print(f"\n[bold magenta]🛠️ Calling Tool: {func_name}...[/bold magenta]")
+                    
                     if tc.function and tc.function.arguments:
-                        tc_dict[idx]["arguments"] += tc.function.arguments
+                        chunk_arg = tc.function.arguments
+                        tc_dict[idx]["arguments"] += chunk_arg
+                        if on_event:
+                            await on_event({"type": "tool", "name": tc_dict[idx]["name"], "args_delta": chunk_arg, "status": "streaming"})
+                            
+                # Optionally print fully completed arguments when finish_reason hits, but let's wait until outside the loop for summary if needed.
                         
             if chunk.choices[0].finish_reason:
                 finish_reason = chunk.choices[0].finish_reason
@@ -447,7 +536,10 @@ async def complete_with_continuation_async(
     session_dir: Optional[Path] = None,
     tools: Optional[List[Dict[str, Any]]] = None, # Unified Tools Schema
     tool_strategy: str = "auto",   # ['native', 'text', 'auto']
-    allowlist: Optional[List[str]] = None
+    allowlist: Optional[List[str]] = None,
+    on_event: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,  # SSE/streaming callback
+    backend: str = "openai",
+    enable_thinking: bool = True,
 ) -> Tuple[str, List[AgentAction]]:
     """
     Supercharged Wrapper supporting Native JSON Function Calling, Text-based Fallback,
@@ -493,7 +585,8 @@ async def complete_with_continuation_async(
                     )
                 else:
                     content, finish_reason, usage_info, native_tcs = await _execute_openai_async(
-                        client, model, current_messages, temperature, safe_tokens, stream, active_tools, verbose
+                        client, model, current_messages, temperature, safe_tokens, stream, active_tools, verbose,
+                        on_event=on_event, backend=backend, enable_thinking=enable_thinking
                     )
                 break
             except Exception as e:
@@ -517,6 +610,14 @@ async def complete_with_continuation_async(
         
         tok_speed = usage_info["completion_tokens"] / elapsed if elapsed > 0 else 0
         console.print(f"[bold blue][LLM][/bold blue] [dim]{usage_info['prompt_tokens']}P, {usage_info['completion_tokens']}C | {tok_speed:.1f} T/s | {elapsed:.1f}s[/dim]")
+
+        if on_event and usage_info:
+            await on_event({
+                "type": "usage",
+                "prompt_tokens": usage_info.get("prompt_tokens", 0),
+                "completion_tokens": usage_info.get("completion_tokens", 0),
+                "elapsed_s": round(elapsed, 2),
+            })
 
         # 4. Continuation Sanitization & Stitching
         if i > 0: 
@@ -596,11 +697,130 @@ async def complete_with_continuation_async(
     # ==========================================
     # Multi-tier Parsing Strategy
     # ==========================================
-    # If no native actions were found (or if strategy strictly forbids them), fallback to text
-    if not final_actions and tool_strategy in ["auto", "text"]:
-        # We only print this debug message if verbose is true, to keep terminal clean
-        if verbose: console.print("[dim]No native tool calls detected. Applying Text-based parsing fallback...[/dim]")
-        
+    # Apply text-based parsing for any strategy that isn't exclusively native-JSON.
+    # 'text_only' : LLM outputs XML tags, must parse — previously broken (checked for "text" not "text_only")
+    # 'hybrid'    : may mix XML tool tags with native JSON
+    # 'auto'/'text': older aliases
+    # 'native_all': already parsed above via native_tcs; skip text parsing
+    if not final_actions and tool_strategy not in ("native_all",):
+        if verbose:
+            console.print("[dim]No native tool calls detected. Applying text-based parsing fallback...[/dim]")
         final_actions = parse_text_actions(full_content, allowlist)
-        
+
     return full_content, final_actions
+
+
+# ==========================================
+# Simple Single-Shot Async Wrapper (No Continuation)
+# ==========================================
+
+async def complete_with_async(
+    client: Any,
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: float = 0.2,
+    max_output_tokens: int = 4096,
+    model_max_context: int = 16384,
+    provider: str = "openai",
+    stream: bool = True,
+    verbose: bool = False,
+    on_event: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    backend: str = "openai",
+    enable_thinking: bool = True,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Simple single-shot async wrapper for LLM API calls.
+
+    Unlike complete_with_continuation_async, this function:
+    - Does NOT loop on finish_reason == 'length' (no auto-continuation)
+    - Does NOT parse tool calls or agent actions
+    - Returns (content: str, usage_info: dict)
+
+    The optional `on_token` async callback receives each streamed token as it
+    arrives, enabling FastAPI SSE endpoints to forward tokens to clients in
+    real-time without any extra buffering.
+
+    Args:
+        client:            Async OpenAI-compatible client (or Anthropic client)
+        model:             Model name
+        messages:          List of chat messages (role/content dicts)
+        temperature:       Sampling temperature
+        max_output_tokens: Maximum completion tokens to request
+        model_max_context: Total context window size (for token budget calc)
+        provider:          'openai' or 'anthropic'
+        stream:            Enable streaming API (token-by-token)
+        verbose:           Print tokens to terminal as they arrive
+        on_token:          Optional async callback called for each streamed token.
+                           Signature: async def on_token(token: str) -> None
+
+    Returns:
+        (content, usage_info)  where usage_info has 'prompt_tokens',
+        'completion_tokens', 'elapsed_seconds', 'tokens_per_second',
+        and 'finish_reason' keys.
+    """
+    # --- 1. Adaptive Token Budget ---
+    input_text = "\n".join(m.get("content", "") for m in messages)
+    input_est = estimate_tokens(input_text)
+    min_output = 256
+    max_allowed_input = model_max_context - 1000 - min_output
+
+    if int(input_est * 1.1) > max_allowed_input > 0:
+        console.print(f"[yellow]Compressing messages (est {input_est} > limit).[/yellow]")
+        messages = compress_messages(messages, max_allowed_tokens=int(max_allowed_input / 1.1))
+        input_est = estimate_tokens("\n".join(m.get("content", "") for m in messages))
+
+    safe_tokens = compute_safe_max_tokens(input_est, model_max_context, max_output_tokens, min_output)
+
+    # --- 2. Single API Call with Retries ---
+    content: str = ""
+    finish_reason: str = "stop"
+    usage_info: Dict[str, Any] = {}
+    start_time = time.time()
+
+    for attempt in range(3):
+        try:
+            if provider == "anthropic":
+                content, finish_reason, usage_info, _ = await _execute_anthropic_async(
+                    client, model, messages, temperature, safe_tokens,
+                    tools=None, verbose=verbose
+                )
+            else:
+                content, finish_reason, usage_info, _ = await _execute_openai_async(
+                    client, model, messages, temperature, safe_tokens,
+                    stream=stream, tools=None, verbose=verbose, on_event=on_event,
+                    backend=backend, enable_thinking=enable_thinking
+                )
+            break
+        except Exception as e:
+            err_str = str(e)
+            if "max_tokens" in err_str or "context length" in err_str:
+                safe_tokens = max(1024, safe_tokens // 2)
+                console.print(f"[red]Context overflow. Retrying max_tokens={safe_tokens}[/red]")
+                await asyncio.sleep(1)
+                continue
+            console.print(f"[red]LLM Call failed (attempt {attempt + 1}): {e}[/red]")
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            break  # Hard fail – return whatever we have
+
+    # --- 3. Metrics ---
+    elapsed = time.time() - start_time
+    if not usage_info:
+        usage_info = {
+            "prompt_tokens": input_est,
+            "completion_tokens": estimate_tokens(content),
+        }
+
+    tok_speed = usage_info["completion_tokens"] / elapsed if elapsed > 0 else 0
+    console.print(
+        f"[bold blue][LLM][/bold blue] [dim]"
+        f"{usage_info['prompt_tokens']}P, {usage_info['completion_tokens']}C | "
+        f"{tok_speed:.1f} T/s | {elapsed:.1f}s | finish={finish_reason}[/dim]"
+    )
+
+    usage_info["elapsed_seconds"] = round(elapsed, 2)
+    usage_info["tokens_per_second"] = round(tok_speed, 1)
+    usage_info["finish_reason"] = finish_reason
+
+    return content, usage_info

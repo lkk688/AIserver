@@ -233,56 +233,134 @@ def parse_text_actions(content: str, allowlist: List[str]) -> List[AgentAction]:
     Optimized for robustness.
     """
     actions = []
-    
-    # 1. WRITE_FILE (Format B)
+
+    # ── Strip <think>...</think> reasoning blocks before parsing tool tags ───────
+    # Reasoning models write tool calls in <think> as exploratory drafts; the real
+    # call appears AFTER </think>.  We keep original `content` for WRITE_FILE /
+    # diff extraction (those patterns appear in the answer section too).
+    think_stripped = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL | re.IGNORECASE)
+    parse_content = think_stripped if think_stripped.strip() else content
+
+    # ── Parser Priority Order ───────────────────────────────────────────────────
+    # (All applied against think_stripped `parse_content` so reasoning drafts
+    #  inside <think> blocks are invisible to the parser.)
+
+    # ① CANONICAL XML child-tag format — what the model's training produces:
+    #    <tool_call><write_file><path>./foo.py</path><content>...</content></write_file></tool_call>
+    for match in re.finditer(
+        r'(?:<tool_call>\s*)?<write_file>\s*<path>\s*(.*?)\s*</path>\s*<content>(.*?)</content>\s*</write_file>(?:\s*</tool_call>)?',
+        parse_content, re.DOTALL | re.IGNORECASE
+    ):
+        fpath = match.group(1).strip()
+        file_content = match.group(2)
+        target_path = resolve_path(fpath, allowlist)
+        if target_path and len(file_content.strip()) >= 5:
+            actions.append(ActionWriteFile(path=str(target_path), content=file_content.rstrip() + "\n"))
+
+    # ① search_and_replace canonical XML:
+    #    <tool_call><search_and_replace><path>...</path><old_text>...</old_text><new_text>...</new_text></search_and_replace></tool_call>
+    for match in re.finditer(
+        r'(?:<tool_call>\s*)?<search_and_replace>\s*<path>\s*(.*?)\s*</path>\s*<old_text>(.*?)</old_text>\s*<new_text>(.*?)</new_text>\s*</search_and_replace>(?:\s*</tool_call>)?',
+        parse_content, re.DOTALL | re.IGNORECASE
+    ):
+        fpath   = match.group(1).strip()
+        old_txt = match.group(2)
+        new_txt = match.group(3)
+        target_path = resolve_path(fpath, allowlist)
+        if target_path:
+            actions.append(ActionReplaceText(path=str(target_path), old_text=old_txt, new_text=new_txt))
+
+    # ② Fallback: old key=value format inside <write_file> tag (pre-standardisation outputs)
+    #    <tool_call><write_file>path=./foo.py\ncontent=...</write_file></tool_call>
+    if not actions:
+        for match in re.finditer(
+            r'(?:<tool_call>\s*)?<write_file>\s*path\s*=\s*(\S+)\s*\ncontent=(.*?)</write_file>(?:\s*</tool_call>)?',
+            parse_content, re.DOTALL | re.IGNORECASE
+        ):
+            fpath = match.group(1).strip()
+            file_content = match.group(2).rstrip()
+            target_path = resolve_path(fpath, allowlist)
+            if target_path and len(file_content.strip()) >= 5:
+                actions.append(ActionWriteFile(path=str(target_path), content=file_content + "\n"))
+
+    # ③ Fallback: WRITE_FILE with code-fence body
+    #    WRITE_FILE: ./foo.py\n```python\n...\n```
+    if not actions:
+        for match in re.finditer(
+            r'WRITE_FILE:\s*(\S+)\s*\n```(?:\w+)?\n(.*?)```',
+            parse_content, re.DOTALL
+        ):
+            fpath = match.group(1).strip()
+            file_content = match.group(2).rstrip()
+            target_path = resolve_path(fpath, allowlist)
+            if target_path and len(file_content.strip()) >= 5:
+                actions.append(ActionWriteFile(path=str(target_path), content=file_content + "\n"))
+
+    # ④ Legacy WRITE_FILE (Format B — <<<CONTENT ... CONTENT>>>)
     write_actions = extract_write_file_actions_v2(content)
     if write_actions:
         for path, text in write_actions:
             target_path = resolve_path(path, allowlist)
             if target_path:
                 actions.append(ActionWriteFile(path=str(target_path), content=text))
-                
-    # 2. Unified Diff (Format A)
+
+    # ⑤ Unified Diff (Format A)
     diff = extract_all_diffs(content)
     if diff:
         actions.append(ActionApplyDiff(diff_text=diff))
         
-    # 3. Interactive Tool Tags (Format C fallback)
-    tool_patterns = {
-        "search_code": r'(?:<tool_call>\s*)?<search_code>(.*?)</search_code>(?:\s*</tool_call>)?',
-        "find_file": r'(?:<tool_call>\s*)?<find_file>(.*?)</find_file>(?:\s*</tool_call>)?',
-        "list_directory": r'(?:<tool_call>\s*)?<list_directory>\s*<dir_path>(.*?)</dir_path>\s*</list_directory>(?:\s*</tool_call>)?',
-        "run_bash_command": r'(?:<tool_call>\s*)?<run_bash_command>\s*<command>(.*?)</command>\s*</run_bash_command>(?:\s*</tool_call>)?',
-    }
+    # ── Universal XML Tool Parser (Format C) ──────────────────────────────────
+    # Extracts ANY structure matching <tool_call><[TOOL_NAME]>[ARGS]</[TOOL_NAME]></tool_call>
+    # and blindly parses its interior `<[ARG_NAME]>val</[ARG_NAME]>` children into a dictionary.
     
-    for tool_name, pattern in tool_patterns.items():
-        for match in re.finditer(pattern, content, re.DOTALL):
-            # For list_directory, handle empty inner tag
-            arg_val = match.group(1).strip() if match.group(1) else "." 
-            actions.append(ActionToolCall(name=tool_name, args={list(BASE_TOOLS_SCHEMA[tool_name].keys())[0]: arg_val}))
+    # 1. Isolate the internal tool tag block
+    for match in re.finditer(r'(?:<tool_call>\s*)?<([a-zA-Z0-9_]+)>(.*?)</\1>(?:\s*</tool_call>)?', parse_content, re.DOTALL):
+        tool_name = match.group(1).strip()
+        inner_content = match.group(2).strip()
+        
+        # Don't capture known parser-specific tags as native tools
+        if tool_name in ["write_file", "search_and_replace"]:
+            continue
+            
+        args_dict = {}
+        
+        # 2. Extract inner specific arguments if they are tagged (e.g., <query>apple</query>)
+        has_child_tags = False
+        for arg_match in re.finditer(r'<([a-zA-Z0-9_]+)>(.*?)</\1>', inner_content, re.DOTALL):
+            arg_name = arg_match.group(1).strip()
+            arg_val = arg_match.group(2).strip()
+            args_dict[arg_name] = arg_val
+            has_child_tags = True
+            
+        # 3. Fallback: If it's a single-argument tool like <web_search>apple</web_search> without <query> apples
+        if not has_child_tags and inner_content and '<' not in inner_content:
+            # We must map this stray string value to the correct argument name defined in the schema
+            if tool_name in BASE_TOOLS_SCHEMA and BASE_TOOLS_SCHEMA[tool_name]:
+                first_arg_name = list(BASE_TOOLS_SCHEMA[tool_name].keys())[0]
+                args_dict[first_arg_name] = inner_content
+        
+        # Default parameter logic if missing entirely
+        if tool_name == "list_directory" and not args_dict:
+            args_dict = {"dir_path": "."}
+            
+        # Only deploy if valid tool
+        if tool_name in BASE_TOOLS_SCHEMA or tool_name == "finish_task":
+             actions.append(ActionToolCall(name=tool_name, args=args_dict))
 
-    # Special handling for read_file_chunk (multi-args)
-    for match in re.finditer(r'(?:<tool_call>\s*)?<read_file_chunk>\s*<filepath>(.*?)</filepath>(.*?)</read_file_chunk>(?:\s*</tool_call>)?', content, re.DOTALL):
-        fpath = match.group(1).strip()
-        rest = match.group(2)
-        m_s = re.search(r'<start_line>(\d+)</start_line>', rest)
-        m_e = re.search(r'<end_line>(\d+)</end_line>', rest)
-        actions.append(ActionToolCall(
-            name="read_file_chunk", 
-            args={"filepath": fpath, "start_line": int(m_s.group(1)) if m_s else 1, "end_line": int(m_e.group(1)) if m_e else 1000}
-        ))
-
-    # Special handling for web_search (supports category)
-    for match in re.finditer(r'(?:<tool_call>\s*)?<web_search>\s*<query>(.*?)</query>(.*?)</web_search>(?:\s*</tool_call>)?', content, re.DOTALL):
-        query = match.group(1).strip()
-        rest = match.group(2)
-        cat_match = re.search(r'<category>(.*?)</category>', rest)
-        cat = cat_match.group(1).strip() if cat_match else "general"
-        actions.append(ActionToolCall(name="web_search", args={"query": query, "category": cat}))
-
-    # Fallback to simple <web_search>query</web_search>
-    for match in re.finditer(r'(?:<tool_call>\s*)?<web_search>(?![\s\S]*<query>)(.*?)</web_search>(?:\s*</tool_call>)?', content, re.DOTALL):
-        actions.append(ActionToolCall(name="web_search", args={"query": match.group(1).strip(), "category": "general"}))
+    # ── finish_task ────────────────────────────────────────────────────────────
+    # Critical: must be detected so text_only agents can exit the ReAct loop.
+    # Matches: <tool_call><finish_task>...</finish_task></tool_call>
+    #   and:   <tool_call><finish_task/></tool_call>  (self-closing)
+    #   and:   <finish_task>...</finish_task>  (bare, without outer tool_call)
+    finish_pattern = re.compile(
+        r'(?:<tool_call>\s*)?<finish_task(?:>\s*(?:.*?)\s*</finish_task>|/>)(?:\s*</tool_call>)?',
+        re.DOTALL | re.IGNORECASE,
+    )
+    if finish_pattern.search(content):
+        # Extract optional summary text inside <summary>...</summary>
+        summary_match = re.search(r'<summary>(.*?)</summary>', content, re.DOTALL)
+        summary = summary_match.group(1).strip() if summary_match else ""
+        actions.append(ActionToolCall(name="finish_task", args={"summary": summary}))
 
     # 4. Extreme Fallbacks if no explicit format found and we only have 1 target file
     # if not actions and len(allowlist) == 1:
@@ -438,6 +516,7 @@ class UniversalToolHandler:
         self.turn_dir = turn_dir
         self.allowlist = allowlist
         self.dynamic_tools_mapping = dynamic_tools_mapping or {}
+        self.written_files: list = []
 
     def _execute_code_mutations(self, actions: List[AgentAction], full_content: str) -> bool:
         """
@@ -498,6 +577,7 @@ class UniversalToolHandler:
                 if target_path:
                     if apply_write_files([(str(target_path), action.content)], self.allowlist, self.turn_dir):
                         changes_applied = True
+                        self.written_files.append(str(target_path))
                 else:
                     console.print(f"[red]Skipping WRITE_FILE for unresolved path: {action.path}[/red]")
                     
@@ -521,6 +601,7 @@ class UniversalToolHandler:
             diff_files = extract_files_from_diff(extract_all_diffs(full_content))
             if diff_files and apply_write_files(diff_files, self.allowlist, self.turn_dir):
                 changes_applied = True
+                self.written_files.extend([p for p, _ in diff_files])
                 console.print("[green]Wrote new files extracted from diff.[/green]")
 
         return changes_applied

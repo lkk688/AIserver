@@ -158,7 +158,7 @@ class PromptRegistry:
         Ensures the agent is completely clear on HOW to call tools.
         """
         #base_prompt = "You are an elite, general-purpose AI Agent. You operate in a structured environment.\n\n"
-        # [NEW] 时空感知 (Spatio-temporal Awareness)
+        # [NEW] (Spatio-temporal Awareness)
         current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z")
         
         base_prompt = (
@@ -169,6 +169,9 @@ class PromptRegistry:
             f"- You are already inside the target workspace directory.\n"
             f"- ALL file paths you read, write, or execute must be RELATIVE to your current directory (e.g., `./script.py`).\n"
             f"- NEVER use `cd` in bash commands. Execute directly (e.g., `python3 script.py`, not `cd dir && python3 script.py`).\n\n"
+            # 👇 新增规则：剥夺交互权限，强制自主推进
+            f"- NO HUMAN INTERACTION: You are running in an autonomous loop. Do NOT ask the user for clarification, permission, or follow-up questions.\n"
+            f"- Make reasonable assumptions and proceed autonomously using tools until the goal is fully achieved.\n\n"
         )
         
         if domain != "general":
@@ -191,55 +194,85 @@ class PromptRegistry:
             # 在这种模式下，不需要手动列出工具，底层 API 会通过系统层传递 Schema 给模型
             
         elif strategy == "hybrid":
-            # HYBRID 模式：只允许 Markdown 写文件，其余查资料用原生工具
+            # HYBRID: native JSON for observation tools, XML child-tags for file mutations
             mode_prompt = (
-                "## 1. Execution Mode: HYBRID (Native Tools + Markdown Coding)\n"
-                "You have access to native JSON tools via the API for gathering information and finishing tasks.\n"
-                "However, to write or modify code, you MUST use Markdown formats instead of JSON tools.\n\n"
-                "### Modifying Files (Use Markdown ONLY)\n"
-                "**Format A: Unified Diff** (For modifying existing files)\n"
-                "```diff\n--- a/file.py\n+++ b/file.py\n@@ -1,2 +1,3 @@\n def main():\n-  pass\n+  print('hi')\n```\n\n"
-                "**Format B: WRITE_FILE** (For new files or massive rewrites)\n"
-                "WRITE_FILE: path/to/file.ext\n<<<CONTENT\n... code ...\nCONTENT>>>\n\n"
+                "## 1. Execution Mode: HYBRID (Native JSON + XML File Mutations)\n"
+                "You have access to native JSON tools (provided via the API) for gathering information.\n"
+                "For writing or editing files, you MUST use the XML formats below instead of JSON tools.\n\n"
+                "### Writing / Editing Files (XML format — DO NOT use JSON tools for these)\n"
+                "**Create or overwrite a file:**\n"
+                "`<tool_call><write_file><path>./path/to/file.py</path><content>full file content here</content></write_file></tool_call>`\n\n"
+                "**Replace text in an existing file:**\n"
+                "`<tool_call><search_and_replace><path>./file.py</path><old_text>exact old text</old_text><new_text>new text</new_text></search_and_replace></tool_call>`\n\n"
             )
-            
+
         elif strategy == "text_only":
-            # TEXT_ONLY 模式：没有原生工具，必须全部靠手打 XML
-            # 动态生成 XML 工具文档
-            xml_docs = ""
-            for t in base_tools_list:
-                name = t.get("name")
-                desc = t.get("description", "")
-                args_xml = "".join([f"<{k}>...</{k}>" for k in t.get("properties", {}).keys()])
-                xml_docs += f"`<tool_call><{name}>{args_xml}</{name}></tool_call>`\n  - {desc}\n"
+            # TEXT_ONLY: no native JSON tools at all — everything via XML child-tags.
+            # The xml_docs are auto-generated from the base_tools_list schema,
+            # using the model's trained convention: <tool_call><name><param>val</param></name></tool_call>
+            def _tool_to_xml_example(t: dict) -> str:
+                name = t["name"]
+                props = t.get("properties", {})
+                inner = "".join(f"<{k}>...</{k}>" for k in props)
+                return f"`<tool_call><{name}>{inner}</{name}></tool_call>`"
+
+            # Split tools into categories for a cleaner prompt
+            obs_tools   = [t for t in base_tools_list if t["name"] not in ("write_file", "search_and_replace", "finish_task")]
+            mut_tools   = [t for t in base_tools_list if t["name"] in ("write_file", "search_and_replace")]
+            done_tools  = [t for t in base_tools_list if t["name"] == "finish_task"]
+
+            obs_section  = "\n".join(f"  {_tool_to_xml_example(t)}\n    ↳ {t['description']}" for t in obs_tools)
+            mut_section  = "\n".join(f"  {_tool_to_xml_example(t)}\n    ↳ {t['description']}" for t in mut_tools)
+            done_section = "\n".join(f"  {_tool_to_xml_example(t)}\n    ↳ {t['description']}" for t in done_tools)
 
             mode_prompt = (
                 "## 1. Execution Mode: TEXT_ONLY\n"
                 "You do NOT have native JSON tools. You must output specific XML formats in your text to interact.\n\n"
                 "### Using Interactive Tools\n"
-                "To gather info, execute bash, or finish a task, output EXACTLY this XML format:\n"
-                f"{xml_docs}\n"
+                "To gather info, execute bash, or finish a task, output EXACTLY this XML format:\n\n"
+                f"{obs_section}\n\n"
+                "### Writing / Editing Files\n"
+                f"{mut_section}\n\n"
+                "### Completing the Task\n"
+                f"{done_section}\n\n"
                 "⚠️ CRITICAL FORMATTING RULES:\n"
-                "- ❌ WRONG: `web_search(query='...')` (Do not use Python syntax)\n"
-                "- ❌ WRONG: `<web_search query=\"...\">` (Do not use XML attributes)\n"
-                "- ✅ CORRECT: `<tool_call><web_search><query>...</query></web_search></tool_call>` (Use nested XML tags)\n\n"
-                "### Modifying Files\n"
-                "**Format A: Unified Diff** (Start with `## Action` followed by ```diff block)\n"
-                "**Format B: WRITE_FILE** (`WRITE_FILE: path\\n<<<CONTENT\\n...\\nCONTENT>>>`)\n\n"
+                "- ❌ WRONG: `web_search(query='...')` (Python syntax — rejected)\n"
+                "- ❌ WRONG: `<web_search query=\"...\">` (XML attributes — rejected)\n"
+                "- ❌ WRONG: `WRITE_FILE: path\\n<<<CONTENT` (old format — rejected)\n"
+                "- ✅ CORRECT: `<tool_call><web_search><query>...</query></web_search></tool_call>`\n"
+                "- ✅ CORRECT: `<tool_call><write_file><path>./foo.py</path><content>...</content></write_file></tool_call>`\n\n"
+                # 👇 新增规则：防幻觉
+                "- NEVER invent tool names or parameter tags. Use EXACTLY the tag names shown above.\n\n"
             )
 
         # -------------------------------------------------------------
         # 2. 追加通用规则
         # -------------------------------------------------------------
+        # general_rules = (
+        #     "## 2. Information Gathering & Verification Rules (CRITICAL)\n"
+        #     "1. **Never Guess Code**: Check `Provided File Context` first. If missing, use tools to read files.\n"
+        #     "2. **Search for Unknowns**: Use `web_search` for unknown libraries or APIs.\n"
+        #     "3. **Verification**: After modifying code, you MUST run a verification command (e.g., `python3 script.py`).\n"
+        #     #"4. Use the `finish_task` tool ONLY when you have verified the solution works.\n"
+        #     # 👇 修改规则：强制调用 finish_task，防止啰嗦
+        #     "4. **End of Task**: The moment you have fully achieved the user's Goal, you MUST immediately call the `finish_task` tool in your very next response. Do NOT provide a plain text summary without calling this tool.\n"
+        # )
         general_rules = (
             "## 2. Information Gathering & Verification Rules (CRITICAL)\n"
             "1. **Never Guess Code**: Check `Provided File Context` first. If missing, use tools to read files.\n"
             "2. **Search for Unknowns**: Use `web_search` for unknown libraries or APIs.\n"
-            "3. **Verification**: After modifying code, you MUST run a verification command (e.g., `python3 script.py`).\n"
-            "4. Use the `finish_task` tool ONLY when you have verified the solution works.\n"
+            # 👇 核心优化：区分代码验证与文档验证，大幅提升编写文档时的效率
+            "3. **Context-Aware Verification**:\n"
+            "   - **For Executable Code**: After modifying scripts, you MUST run a verification command (e.g., `python3 script.py` or `pytest`) to ensure it works.\n"
+            "   - **For Documents/Reports**: (e.g., `.md`, `.txt`) Do NOT attempt to execute them. Once the writing tool returns a success message, consider it verified.\n"
+            "4. **End of Task**: The moment you have fully achieved the user's Goal, you MUST immediately call the `finish_task` tool in your very next response. Do NOT provide a plain text summary without calling this tool.\n"
         )
-        
-        return base_prompt + mode_prompt + general_rules
+        cot_rules = (
+            "## Chain-of-Thought Protocol\n"
+            "- If you need to think before acting, enclose your thoughts within `<think>...</think>` tags.\n"
+            "- CRITICAL: Your actual tool call (JSON or XML) MUST be placed OUTSIDE and AFTER the `<think>...</think>` tags, otherwise the system cannot execute it.\n\n"
+        )
+        return base_prompt + cot_rules + mode_prompt + general_rules
 
     @staticmethod
     def format_task(goal: str, allowlist: List[str], context_files: List[str], workspace_dir: str, content_injector) -> str:

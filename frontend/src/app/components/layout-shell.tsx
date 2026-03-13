@@ -25,6 +25,7 @@ function Sidebar() {
     { icon: FileText, label: "My Documents", href: "/documents" },
     { icon: History, label: "History", href: "/jobs" },
     { icon: Waves, label: "Audio Lab", href: "/audio" },
+    { icon: Sparkles, label: "Chat Agent", href: "/chat" },
     { icon: Search, label: "Smart Search", href: "/search" },
   ];
 

@@ -31,3 +31,11 @@ text_processing:
   use_seq2seq: false
   seq2seq_model: google/byt5-small
   seq2seq_prefix: null
+
+minio:
+  endpoint: "http://100.83.246.7:9000"
+  console_url: "http://100.83.246.7:9001"
+  bucket: "aiagent"
+  access_key: "my_minio_admin"
+  secret_key: "mypwd4minio"
+  secure: false

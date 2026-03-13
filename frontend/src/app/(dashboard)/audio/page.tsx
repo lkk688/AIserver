@@ -67,8 +67,10 @@ export default function AudioPage() {
     const supported =
       typeof window !== "undefined" &&
       typeof WebSocket !== "undefined" &&
-      (window as Window & { webkitAudioContext?: typeof AudioContext }).AudioContext;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ((window as any).AudioContext || (window as any).webkitAudioContext);
     if (supported) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setCanStream(true);
     }
   }, []);
@@ -138,6 +140,7 @@ export default function AudioPage() {
   };
 
   const createAudioChain = () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const anyWindow = window as any;
     const AudioCtx = anyWindow.AudioContext || anyWindow.webkitAudioContext;
     if (!AudioCtx) {

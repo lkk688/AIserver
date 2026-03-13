@@ -5,3 +5,4 @@ pdfplumber
 wordfreq
 kenlm
 transformers
+pyyaml

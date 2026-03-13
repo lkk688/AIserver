@@ -84,7 +84,7 @@ function LoginModal({ isOpen, onClose }: { isOpen: boolean; onClose: () => void 
           </div>
         </div>
         <div className="bg-gray-50 px-6 py-4 text-center text-sm text-gray-500">
-          Don't have an account? <a href="#" className="text-blue-600 font-medium hover:underline">Create Account</a>
+          Don&apos;t have an account? <a href="#" className="text-blue-600 font-medium hover:underline">Create Account</a>
         </div>
       </div>
     </div>
@@ -227,7 +227,7 @@ export default function LandingPage() {
                     <p className="text-xs text-gray-500">{item.role}</p>
                   </div>
                 </div>
-                <p className="text-gray-600 italic">"{item.quote}"</p>
+                <p className="text-gray-600 italic">&quot;{item.quote}&quot;</p>
               </div>
             ))}
           </div>

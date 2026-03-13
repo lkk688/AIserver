@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from backend.app.config.loader import load_config
 from backend.app.dependencies import get_job_runner
 import os
@@ -25,9 +26,22 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Local Search RAG", lifespan=lifespan)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.get("/health")
 def health_check():
     return {"status": "ok", "config_loaded": config is not None}
 
 from backend.app.api.routers import router as api_router
+from backend.app.api.llm_router import router as llm_router
+from BatchAgent.agent_service import router as agent_router
+
 app.include_router(api_router, prefix="/api/v1")
+app.include_router(llm_router, prefix="/api/v1")
+app.include_router(agent_router, prefix="/api/v1")
+

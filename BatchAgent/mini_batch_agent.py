@@ -352,7 +352,17 @@ def execute_actions(actions: List[AgentAction], content: str, allowlist: List[st
 def parse_text_actions(content: str, allowlist: List[str]) -> List[AgentAction]:
     """Fallback text parser to convert plain text markdown into AgentAction protocol."""
     actions = []
-    
+
+    # ── Strip <think>...</think> reasoning blocks before parsing ──────────────
+    # Reasoning models (Qwen3, DeepSeek-R1, etc.) wrap their chain-of-thought in
+    # <think> tags. The actual tool calls appear AFTER the closing </think> tag.
+    # Parsing the thinking section can match partial/test XML and cause false positives
+    # or miss the real tool call in the answer section.
+    think_stripped = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL | re.IGNORECASE)
+    # Use stripped content for all tool-call pattern matching;
+    # keep original `content` for WRITE_FILE / diff extraction (they live outside <think>)
+    parse_content = think_stripped if think_stripped.strip() else content
+
     # 1. WRITE_FILE
     write_actions = extract_write_file_actions(content)
     if write_actions:
@@ -366,12 +376,12 @@ def parse_text_actions(content: str, allowlist: List[str]) -> List[AgentAction]:
     if diff:
         actions.append(ActionApplyDiff(diff_text=diff))
         
-    # 3. Interactive Tool Tags
-    for match in re.finditer(r'(?:<tool_call>\s*)?<search_code>(.*?)</search_code>(?:\s*</tool_call>)?', content, re.DOTALL):
+    # 3. Interactive Tool Tags (parsed from think-stripped content)
+    for match in re.finditer(r'(?:<tool_call>\s*)?<search_code>(.*?)</search_code>(?:\s*</tool_call>)?', parse_content, re.DOTALL):
         actions.append(ActionToolCall(name="search_code", args={"query": match.group(1).strip()}))
-    for match in re.finditer(r'(?:<tool_call>\s*)?<find_file>(.*?)</find_file>(?:\s*</tool_call>)?', content, re.DOTALL):
+    for match in re.finditer(r'(?:<tool_call>\s*)?<find_file>(.*?)</find_file>(?:\s*</tool_call>)?', parse_content, re.DOTALL):
         actions.append(ActionToolCall(name="find_file", args={"pattern": match.group(1).strip()}))
-    for match in re.finditer(r'(?:<tool_call>\s*)?<read_file_chunk>\s*<filepath>(.*?)</filepath>(.*?)</read_file_chunk>(?:\s*</tool_call>)?', content, re.DOTALL):
+    for match in re.finditer(r'(?:<tool_call>\s*)?<read_file_chunk>\s*<filepath>(.*?)</filepath>(.*?)</read_file_chunk>(?:\s*</tool_call>)?', parse_content, re.DOTALL):
         fpath = match.group(1).strip()
         rest = match.group(2)
         m_s = re.search(r'<start_line>(\d+)</start_line>', rest)
@@ -380,14 +390,27 @@ def parse_text_actions(content: str, allowlist: List[str]) -> List[AgentAction]:
         e_line = int(m_e.group(1)) if m_e else 1000
         actions.append(ActionToolCall(name="read_file_chunk", args={"filepath": fpath, "start_line": s_line, "end_line": e_line}))
         
-    for match in re.finditer(r'(?:<tool_call>\s*)?<list_directory>\s*<dir_path>(.*?)</dir_path>\s*</list_directory>(?:\s*</tool_call>)?', content, re.DOTALL):
+    for match in re.finditer(r'(?:<tool_call>\s*)?<list_directory>\s*<dir_path>(.*?)</dir_path>\s*</list_directory>(?:\s*</tool_call>)?', parse_content, re.DOTALL):
         actions.append(ActionToolCall(name="list_directory", args={"dir_path": match.group(1).strip()}))
         
-    for match in re.finditer(r'(?:<tool_call>\s*)?<run_bash_command>\s*<command>(.*?)</command>\s*</run_bash_command>(?:\s*</tool_call>)?', content, re.DOTALL):
+    for match in re.finditer(r'(?:<tool_call>\s*)?<run_bash_command>\s*<command>(.*?)</command>\s*</run_bash_command>(?:\s*</tool_call>)?', parse_content, re.DOTALL):
         actions.append(ActionToolCall(name="run_bash_command", args={"command": match.group(1).strip()}))
 
-    for match in re.finditer(r'(?:<tool_call>\s*)?<web_search>(.*?)</web_search>(?:\s*</tool_call>)?', content, re.DOTALL):
+    for match in re.finditer(r'(?:<tool_call>\s*)?<web_search>(.*?)</web_search>(?:\s*</tool_call>)?', parse_content, re.DOTALL):
         actions.append(ActionToolCall(name="web_search", args={"query": match.group(1).strip()}))
+
+    # ── finish_task ────────────────────────────────────────────────────────────
+    # CRITICAL: without this pattern the agent loops forever in text_only mode even
+    # when the model correctly outputs <tool_call><finish_task>...</finish_task></tool_call>.
+    # Matches all common variants the model might produce.
+    finish_pat = re.compile(
+        r'(?:<tool_call>\s*)?<finish_task(?:>\s*(?:.*?)\s*</finish_task>|/>)(?:\s*</tool_call>)?',
+        re.DOTALL | re.IGNORECASE,
+    )
+    if finish_pat.search(parse_content):
+        summary_m = re.search(r'<summary>(.*?)</summary>', parse_content, re.DOTALL)
+        summary = summary_m.group(1).strip() if summary_m else ""
+        actions.append(ActionToolCall(name="finish_task", args={"summary": summary}))
 
     # 4. Fallbacks if no explicit format found
     if not actions and len(allowlist) == 1:
@@ -404,6 +427,7 @@ def parse_text_actions(content: str, allowlist: List[str]) -> List[AgentAction]:
             actions.append(ActionWriteFile(path=allowlist[0], content=clean))
             
     return actions
+
 
 
 # ---------------------------

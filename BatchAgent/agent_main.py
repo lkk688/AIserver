@@ -3,8 +3,8 @@ import re
 import json
 import asyncio
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass
+from typing import List, Dict, Any, Optional, Tuple, Callable, Awaitable
+from dataclasses import dataclass, field
 import sys
 import httpx
 import argparse
@@ -56,10 +56,14 @@ class AgentConfig:
     serper_api_key: str = ""
     domain: str = "general"
     location: str = "California, United States"
-
-
-
-
+    temperature: float = 0.1  # [NEW] optimized for strict formatting 
+    memory_strategy: str = "sliding_window"  # [NEW] 'sliding_window', 'summarize'
+    backend: str = "vllm" # [NEW] 'vllm', 'llama.cpp', 'openai', 'anthropic'
+    enable_thinking: bool = True # [NEW] Switch for internal reasoning injection
+    enable_turn_limits: bool = False
+    max_turns: int = 15  # configurable max ReAct turns
+    # Optional: async token callback for SSE streaming (set by agent_service / API layer)
+    stream_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
 # ==========================================
 # 3. Universal Agent Class (Single-Track ReAct)
 # ==========================================
@@ -124,13 +128,45 @@ class UniversalAgent:
         return "\n\n".join(combined_results)
 
     
-    def _prune_memory(self):
-        """intelligent sliding window with strategic retention of key information"""
+    async def _prune_memory(self):
+        """Intelligent context window management avoiding context loss."""
         if len(self.messages) > 12:
-            # Keep: System Prompt (0), User Goal (1)
-            # Keep: latest 10 messages (to preserve recent context and instructions)
-            self.messages = [self.messages[0], self.messages[1]] + self.messages[-10:]
-            console.print("[dim]🧹 Memory window gracefully pruned (kept last 10 turns).[/dim]")
+            if getattr(self.config, 'memory_strategy', 'sliding_window') == 'summarize':
+                # We need to compress messages from index 2 up to -10
+                msgs_to_compress = self.messages[2:-10]
+                text_to_compress = "\n\n".join([f"Role: {m['role']}\n{m['content']}" for m in msgs_to_compress])
+                
+                console.print("\n[magenta]🧠 Compress memory: Summarizing previous actions to preserve context...[/magenta]")
+                prompt = (
+                    "Please concisely summarize the following sequence of actions, tool results, and findings. "
+                    "Focus only on WHAT tools were used, WHAT data was discovered, and WHAT files were changed. "
+                    "Do NOT include conversational filler.\n\n"
+                    f"{text_to_compress}"
+                )
+                
+                from BatchAgent.llm_wrapper import complete_with_async
+                try:
+                    summary, _ = await complete_with_async(
+                        client=self.config.client, model=self.config.model, provider=self.config.provider,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.1, max_output_tokens=1000,
+                        stream=False, backend=self.config.backend, enable_thinking=False
+                    )
+                    
+                    compressed_msg = {
+                        "role": "user", 
+                        "content": f"[SYSTEM: The following is a summary of earlier actions to preserve context]\n{summary}"
+                    }
+                    self.messages = [self.messages[0], self.messages[1], compressed_msg] + self.messages[-10:]
+                    console.print("[dim]🧹 Memory window gracefully compressed via LLM summarization.[/dim]")
+                except Exception as e:
+                    console.print(f"[red]Failed to summarize memory ({e}), falling back to sliding window.[/red]")
+                    self.messages = [self.messages[0], self.messages[1]] + self.messages[-10:]
+            else:
+                # Keep: System Prompt (0), User Goal (1)
+                # Keep: latest 10 messages
+                self.messages = [self.messages[0], self.messages[1]] + self.messages[-10:]
+                console.print("[dim]🧹 Memory window gracefully pruned (kept last 10 turns).[/dim]")
 
     async def _execute_batch_brainstorm(self, action: ActionToolCall, allowlist: List[str]) -> str:
         """
@@ -166,7 +202,9 @@ class UniversalAgent:
                 stream=False,   # disable streaming for batch calls to simplify aggregation
                 verbose=False,
                 tool_strategy="text", # text only for brainstorming to avoid parsing issues and encourage free-form thinking
-                allowlist=allowlist
+                allowlist=allowlist,
+                backend=self.config.backend,
+                enable_thinking=self.config.enable_thinking
             )
             return f"### Approach {idx + 1} (Temp {div_temp:.2f}):\n{content}\n"
 
@@ -213,7 +251,7 @@ class UniversalAgent:
                 "Do NOT rewrite the files unless you found an error."
             )
             
-        # 3. check approaval
+        # 3. check approoval
         if getattr(self.config, 'require_approval', False):
             console.print(f"\n[bold red]⚠️ Agent intends to run a command: [/bold red] `[white]{verify_cmd}[/white]`")
             from rich.prompt import Confirm
@@ -251,18 +289,21 @@ class UniversalAgent:
     # =========================================================
     # THE MAIN LOOP (Now incredibly clean and readable)
     # =========================================================
-    async def execute_task(self, task_goal: str, task_idx: int, allowlist: List[str], prompt_md: str) -> bool:
+    async def execute_task(self, task_goal: str, task_idx: int, allowlist: List[str], prompt_md: str) -> Tuple[bool, str]:
         
         console.print(f"\n[bold green]=== Starting Agent Task {task_idx+1} ===[/bold green]")
-        self.messages = [{"role": "system", "content": self.system_message}, {"role": "user", "content": prompt_md}]
+        self.messages = [{"role": "system", "content": self.system_message}]
         self._log_rl("system", self.system_message)
-        self._log_rl("user", prompt_md)
 
-        MAX_REACT_TURNS = 15
+        MAX_REACT_TURNS = getattr(self.config, 'max_turns', 15)
         from BatchAgent.llm_wrapper import complete_with_continuation_async # Local import
-        
+
+        final_result_text = "Task aborted or failed."
+        # Loop-detection: track (tool_name, arg_hash) fingerprints from last 3 turns
+        _recent_fingerprints: list = []
+
         for current_turn in range(MAX_REACT_TURNS):
-            self._prune_memory()
+            await self._prune_memory()
             
             turn_dir = self.config.session_dir / f"{task_idx * 100 + current_turn:04d}"
             turn_dir.mkdir(parents=True, exist_ok=True)
@@ -270,26 +311,48 @@ class UniversalAgent:
             # ===============================================================
             # [NEW] 1. complete Prompt for debug
             # ===============================================================
-            (turn_dir / "full_prompt_context.json").write_text(
-                json.dumps(self.messages, indent=2, ensure_ascii=False), 
-                encoding="utf-8"
-            )
-            # Human readable version of the prompt for easier debugging
-            (turn_dir / "latest_instruction.md").write_text(self.messages[-1]["content"], encoding="utf-8")
+            # (turn_dir / "full_prompt_context.json").write_text(
+            #     json.dumps(self.messages, indent=2, ensure_ascii=False), 
+            #     encoding="utf-8"
+            # )
+            # # Human readable version of the prompt for easier debugging
+            # (turn_dir / "latest_instruction.md").write_text(self.messages[-1]["content"], encoding="utf-8")
             
             console.print(f"\n[bold yellow]>>> ReAct Turn {current_turn + 1} / {MAX_REACT_TURNS}[/bold yellow]")
+
+            # Notify streaming clients of a new ReAct turn so the UI can create a new message bubble
+            if self.config.stream_callback:
+                await self.config.stream_callback({
+                    "type": "turn_start",
+                    "turn": current_turn + 1,
+                    "max_turns": MAX_REACT_TURNS,
+                })
+
+            # [NEW] Inject temporal awareness if enabled
+            current_user_prompt = prompt_md if current_turn == 0 else "" # Initial prompt is only for the first turn
+            if self.config.enable_turn_limits:
+                current_user_prompt = f"[Current Turn: {current_turn + 1} / Max Turns: {MAX_REACT_TURNS}]\n{current_user_prompt}"
+            
+            if current_turn == 0:
+                self._log_rl("user", prompt_md)
+                self.messages.append({"role": "user", "content": current_user_prompt})
+                (turn_dir / "user_prompt.md").write_text(prompt_md, encoding="utf-8")
             
             # --- 1. LLM Generation ---
             content, actions = await complete_with_continuation_async(
                 client=self.config.client, model=self.config.model, messages=self.messages,
-                temperature=getattr(self.config, 'temperature', 0.2), max_output_tokens=self.config.max_output,
+                temperature=getattr(self.config, 'temperature', 0.1), max_output_tokens=self.config.max_output,
                 model_max_context=self.config.max_context, provider=self.config.provider,
                 stream=True, verbose=self.config.verbose, session_dir=self.config.session_dir,
-                tools=self.tools, tool_strategy=self.config.tool_strategy, allowlist=allowlist
+                tools=self.tools, tool_strategy=self.config.tool_strategy, allowlist=allowlist,
+                on_event=getattr(self.config, 'stream_callback', None),  # SSE forwarding hook
+                backend=getattr(self.config, 'backend', 'vllm'),
+                enable_thinking=getattr(self.config, 'enable_thinking', True)
             )
             
             (turn_dir / "response.md").write_text(content, encoding="utf-8")
             self._log_rl("assistant", content)
+            final_result_text = content # keep track of last message
 
             # ===============================================================
             # [NEW] 2. extract the actions for this turn and log them in a structured way for better interpretability and debugging. This also allows us to analyze the agent's decision-making process and tool usage patterns over time.
@@ -307,10 +370,12 @@ class UniversalAgent:
             )
             
             # --- 2. Check for Conclusion ---
-            if next((a for a in actions if getattr(a, 'name', '') == 'finish_task'), None):
+            finish_task_action = next((a for a in actions if getattr(a, 'name', '') == 'finish_task'), None)
+            if finish_task_action:
                 console.print("[bold green]🏁 Agent explicitly finished the task.[/bold green]")
                 self._save_trajectory_to_disk(task_idx, reward=1.0)
-                return True
+                summary = finish_task_action.args.get('summary', final_result_text)
+                return True, summary
                 
             if not actions:
                 console.print("[yellow]Agent outputted nothing useful. Forcing format switch.[/yellow]")
@@ -335,9 +400,15 @@ class UniversalAgent:
                         "If you are finished, invoke the `finish_task` tool."
                     )
 
-                self.messages.extend([{"role": "assistant", "content": content}, {"role": "user", "content": feedback}])
+                self.messages.append({"role": "assistant", "content": content})
+                
+                feedback_prompt = feedback
+                if self.config.enable_turn_limits:
+                    feedback_prompt = f"[Current Turn: {current_turn + 1} / Max Turns: {MAX_REACT_TURNS}]\n{feedback_prompt}"
+
                 self._log_rl("user", feedback)
-                current_turn += 1
+                self.messages.append({"role": "user", "content": feedback_prompt})
+                (turn_dir / "user_feedback.md").write_text(feedback_prompt, encoding="utf-8")
                 continue
                 
             # --- 3. Action Segregation ---
@@ -382,9 +453,15 @@ class UniversalAgent:
                     load_feedback = f"❌ Failed to load domain. '{new_domain}' is not a valid domain plugin."
                 
                 # record this hot-swapping event in the trajectory with the new system prompt and feedback, to help the agent understand the change in its capabilities and instructions
-                self.messages.extend([{"role": "assistant", "content": content}, {"role": "user", "content": load_feedback}])
+                self.messages.append({"role": "assistant", "content": content})
+                
+                feedback_prompt = load_feedback
+                if self.config.enable_turn_limits:
+                    feedback_prompt = f"[Current Turn: {current_turn + 1} / Max Turns: {MAX_REACT_TURNS}]\n{feedback_prompt}"
+
                 self._log_rl("user", load_feedback)
-                current_turn += 1
+                self.messages.append({"role": "user", "content": feedback_prompt})
+                (turn_dir / "load_feedback.md").write_text(feedback_prompt, encoding="utf-8")
                 continue
             # =====================================================================
 
@@ -393,13 +470,47 @@ class UniversalAgent:
             brainstorm_action = next((a for a in info_actions if getattr(a, 'name', '') == 'brainstorm_solutions'), None)
             if brainstorm_action and getattr(self.config, 'enable_parallel_thinking', False):
                 bs_feedback = await self._execute_batch_brainstorm(brainstorm_action, allowlist)
-                self.messages.extend([{"role": "assistant", "content": content}, {"role": "user", "content": bs_feedback}])
+                self.messages.append({"role": "assistant", "content": content})
+                
+                feedback_prompt = bs_feedback
+                if self.config.enable_turn_limits:
+                    feedback_prompt = f"[Current Turn: {current_turn + 1} / Max Turns: {MAX_REACT_TURNS}]\n{feedback_prompt}"
+
                 self._log_rl("user", bs_feedback)
+                self.messages.append({"role": "user", "content": feedback_prompt})
+                (turn_dir / "bs_feedback.md").write_text(feedback_prompt, encoding="utf-8")
                 continue # get all the ideas, then let the agent decide how to proceed in the next turn, instead of rushing into tool execution or file mutations
 
             # --- 5. Execute Standard Tools (Concurrently) ---
-            standard_info_actions = [a for a in info_actions if a.name not in ['brainstorm_solutions', 'finish_task']]
+            standard_info_actions = [a for a in info_actions if a.name not in ['brainstorm_solutions', 'finish_task', 'load_domain_tools', 'register_custom_tool']]
+
+            # Loop detection: skip actions whose (name, args) fingerprint appeared in the last 2 turns
             if standard_info_actions:
+                deduped, skipped = [], []
+                for a in standard_info_actions:
+                    fp = (a.name, json.dumps(a.args, sort_keys=True))
+                    if _recent_fingerprints.count(fp) >= 2:
+                        skipped.append(a.name)
+                    else:
+                        deduped.append(a)
+                if skipped:
+                    console.print(f"[yellow]⚠️ Loop detected — skipping repeated calls: {skipped}[/yellow]")
+                    feedback_blocks.append(
+                        f"⚠️ **Loop detected**: You already called {skipped} with identical arguments in a previous turn. "
+                        "The results were already provided. Use the information you have to proceed — "
+                        "either synthesize what you know into a `write_file` call or call `finish_task`."
+                    )
+                standard_info_actions = deduped
+
+            if standard_info_actions:
+                # Record fingerprints for this turn
+                for a in standard_info_actions:
+                    fp = (a.name, json.dumps(a.args, sort_keys=True))
+                    _recent_fingerprints.append(fp)
+                # Keep only last 6 entries (3 turns × 2 tools)
+                if len(_recent_fingerprints) > 6:
+                    _recent_fingerprints[:] = _recent_fingerprints[-6:]
+
                 concurrent_results = await self._execute_tools_concurrently(standard_info_actions, turn_dir, allowlist)
                 feedback_blocks.append(f"### Tool Execution Results\n{concurrent_results}")
             
@@ -427,11 +538,11 @@ class UniversalAgent:
                 self.dynamic_tools_mapping[t_name] = args.get("script_path", "")
                 
                 # recompile the full tool list for the current provider, including both the static base tools and the newly added dynamic tool, to update the agent's capabilities immediately without needing a restart
-                from tools_registry import compile_tools_for_provider
-                from prompt_registry import PromptRegistry
+                from BatchAgent.tools_registry import compile_tools_for_provider
+                from BatchAgent.prompt_registry import PromptRegistry
                 
                 # get the base tools for the current strategy and domain, then append the new dynamic tool to it. This ensures that the agent retains access to all its original tools while also gaining the new one it just created, allowing for seamless integration of self-generated capabilities.
-                from tools_registry import get_base_tools
+                from BatchAgent.tools_registry import get_base_tools
                 current_base_tools = get_base_tools(self.config.tool_strategy, getattr(self.config, 'parallel_thinking', False), getattr(self.config, 'domain', 'auto'))
                 current_base_tools.extend(self.dynamic_tools_schema)
                 
@@ -447,9 +558,15 @@ class UniversalAgent:
                     f"The tool is now loaded into your context. You can call it immediately just like any other native tool."
                 )
                 
-                self.messages.extend([{"role": "assistant", "content": content}, {"role": "user", "content": feedback}])
+                self.messages.append({"role": "assistant", "content": content})
+                
+                feedback_prompt = feedback
+                if self.config.enable_turn_limits:
+                    feedback_prompt = f"[Current Turn: {current_turn + 1} / Max Turns: {MAX_REACT_TURNS}]\n{feedback_prompt}"
+
                 self._log_rl("user", feedback)
-                current_turn += 1
+                self.messages.append({"role": "user", "content": feedback_prompt})
+                (turn_dir / "custom_tool_feedback.md").write_text(feedback_prompt, encoding="utf-8")
                 continue
             
             # --- 6. Execute Mutations & Verify ---
@@ -457,7 +574,30 @@ class UniversalAgent:
                 handler = UniversalToolHandler(self.config, turn_dir, allowlist, dynamic_tools_mapping=self.dynamic_tools_mapping)
                 has_mutation, mutation_res = handler.execute(mutation_actions, content)
                 feedback_blocks.append(mutation_res)
-                
+
+                # Upload any written files to MinIO and notify the UI
+                if handler.written_files and self.config.stream_callback:
+                    from BatchAgent.minio_uploader import upload_file
+                    for fpath in handler.written_files:
+                        fname = Path(fpath).name
+                        url = upload_file(fpath)
+                        # Include inline content for small files (< 200 KB) so the
+                        # frontend can display them even when MinIO is unavailable.
+                        inline_content = None
+                        try:
+                            if os.path.getsize(fpath) < 200 * 1024:
+                                with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
+                                    inline_content = _f.read()
+                        except Exception:
+                            pass
+                        await self.config.stream_callback({
+                            "type": "file_written",
+                            "name": fname,
+                            "url": url or "",
+                            "local_path": fpath,
+                            "content": inline_content,
+                        })
+
                 if has_mutation:
                     # [FIX] get the output from sandbox verification and provide it as feedback to the agent, instead of just returning True/False. This allows the agent to understand the results of its actions and learn from any mistakes, rather than just blindly trying again without guidance.
                     v_feedback = self._verify_mutations(content, mutation_actions, allowlist, turn_dir)
@@ -481,12 +621,19 @@ class UniversalAgent:
             if combined_feedback:
                 (turn_dir / "tool_execution_results.md").write_text(combined_feedback, encoding="utf-8")
 
-            self.messages.extend([{"role": "assistant", "content": content}, {"role": "user", "content": combined_feedback}])
+            self.messages.append({"role": "assistant", "content": content})
+            
+            feedback_prompt = combined_feedback
+            if self.config.enable_turn_limits:
+                feedback_prompt = f"[Current Turn: {current_turn + 1} / Max Turns: {MAX_REACT_TURNS}]\n{feedback_prompt}"
+
             self._log_rl("user", combined_feedback)
+            self.messages.append({"role": "user", "content": feedback_prompt})
+            (turn_dir / "user_feedback.md").write_text(feedback_prompt, encoding="utf-8")
 
         console.print("[bold red]Max ReAct turns exceeded. Task aborted.[/bold red]")
         self._save_trajectory_to_disk(task_idx, reward=-1.0)
-        return False
+        return False, final_result_text
 
     # [old version]
     async def execute_task_v1(self, task_goal: str, task_idx: int, allowlist: List[str], prompt_md: str) -> bool:
@@ -530,7 +677,9 @@ class UniversalAgent:
                 session_dir=self.config.session_dir,
                 tools=self.tools,
                 tool_strategy="auto",
-                allowlist=allowlist
+                allowlist=allowlist,
+                backend=getattr(self.config, 'backend', 'vllm'),
+                enable_thinking=getattr(self.config, 'enable_thinking', True)
             )
             
             (turn_dir / "response.md").write_text(content, encoding="utf-8")
@@ -738,7 +887,7 @@ class UniversalAgent:
                 if not verify_cmd:
                     console.print("[yellow]No verification command found/needed. Assuming Success.[/yellow]")
                     self._save_trajectory_to_disk(task_idx, reward=1.0)
-                    return True
+                    return True, final_result_text
                 
                 # Approval for running commands
                 if self.config.require_approval:
@@ -746,7 +895,7 @@ class UniversalAgent:
                     if not Confirm.ask("Do you approve executing this command?"):
                         console.print("[yellow]Command rejected by user.[/yellow]")
                         self._save_trajectory_to_disk(task_idx, reward=1.0)
-                        return True
+                        return True, final_result_text
 
                 # Run Verification
                 code, out = run_shell(verify_cmd, cap=20000, sandbox_container=self.config.sandbox_container)
@@ -756,7 +905,7 @@ class UniversalAgent:
                     console.print("[bold green]✅ Verification PASSED![/bold green]")
                     if self.config.verbose: console.print(f"[dim]{out}[/dim]")
                     self._save_trajectory_to_disk(task_idx, reward=1.0)
-                    return True
+                    return True, final_result_text
                 else:
                     console.print(f"[bold red]❌ Verification Failed (exit={code})[/bold red]")
                     
@@ -785,7 +934,7 @@ class UniversalAgent:
 
         console.print("[bold red]Max ReAct turns exceeded. Task aborted.[/bold red]")
         self._save_trajectory_to_disk(task_idx, reward=-1.0)
-        return False
+        return False, final_result_text
 
 
 # ==========================================
@@ -858,6 +1007,7 @@ async def main_async():
                                  "business", "assistant", "sales_support"], 
                         help="Inject domain-specific tools.")
     parser.add_argument("--location", default="California, United States", help="Location for time-sensitive tasks")
+    parser.add_argument("--enable-turn-limits", action="store_true", help="Inject turn limits into prompts to remind the agent of remaining turns.")
     
     args = parser.parse_args()
 
@@ -919,7 +1069,8 @@ async def main_async():
         verbose=args.verbose,
         serper_api_key=args.serper_key,
         domain=args.domain,
-        location=args.location
+        location=args.location,
+        enable_turn_limits=args.enable_turn_limits
     )
 
     # --- Goal Collection ---
@@ -956,7 +1107,6 @@ async def main_async():
         location=config.location
     )
     # compiled_tools = get_active_tools(config.tool_strategy, config.provider)
-    # system_prompt = PromptRegistry.get_system_prompt(config.tool_strategy, compiled_tools)
     
     #compiled_tools = get_compiled_tools(config.provider)
     #system_prompt = PromptRegistry.get_system_prompt(BASE_TOOLS)

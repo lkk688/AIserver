@@ -1,10 +1,16 @@
 import os
-import yaml
 from pathlib import Path
 from typing import Any, Dict
 from .schema import AppConfig
 
 def load_config(config_path: str = "backend/config.yaml") -> AppConfig:
+    try:
+        import yaml
+    except ImportError:
+        raise ImportError(
+            "PyYAML is required to load config. "
+            "Install it with: conda activate mypy311 && pip install pyyaml"
+        )
     # Allow absolute paths or paths relative to CWD
     path = Path(config_path)
     if not path.is_absolute():

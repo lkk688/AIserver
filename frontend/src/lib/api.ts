@@ -12,6 +12,7 @@ export interface Source {
   id: string;
   name: string;
   path: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   config: Record<string, any>;
   created_at: string;
   updated_at: string;
@@ -23,6 +24,7 @@ export interface Job {
   status: 'pending' | 'running' | 'done' | 'failed';
   progress: number;
   error?: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   payload: Record<string, any>;
   created_at: string;
   updated_at: string;
@@ -66,6 +68,7 @@ export interface SearchResult {
   chunk_id: string;
   score: number;
   text: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   metadata: Record<string, any>;
 }
 
@@ -74,6 +77,7 @@ export const fetchSources = async (): Promise<Source[]> => {
   return data;
 };
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const createSource = async (source: { name: string; path: string; config?: Record<string, any> }): Promise<Source> => {
   const { data } = await api.post<Source>('/sources', source);
   return data;
