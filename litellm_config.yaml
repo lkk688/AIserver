@@ -1,15 +1,27 @@
 model_list:
   - model_name: qwen3
     litellm_params:
-      model: openai/Qwen/Qwen2.5-14B-Instruct-AWQ
+      model: openai/Qwen/Qwen3.5-35B-A3B-Instruct
       api_base: http://vllm-qwen3:8000/v1
       api_key: sk-dummy-key
 
+  # the same model
   - model_name: qwen3-vl
     litellm_params:
-      model: openai/Qwen/Qwen2.5-VL-7B-Instruct-AWQ
-      api_base: http://vllm-qwen3-vl:8000/v1
+      model: openai/Qwen/Qwen3.5-35B-A3B-Instruct
+      api_base: http://vllm-qwen3:8000/v1
       api_key: sk-dummy-key
+  # - model_name: qwen3
+  #   litellm_params:
+  #     model: openai/Qwen/Qwen2.5-14B-Instruct-AWQ
+  #     api_base: http://vllm-qwen3:8000/v1
+  #     api_key: sk-dummy-key
+
+  # - model_name: qwen3-vl
+  #   litellm_params:
+  #     model: openai/Qwen/Qwen2.5-VL-7B-Instruct-AWQ
+  #     api_base: http://vllm-qwen3-vl:8000/v1
+  #     api_key: sk-dummy-key
 
   - model_name: cosyvoice
     litellm_params:
