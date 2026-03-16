@@ -121,20 +121,43 @@ def robust_json_loads(json_str: str, tool_name: str = "") -> Optional[Dict[str, 
     if tool_name == "write_file":
         logging.warning("JSON parsing failed. Attempting violent regex extraction for write_file.")
         try:
-            # 提取 path: 匹配 "path": "xxx"
-            path_match = re.search(r'"path"\s*:\s*"([^"]+)"', json_str)
-            # 提取 content: 匹配 "content": "xxx" 一直到结尾的 } 或字符串末尾
-            content_match = re.search(r'"content"\s*:\s*"(.*)"\s*}?\s*$', json_str, re.DOTALL)
-            
-            if path_match and content_match:
-                path = path_match.group(1)
-                raw_content = content_match.group(1)
-                
-                # 还原基本的转义符
-                clean_content = raw_content.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
-                # 切除可能漏掉的结尾引号和括号
-                clean_content = re.sub(r'"\s*}\s*$', '', clean_content)
-                
+            def _extract_string_field(payload: str, field_name: str) -> Optional[str]:
+                key = f'"{field_name}"'
+                key_idx = payload.find(key)
+                if key_idx < 0:
+                    return None
+                colon_idx = payload.find(":", key_idx + len(key))
+                if colon_idx < 0:
+                    return None
+                start_quote_idx = payload.find('"', colon_idx + 1)
+                if start_quote_idx < 0:
+                    return None
+                value_chars: List[str] = []
+                escaped = False
+                i = start_quote_idx + 1
+                while i < len(payload):
+                    ch = payload[i]
+                    if escaped:
+                        value_chars.append(ch)
+                        escaped = False
+                    elif ch == "\\":
+                        value_chars.append(ch)
+                        escaped = True
+                    elif ch == '"':
+                        return "".join(value_chars)
+                    else:
+                        value_chars.append(ch)
+                    i += 1
+                return "".join(value_chars) if value_chars else None
+
+            path_raw = _extract_string_field(json_str, "path")
+            content_raw = _extract_string_field(json_str, "content")
+            if path_raw is not None and content_raw is not None:
+                path = bytes(path_raw, "utf-8").decode("unicode_escape")
+                try:
+                    clean_content = bytes(content_raw, "utf-8").decode("unicode_escape")
+                except Exception:
+                    clean_content = content_raw.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
                 return {"path": path, "content": clean_content}
         except Exception as e:
             logging.error(f"Violent regex extraction failed: {e}")
@@ -471,10 +494,48 @@ def read_file_chunk(filepath: str, start_line: int, end_line: int) -> str:
     Replaces view_file_content.
     """
     try:
-        if not os.path.exists(filepath):
+        raw_path = Path(filepath.strip()).expanduser()
+        cwd = Path.cwd()
+        candidate_paths: List[Path] = []
+        if raw_path.is_absolute():
+            candidate_paths.append(raw_path)
+        else:
+            candidate_paths.append((cwd / raw_path))
+            candidate_paths.append(raw_path)
+
+        file_path: Optional[Path] = None
+        for candidate in candidate_paths:
+            resolved = candidate.resolve()
+            if resolved.exists() and resolved.is_file():
+                file_path = resolved
+                break
+
+        if file_path is None and raw_path.name:
+            suffix_parts = [part.lower() for part in raw_path.parts if part not in (".", "")]
+            matches: List[Path] = []
+            for match in cwd.rglob(raw_path.name):
+                if not match.is_file():
+                    continue
+                rel_parts = [part.lower() for part in match.relative_to(cwd).parts]
+                if len(rel_parts) >= len(suffix_parts) and rel_parts[-len(suffix_parts):] == suffix_parts:
+                    matches.append(match.resolve())
+            if not matches:
+                for match in cwd.rglob("*"):
+                    if not match.is_file():
+                        continue
+                    if match.name.lower() != raw_path.name.lower():
+                        continue
+                    rel_parts = [part.lower() for part in match.relative_to(cwd).parts]
+                    if len(rel_parts) >= len(suffix_parts) and rel_parts[-len(suffix_parts):] == suffix_parts:
+                        matches.append(match.resolve())
+            unique_matches = list(dict.fromkeys(matches))
+            if len(unique_matches) == 1:
+                file_path = unique_matches[0]
+
+        if file_path is None:
             return f"[Error] File not found: {filepath}"
-            
-        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             lines = f.readlines()
             
         if start_line < 1:
@@ -485,7 +546,7 @@ def read_file_chunk(filepath: str, start_line: int, end_line: int) -> str:
         if start_line > end_line:
             return f"[Error] Invalid range: start_line ({start_line}) > end_line ({end_line})"
             
-        result = [f"--- {filepath} (Lines {start_line}-{end_line}) ---"]
+        result = [f"--- {file_path} (Lines {start_line}-{end_line}) ---"]
         for i in range(start_line - 1, end_line):
             result.append(f"{i+1:4d} | {lines[i].rstrip()}")
             
@@ -1459,28 +1520,35 @@ def resolve_path(raw_path: str, allowlist: List[str], root_dir: Path = Path(".")
     2. Basename match in allowlist (e.g. '/abs/path/task.py' -> 'task.py').
     3. Relative path from root_dir.
     """
-    # Clean up formatting artifacts
-    clean = raw_path.strip().strip("'").strip('"')
-    
-    # 1. Safety Check: Absolute paths are suspicious. Strip root.
-    # Logic: If model says /Developer/AIserver/task.py, we only care about src/main.py relative to us.
-    if clean.startswith("/"):
-        clean = clean.lstrip("/")
-    
-    # 2. Check Allowlist (Highest Priority)
-    # This fixes the exact case you saw: 'Developer/AIserver/task.py' vs 'task.py'
-    target_name = Path(clean).name
-    for allowed in allowlist:
-        allowed_p = Path(allowed)
-        # If basenames match (e.g. task.py == task.py), map it!
-        if allowed_p.name == target_name:
-            # Optional: Check if the full suffix matches to be safer
-            # e.g. 'server/task.py' matches 'task.py' -> maybe unsafe?
-            # For a mini-agent, basename matching is usually the desired behavior.
-            return allowed_p
+    clean = raw_path.strip().strip("'").strip('"').replace("\\", "/")
+    clean = re.sub(r"^\./+", "", clean)
+    clean = clean.lstrip("/")
+    if not clean:
+        return None
 
-    # 3. Direct resolution relative to CWD
-    candidate = root_dir / clean
+    root = root_dir.resolve()
+    clean_parts = [part for part in Path(clean).parts if part not in ("", ".")]
+    clean_parts_lower = [part.lower() for part in clean_parts]
+    allowed_paths = [Path(p).expanduser().resolve() for p in allowlist if str(p).strip()]
+
+    for allowed in allowed_paths:
+        if allowed.as_posix() == Path(clean).as_posix() or str(allowed) == clean:
+            return allowed
+
+    suffix_matches: List[Path] = []
+    for allowed in allowed_paths:
+        allowed_parts_lower = [part.lower() for part in allowed.parts]
+        if len(allowed_parts_lower) >= len(clean_parts_lower) and allowed_parts_lower[-len(clean_parts_lower):] == clean_parts_lower:
+            suffix_matches.append(allowed)
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+
+    basename = Path(clean).name.lower()
+    basename_matches = [p for p in allowed_paths if p.name.lower() == basename]
+    if len(basename_matches) == 1:
+        return basename_matches[0]
+
+    candidate = (root / Path(clean)).resolve()
     if candidate.exists() or candidate.parent.exists():
         return candidate
 
@@ -1907,5 +1975,4 @@ def perform_web_search(query: str, api_key: str) -> str:
             return "\n".join(results) if results else "No results found."
     except Exception as e:
         return f"Web search failed: {str(e)}"
-
 

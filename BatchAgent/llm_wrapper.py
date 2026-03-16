@@ -16,155 +16,9 @@ console = Console()
 from BatchAgent.mini_batch_agent_libs import (
     estimate_tokens, compress_messages, compute_safe_max_tokens, now_stamp, write_jsonl, robust_json_loads
 )
-from BatchAgent.mini_batch_agent import AgentAction, ActionWriteFile, ActionReplaceText, ActionToolCall #, parse_text_actions
+from BatchAgent.mini_batch_agent_base import AgentAction, ActionWriteFile, ActionReplaceText, ActionToolCall #, parse_text_actions
 from BatchAgent.tool_handler import parse_text_actions
 from typing import List, Dict, Any
-
-# ==========================================
-# 1. Base Tool Definitions (Single Source of Truth)
-# ==========================================
-# BASE_TOOLS = [
-#     # {
-#     #     "name": "write_file",
-#     #     "description": "Create a new file or completely overwrite an existing file with new content. Use this for new files or when changes are too complex for search_and_replace.",
-#     #     "properties": {
-#     #         "path": {"type": "string", "description": "Relative path to the file"},
-#     #         "content": {"type": "string", "description": "The complete file content to write"}
-#     #     },
-#     #     "required": ["path", "content"]
-#     # },
-#     {
-#         "name": "search_code",
-#         "description": "Search for a string or regex pattern in the codebase.",
-#         "properties": {
-#             "query": {"type": "string", "description": "The text pattern to search for"}
-#         },
-#         "required": ["query"]
-#     },
-#     {
-#         "name": "find_file",
-#         "description": "Find files matching a glob pattern.",
-#         "properties": {
-#             "pattern": {"type": "string", "description": "The glob pattern to search for, e.g. '*.py'"}
-#         },
-#         "required": ["pattern"]
-#     },
-#     {
-#         "name": "read_file_chunk",
-#         "description": "Read the contents of a file along with line numbers.",
-#         "properties": {
-#             "filepath": {"type": "string", "description": "Relative path to the file to open"},
-#             "start_line": {"type": "integer", "description": "Optional: Start line number (1-indexed)"},
-#             "end_line": {"type": "integer", "description": "Optional: End line number"}
-#         },
-#         "required": ["filepath"]
-#     },
-#     {
-#         "name": "list_directory",
-#         "description": "List the contents of a directory using ls -la.",
-#         "properties": {
-#             "dir_path": {"type": "string", "description": "Directory path to list, defaults to '.'"}
-#         },
-#         "required": [] # list_directory technically might not strictly require it if default is used, but good to define
-#     },
-#     {
-#         "name": "run_bash_command",
-#         "description": "Execute a terminal command. Only use this for reading status, logs, or debugging outputs.",
-#         "properties": {
-#             "command": {"type": "string", "description": "The bash command to execute."}
-#         },
-#         "required": ["command"]
-#     },
-#     {
-#         "name": "web_search",
-#         "description": "Search the internet. Use categories to route to specific reliable sources.",
-#         "properties": {
-#             "query": {"type": "string", "description": "The exact search query."},
-#             "category": {
-#                 "type": "string", 
-#                 "enum": ["general", "news", "code", "academic"],
-#                 "description": "Choose 'news' for current events, 'code' for github/docs, 'academic' for papers. Default to 'general'."
-#             }
-#         },
-#         "required": ["query"]
-#     },
-#     {
-#         "name": "read_url",
-#         "description": "Fetch and read the full text content of a specific webpage URL. Use this after web_search if you need more details from a specific source.",
-#         "properties": {
-#             "url": {"type": "string", "description": "The exact URL to fetch (must start with http:// or https://)."}
-#         },
-#         "required": ["url"]
-#     },
-#     {
-#         "name": "submit_plan",
-#         "description": "Break down a complex task into smaller subtasks. The framework will orchestrate and potentially parallelize them.",
-#         "properties": {
-#             "subtasks": {
-#                 "type": "array",
-#                 "description": "List of subtasks.",
-#                 "items": {
-#                     "type": "object",
-#                     "properties": {
-#                         "task_id": {"type": "string", "description": "Unique ID, e.g., 'task_1'"},
-#                         "description": {"type": "string", "description": "Detailed instruction for this subtask"},
-#                         "depends_on": {
-#                             "type": "array", 
-#                             "items": {"type": "string"}, 
-#                             "description": "List of task_ids this subtask depends on. Empty if it can run immediately."
-#                         }
-#                     },
-#                     "required": ["task_id", "description", "depends_on"]
-#                 }
-#             }
-#         },
-#         "required": ["subtasks"]
-#     },
-#     {
-#         "name": "finish_task",
-#         "description": "Call this tool ONLY when you have fully completed the user's goal and verified the results.",
-#         "properties": {
-#             "summary": {"type": "string", "description": "A brief summary of what was accomplished."}
-#         },
-#         "required": ["summary"]
-#     }
-# ]
-
-# # ==========================================
-# # 2. Dynamic Tool Compiler
-# # ==========================================
-# def get_compiled_tools(provider: str) -> List[Dict[str, Any]]:
-#     """
-#     Compiles the BASE_TOOLS into the specific format required by the LLM provider.
-#     """
-#     compiled = []
-#     for tool in BASE_TOOLS:
-#         if provider == "anthropic":
-#             # Anthropic Format
-#             compiled.append({
-#                 "name": tool["name"],
-#                 "description": tool["description"],
-#                 "input_schema": {
-#                     "type": "object",
-#                     "properties": tool["properties"],
-#                     "required": tool.get("required", [])
-#                 }
-#             })
-#         else:
-#             # OpenAI / vLLM Format
-#             compiled.append({
-#                 "type": "function",
-#                 "function": {
-#                     "name": tool["name"],
-#                     "description": tool["description"],
-#                     "parameters": {
-#                         "type": "object",
-#                         "properties": tool["properties"],
-#                         "required": tool.get("required", [])
-#                     }
-#                 }
-#             })
-#     return compiled
 
 # ==========================================
 # Helper Modules for LLM Interaction
@@ -213,26 +67,6 @@ def _detect_repetition(text: str, window_size: int = 50, threshold: int = 4) -> 
         
     return False
 
-# deprecated    
-def _detect_repetition_v1(text: str, tail_lines: int = 30) -> bool:
-    """Detects infinite loops in LLM generation tail, ignoring list numbers."""
-    if not text or len(text) < 200: return False
-    lines = text.splitlines()
-    if len(lines) < tail_lines: return False
-    
-    tail = lines[-tail_lines:]
-    
-    # [NEW] Remove leading numbers (e.g. "15. ", "- ") for pattern matching
-    clean_tail = [re.sub(r'^(\d+\.|-|\*)\s*', '', line).strip() for line in tail if line.strip()]
-    
-    if len(clean_tail) >= 12:
-        # Check if the last 4 clean lines appear multiple times
-        chunk = "\n".join(clean_tail[-5:-1])
-        clean_tail_str = "\n".join(clean_tail)
-        if chunk.strip() and clean_tail_str.count(chunk) >= 3:
-            return True
-    return False
-
 def _stitch_text(full_content: str, new_content: str) -> str:
     """Cleans up conversational filler when stitching continuations."""
     original_len = len(new_content)
@@ -249,6 +83,41 @@ def _stitch_text(full_content: str, new_content: str) -> str:
         new_content = new_content.split("## ")[0]
 
     return new_content
+
+
+def _has_unclosed_tool_markup(text: str) -> bool:
+    lowered = (text or "").lower()
+    if lowered.count("<tool_call>") > lowered.count("</tool_call>"):
+        return True
+    tool_tags = ("write_file", "search_and_replace", "finish_task")
+    for tag in tool_tags:
+        if lowered.count(f"<{tag}>") > lowered.count(f"</{tag}>"):
+            return True
+    return False
+
+
+def compute_stream_speed_metrics(
+    prompt_tokens: int,
+    completion_tokens: int,
+    elapsed_seconds: float,
+    ttft_seconds: Optional[float] = None,
+) -> Dict[str, float]:
+    ttft = float(ttft_seconds) if ttft_seconds is not None else float(elapsed_seconds)
+    ttft = max(0.0, ttft)
+    elapsed = max(0.0, float(elapsed_seconds))
+    decode_latency = max(0.0, elapsed - ttft)
+    e2e_tps = (float(completion_tokens) / elapsed) if elapsed > 0 else 0.0
+    decode_tps = (float(completion_tokens) / decode_latency) if decode_latency > 0 and completion_tokens > 0 else 0.0
+    prefill_tps = (float(prompt_tokens) / ttft) if ttft > 0 and prompt_tokens > 0 else 0.0
+    per_token_decode_latency_ms = (decode_latency * 1000.0 / float(completion_tokens)) if completion_tokens > 0 and decode_latency > 0 else 0.0
+    return {
+        "ttft_seconds": ttft,
+        "decode_latency_seconds": decode_latency,
+        "e2e_tokens_per_second": e2e_tps,
+        "decode_tokens_per_second": decode_tps,
+        "prefill_tokens_per_second": prefill_tps,
+        "per_token_decode_latency_ms": per_token_decode_latency_ms,
+    }
 
 def _parse_native_dict_to_action(name: str, args_dict: dict, allowlist: List[str]) -> AgentAction:
     """Translates a native parsed tool dictionary into our AgentAction protocol."""
@@ -608,8 +477,15 @@ async def complete_with_continuation_async(
         if not usage_info:
             usage_info = {"prompt_tokens": input_est, "completion_tokens": estimate_tokens(content)}
         
-        tok_speed = usage_info["completion_tokens"] / elapsed if elapsed > 0 else 0
-        console.print(f"[bold blue][LLM][/bold blue] [dim]{usage_info['prompt_tokens']}P, {usage_info['completion_tokens']}C | {tok_speed:.1f} T/s | {elapsed:.1f}s[/dim]")
+        speed_metrics = compute_stream_speed_metrics(
+            prompt_tokens=int(usage_info.get("prompt_tokens", input_est) or 0),
+            completion_tokens=int(usage_info.get("completion_tokens", estimate_tokens(content)) or 0),
+            elapsed_seconds=elapsed,
+        )
+        console.print(
+            f"[bold blue][LLM][/bold blue] [dim]{usage_info['prompt_tokens']}P, {usage_info['completion_tokens']}C | "
+            f"{speed_metrics['e2e_tokens_per_second']:.1f} T/s | {elapsed:.1f}s[/dim]"
+        )
 
         if on_event and usage_info:
             await on_event({
@@ -653,8 +529,15 @@ async def complete_with_continuation_async(
             full_content = full_content[:safe_length] + "\n\n[SYSTEM: OUTPUT TRUNCATED DUE TO REPETITION LOOP]"
             break
             
+        completion_tokens = int(usage_info.get("completion_tokens", 0) or 0)
+        near_budget_cap = completion_tokens >= int(max(128, safe_tokens * 0.9))
+        likely_truncated = (
+            finish_reason == "length"
+            or (finish_reason in ("stop", None, "") and (_has_unclosed_tool_markup(content) or near_budget_cap))
+        )
+
         # 5. Process Native Tool Calls (If Any)
-        if native_tcs:
+        if native_tcs and not likely_truncated:
             for tc in native_tcs:
                 tool_name = tc.get("name", "")
                 
@@ -684,7 +567,7 @@ async def complete_with_continuation_async(
                 break
 
         # 6. Continuation Check
-        if finish_reason == "length":
+        if likely_truncated:
             console.print("[yellow]Output truncated. Continuing automatically...[/yellow]")
             current_messages.append({"role": "assistant", "content": content})
             current_messages.append({
@@ -812,15 +695,22 @@ async def complete_with_async(
             "completion_tokens": estimate_tokens(content),
         }
 
-    tok_speed = usage_info["completion_tokens"] / elapsed if elapsed > 0 else 0
+    speed_metrics = compute_stream_speed_metrics(
+        prompt_tokens=int(usage_info.get("prompt_tokens", input_est) or 0),
+        completion_tokens=int(usage_info.get("completion_tokens", estimate_tokens(content)) or 0),
+        elapsed_seconds=elapsed,
+    )
     console.print(
         f"[bold blue][LLM][/bold blue] [dim]"
         f"{usage_info['prompt_tokens']}P, {usage_info['completion_tokens']}C | "
-        f"{tok_speed:.1f} T/s | {elapsed:.1f}s | finish={finish_reason}[/dim]"
+        f"{speed_metrics['e2e_tokens_per_second']:.1f} T/s | {elapsed:.1f}s | finish={finish_reason}[/dim]"
     )
 
     usage_info["elapsed_seconds"] = round(elapsed, 2)
-    usage_info["tokens_per_second"] = round(tok_speed, 1)
+    usage_info["tokens_per_second"] = round(speed_metrics["e2e_tokens_per_second"], 1)
+    usage_info["prefill_tokens_per_second"] = round(speed_metrics["prefill_tokens_per_second"], 3)
+    usage_info["decode_tokens_per_second"] = round(speed_metrics["decode_tokens_per_second"], 3)
+    usage_info["per_token_decode_latency_ms"] = round(speed_metrics["per_token_decode_latency_ms"], 3)
     usage_info["finish_reason"] = finish_reason
 
     return content, usage_info
