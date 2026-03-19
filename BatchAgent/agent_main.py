@@ -24,9 +24,9 @@ from BatchAgent.llm_wrapper import complete_with_continuation_async #, get_compi
 from BatchAgent.tool_handler import UniversalToolHandler
 from BatchAgent.mini_batch_agent_libs import (
     now_stamp, ensure_dirs, run_shell, _determine_verify_cmd, build_debug_prompt,
-    _handle_missing_modules, top_level_tree, read_file, estimate_tokens, truncate_to_tokens, robust_json_loads
+    _handle_missing_modules, top_level_tree, read_file, estimate_tokens, truncate_to_tokens, robust_json_loads, sha1_text
 )
-from BatchAgent.mini_batch_agent import ActionApplyDiff, ActionToolCall, ActionWriteFile, ActionReplaceText
+from BatchAgent.mini_batch_agent_base import ActionApplyDiff, ActionToolCall, ActionWriteFile, ActionReplaceText
 from BatchAgent.tools_registry import get_base_tools, compile_tools_for_provider #get_active_tools
 from BatchAgent.prompt_registry import PromptRegistry
 
@@ -56,12 +56,16 @@ class AgentConfig:
     serper_api_key: str = ""
     domain: str = "general"
     location: str = "California, United States"
+    current_time: str = ""
     temperature: float = 0.1  # [NEW] optimized for strict formatting 
     memory_strategy: str = "sliding_window"  # [NEW] 'sliding_window', 'summarize'
     backend: str = "vllm" # [NEW] 'vllm', 'llama.cpp', 'openai', 'anthropic'
     enable_thinking: bool = True # [NEW] Switch for internal reasoning injection
     enable_turn_limits: bool = False
     max_turns: int = 15  # configurable max ReAct turns
+    embedding_base_url: str = "http://100.83.246.7:8003/v1"
+    embedding_api_key: str = "EMPTY"
+    embedding_model: str = "custom_bge_gpu1"
     # Optional: async token callback for SSE streaming (set by agent_service / API layer)
     stream_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
 # ==========================================
@@ -289,11 +293,40 @@ class UniversalAgent:
     # =========================================================
     # THE MAIN LOOP (Now incredibly clean and readable)
     # =========================================================
-    async def execute_task(self, task_goal: str, task_idx: int, allowlist: List[str], prompt_md: str) -> Tuple[bool, str]:
+    async def execute_task(
+        self,
+        task_goal: str,
+        task_idx: int,
+        allowlist: List[str],
+        prompt_md: str,
+        resume_messages: Optional[List[Dict[str, str]]] = None,
+        start_turn_index: int = 0,
+        resume_rl_trajectory: Optional[List[Dict[str, str]]] = None,
+    ) -> Tuple[bool, str]:
         
         console.print(f"\n[bold green]=== Starting Agent Task {task_idx+1} ===[/bold green]")
-        self.messages = [{"role": "system", "content": self.system_message}]
-        self._log_rl("system", self.system_message)
+        if resume_messages:
+            restored = [
+                {"role": str(m.get("role", "")), "content": str(m.get("content", ""))}
+                for m in resume_messages
+                if isinstance(m, dict) and m.get("role") and m.get("content") is not None
+            ]
+            if restored and restored[0].get("role") == "system":
+                restored[0]["content"] = self.system_message
+            else:
+                restored.insert(0, {"role": "system", "content": self.system_message})
+            self.messages = restored
+            if resume_rl_trajectory:
+                self.rl_trajectory = [
+                    {"role": str(m.get("role", "")), "content": str(m.get("content", ""))}
+                    for m in resume_rl_trajectory
+                    if isinstance(m, dict) and m.get("role") and m.get("content") is not None
+                ]
+            else:
+                self.rl_trajectory = list(self.messages)
+        else:
+            self.messages = [{"role": "system", "content": self.system_message}]
+            self._log_rl("system", self.system_message)
 
         MAX_REACT_TURNS = getattr(self.config, 'max_turns', 15)
         from BatchAgent.llm_wrapper import complete_with_continuation_async # Local import
@@ -301,11 +334,41 @@ class UniversalAgent:
         final_result_text = "Task aborted or failed."
         # Loop-detection: track (tool_name, arg_hash) fingerprints from last 3 turns
         _recent_fingerprints: list = []
+        _recent_mutation_fingerprints: list = []
+        consecutive_json_parse_turns = 0
+        last_write_only_signature = None
+        write_only_repeat_count = 0
+
+        def _tool_fingerprint(action: ActionToolCall):
+            name = str(getattr(action, "name", "") or "").strip()
+            args = getattr(action, "args", {}) or {}
+            if name == "read_file_chunk":
+                raw_path = str(args.get("filepath", "")).strip().replace("\\", "/")
+                normalized_path = re.sub(r"^\./+", "", raw_path).lower()
+                try:
+                    start_line = int(args.get("start_line", 1))
+                except Exception:
+                    start_line = 1
+                try:
+                    end_line = int(args.get("end_line", start_line + 200))
+                except Exception:
+                    end_line = start_line + 200
+                span = 25
+                start_bucket = (max(1, start_line) // span) * span
+                end_bucket = (max(start_line, end_line) // span) * span
+                return (name, normalized_path, start_bucket, end_bucket)
+            try:
+                normalized_args = json.dumps(args, sort_keys=True)
+            except Exception:
+                normalized_args = str(args)
+            return (name, normalized_args)
 
         for current_turn in range(MAX_REACT_TURNS):
             await self._prune_memory()
             
-            turn_dir = self.config.session_dir / f"{task_idx * 100 + current_turn:04d}"
+            absolute_turn = start_turn_index + current_turn
+            display_turn = absolute_turn + 1
+            turn_dir = self.config.session_dir / f"{task_idx * 100 + absolute_turn:04d}"
             turn_dir.mkdir(parents=True, exist_ok=True)
 
             # ===============================================================
@@ -318,20 +381,20 @@ class UniversalAgent:
             # # Human readable version of the prompt for easier debugging
             # (turn_dir / "latest_instruction.md").write_text(self.messages[-1]["content"], encoding="utf-8")
             
-            console.print(f"\n[bold yellow]>>> ReAct Turn {current_turn + 1} / {MAX_REACT_TURNS}[/bold yellow]")
+            console.print(f"\n[bold yellow]>>> ReAct Turn {display_turn} / {MAX_REACT_TURNS}[/bold yellow]")
 
             # Notify streaming clients of a new ReAct turn so the UI can create a new message bubble
             if self.config.stream_callback:
                 await self.config.stream_callback({
                     "type": "turn_start",
-                    "turn": current_turn + 1,
+                    "turn": display_turn,
                     "max_turns": MAX_REACT_TURNS,
                 })
 
             # [NEW] Inject temporal awareness if enabled
             current_user_prompt = prompt_md if current_turn == 0 else "" # Initial prompt is only for the first turn
             if self.config.enable_turn_limits:
-                current_user_prompt = f"[Current Turn: {current_turn + 1} / Max Turns: {MAX_REACT_TURNS}]\n{current_user_prompt}"
+                current_user_prompt = f"[Current Turn: {display_turn} / Max Turns: {MAX_REACT_TURNS}]\n{current_user_prompt}"
             
             if current_turn == 0:
                 self._log_rl("user", prompt_md)
@@ -376,6 +439,49 @@ class UniversalAgent:
                 self._save_trajectory_to_disk(task_idx, reward=1.0)
                 summary = finish_task_action.args.get('summary', final_result_text)
                 return True, summary
+
+            json_parse_errors = [
+                a for a in actions
+                if isinstance(a, ActionToolCall)
+                and getattr(a, "name", "") == "json_parse_error"
+                and "write_file" in str(getattr(a, "args", {}).get("error", "")).lower()
+            ]
+            if json_parse_errors:
+                consecutive_json_parse_turns += 1
+                if self.config.tool_strategy == "native_all" and consecutive_json_parse_turns >= 2:
+                    self.config.tool_strategy = "hybrid"
+                    switched_base_tools = get_base_tools(
+                        strategy=self.config.tool_strategy,
+                        enable_parallel=getattr(self.config, "parallel_thinking", False),
+                        domain=getattr(self.config, "domain", "general"),
+                    )
+                    self.tools = compile_tools_for_provider(
+                        switched_base_tools,
+                        self.config.provider,
+                        self.config.tool_strategy,
+                    )
+                    self.system_message = PromptRegistry.get_system_prompt(
+                        strategy=self.config.tool_strategy,
+                        base_tools_list=switched_base_tools,
+                        domain=getattr(self.config, "domain", "general"),
+                        location=getattr(self.config, "location", "California, United States"),
+                        current_time=getattr(self.config, "current_time", ""),
+                    )
+                    self.messages[0]["content"] = self.system_message
+                    parse_feedback = (
+                        "System switched tool strategy from native_all to hybrid after repeated write_file JSON parsing failures. "
+                        "Continue with native tools for observation and XML write_file/search_and_replace for file mutations."
+                    )
+                    self.messages.append({"role": "assistant", "content": content})
+                    feedback_prompt = parse_feedback
+                    if self.config.enable_turn_limits:
+                        feedback_prompt = f"[Current Turn: {display_turn} / Max Turns: {MAX_REACT_TURNS}]\n{feedback_prompt}"
+                    self._log_rl("user", parse_feedback)
+                    self.messages.append({"role": "user", "content": feedback_prompt})
+                    (turn_dir / "strategy_switch_feedback.md").write_text(feedback_prompt, encoding="utf-8")
+                    continue
+            else:
+                consecutive_json_parse_turns = 0
                 
             if not actions:
                 console.print("[yellow]Agent outputted nothing useful. Forcing format switch.[/yellow]")
@@ -415,6 +521,10 @@ class UniversalAgent:
             info_actions = [a for a in actions if isinstance(a, ActionToolCall)]
             mutation_actions = [a for a in actions if isinstance(a, (ActionWriteFile, ActionApplyDiff, ActionReplaceText))]
             feedback_blocks = []
+            if json_parse_errors:
+                feedback_blocks.append(
+                    "Tool JSON parsing failed for at least one call. If writing files, switch to XML write format in hybrid mode."
+                )
 
             # =====================================================================
             # [NEW]load domain-specific Hot-Swapping tools
@@ -438,7 +548,13 @@ class UniversalAgent:
                     self.tools = compile_tools_for_provider(new_base_tools, self.config.provider, self.config.tool_strategy)
                     
                     # 3. re-generate System Prompt to include the new tools' usage instructions
-                    self.system_message = PromptRegistry.get_system_prompt(self.config.tool_strategy, new_base_tools, new_domain)
+                    self.system_message = PromptRegistry.get_system_prompt(
+                        self.config.tool_strategy,
+                        new_base_tools,
+                        new_domain,
+                        self.config.location,
+                        getattr(self.config, "current_time", ""),
+                    )
                     
                     # 4. change the first message in the conversation to the new system prompt, so that the agent can immediately pick up on the new tools and instructions in the next turn without needing a full reset or restart
                     self.messages[0]["content"] = self.system_message
@@ -482,14 +598,14 @@ class UniversalAgent:
                 continue # get all the ideas, then let the agent decide how to proceed in the next turn, instead of rushing into tool execution or file mutations
 
             # --- 5. Execute Standard Tools (Concurrently) ---
-            standard_info_actions = [a for a in info_actions if a.name not in ['brainstorm_solutions', 'finish_task', 'load_domain_tools', 'register_custom_tool']]
+            standard_info_actions = [a for a in info_actions if a.name not in ['brainstorm_solutions', 'finish_task', 'load_domain_tools', 'register_custom_tool', 'json_parse_error']]
 
             # Loop detection: skip actions whose (name, args) fingerprint appeared in the last 2 turns
             if standard_info_actions:
                 deduped, skipped = [], []
                 for a in standard_info_actions:
-                    fp = (a.name, json.dumps(a.args, sort_keys=True))
-                    if _recent_fingerprints.count(fp) >= 2:
+                    fp = _tool_fingerprint(a)
+                    if _recent_fingerprints.count(fp) >= 1:
                         skipped.append(a.name)
                     else:
                         deduped.append(a)
@@ -505,11 +621,10 @@ class UniversalAgent:
             if standard_info_actions:
                 # Record fingerprints for this turn
                 for a in standard_info_actions:
-                    fp = (a.name, json.dumps(a.args, sort_keys=True))
+                    fp = _tool_fingerprint(a)
                     _recent_fingerprints.append(fp)
-                # Keep only last 6 entries (3 turns × 2 tools)
-                if len(_recent_fingerprints) > 6:
-                    _recent_fingerprints[:] = _recent_fingerprints[-6:]
+                if len(_recent_fingerprints) > 12:
+                    _recent_fingerprints[:] = _recent_fingerprints[-12:]
 
                 concurrent_results = await self._execute_tools_concurrently(standard_info_actions, turn_dir, allowlist)
                 feedback_blocks.append(f"### Tool Execution Results\n{concurrent_results}")
@@ -537,12 +652,6 @@ class UniversalAgent:
                 self.dynamic_tools_schema.append(new_schema)
                 self.dynamic_tools_mapping[t_name] = args.get("script_path", "")
                 
-                # recompile the full tool list for the current provider, including both the static base tools and the newly added dynamic tool, to update the agent's capabilities immediately without needing a restart
-                from BatchAgent.tools_registry import compile_tools_for_provider
-                from BatchAgent.prompt_registry import PromptRegistry
-                
-                # get the base tools for the current strategy and domain, then append the new dynamic tool to it. This ensures that the agent retains access to all its original tools while also gaining the new one it just created, allowing for seamless integration of self-generated capabilities.
-                from BatchAgent.tools_registry import get_base_tools
                 current_base_tools = get_base_tools(self.config.tool_strategy, getattr(self.config, 'parallel_thinking', False), getattr(self.config, 'domain', 'auto'))
                 current_base_tools.extend(self.dynamic_tools_schema)
                 
@@ -550,7 +659,13 @@ class UniversalAgent:
                 self.tools = compile_tools_for_provider(current_base_tools, self.config.provider, self.config.tool_strategy)
                 
                 # update system prompt to reflect the new tool in the instructions, so that the agent can understand how to use it properly in the next turn. This is crucial for enabling the agent to effectively leverage its newly created capabilities without needing explicit human intervention or retraining.
-                self.system_message = PromptRegistry.get_system_prompt(self.config.tool_strategy, current_base_tools, getattr(self.config, 'domain', 'auto'))
+                self.system_message = PromptRegistry.get_system_prompt(
+                    self.config.tool_strategy,
+                    current_base_tools,
+                    getattr(self.config, 'domain', 'auto'),
+                    self.config.location,
+                    getattr(self.config, "current_time", ""),
+                )
                 self.messages[0]["content"] = self.system_message
                 
                 feedback = (
@@ -571,38 +686,109 @@ class UniversalAgent:
             
             # --- 6. Execute Mutations & Verify ---
             if mutation_actions:
+                deduped_mutations = []
+                skipped_mutations = []
+                current_mutation_fingerprints = []
+
+                for a in mutation_actions:
+                    if isinstance(a, ActionWriteFile):
+                        fp = ("write_file", str(getattr(a, "path", "")).strip().lower(), sha1_text(getattr(a, "content", "")))
+                    elif isinstance(a, ActionReplaceText):
+                        fp = (
+                            "search_and_replace",
+                            str(getattr(a, "path", "")).strip().lower(),
+                            sha1_text(f"{getattr(a, 'old_text', '')}::{getattr(a, 'new_text', '')}")
+                        )
+                    elif isinstance(a, ActionApplyDiff):
+                        fp = ("apply_diff", sha1_text(getattr(a, "diff_text", "")))
+                    else:
+                        fp = ("mutation", sha1_text(str(a)))
+
+                    if _recent_mutation_fingerprints.count(fp) >= 1:
+                        skipped_mutations.append(fp[0])
+                        continue
+
+                    deduped_mutations.append(a)
+                    current_mutation_fingerprints.append(fp)
+
+                if skipped_mutations:
+                    feedback_blocks.append(
+                        "⚠️ Repeated identical file mutation detected and skipped. "
+                        "The same write/edit was already applied in a previous turn. "
+                        "Use the existing file result and call finish_task if the goal is completed."
+                    )
+
+                mutation_actions = deduped_mutations
+
+            if mutation_actions:
                 handler = UniversalToolHandler(self.config, turn_dir, allowlist, dynamic_tools_mapping=self.dynamic_tools_mapping)
                 has_mutation, mutation_res = handler.execute(mutation_actions, content)
                 feedback_blocks.append(mutation_res)
 
-                # Upload any written files to MinIO and notify the UI
-                if handler.written_files and self.config.stream_callback:
-                    from BatchAgent.minio_uploader import upload_file
-                    for fpath in handler.written_files:
-                        fname = Path(fpath).name
-                        url = upload_file(fpath)
-                        # Include inline content for small files (< 200 KB) so the
-                        # frontend can display them even when MinIO is unavailable.
-                        inline_content = None
-                        try:
-                            if os.path.getsize(fpath) < 200 * 1024:
-                                with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
-                                    inline_content = _f.read()
-                        except Exception:
-                            pass
+                if self.config.stream_callback:
+                    file_records = list(getattr(handler, "written_file_records", []) or [])
+                    if not file_records and handler.written_files:
+                        from BatchAgent.minio_uploader import upload_file
+                        for fpath in handler.written_files:
+                            fname = Path(fpath).name
+                            session_name = getattr(self.config, "session_dir", Path(".")).name
+                            object_name = f"agent/{session_name}/{fname}"
+                            url = upload_file(fpath, object_name=object_name)
+                            inline_content = None
+                            try:
+                                ext = Path(fpath).suffix.lower()
+                                if ext in {".md", ".markdown", ".txt"} or os.path.getsize(fpath) < 200 * 1024:
+                                    with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
+                                        inline_content = _f.read()
+                            except Exception:
+                                pass
+                            file_records.append({
+                                "name": fname,
+                                "url": url or "",
+                                "local_path": fpath,
+                                "content": inline_content,
+                                "size": os.path.getsize(fpath) if os.path.exists(fpath) else 0,
+                            })
+                    for rec in file_records:
                         await self.config.stream_callback({
                             "type": "file_written",
-                            "name": fname,
-                            "url": url or "",
-                            "local_path": fpath,
-                            "content": inline_content,
+                            "name": rec.get("name") or "",
+                            "url": rec.get("url") or "",
+                            "local_path": rec.get("local_path") or "",
+                            "content": rec.get("content"),
+                            "size": int(rec.get("size") or 0),
                         })
 
                 if has_mutation:
+                    if current_mutation_fingerprints:
+                        _recent_mutation_fingerprints.extend(current_mutation_fingerprints)
+                        if len(_recent_mutation_fingerprints) > 8:
+                            _recent_mutation_fingerprints[:] = _recent_mutation_fingerprints[-8:]
                     # [FIX] get the output from sandbox verification and provide it as feedback to the agent, instead of just returning True/False. This allows the agent to understand the results of its actions and learn from any mistakes, rather than just blindly trying again without guidance.
                     v_feedback = self._verify_mutations(content, mutation_actions, allowlist, turn_dir)
                     if v_feedback:
                         feedback_blocks.append(v_feedback)
+                    write_only_actions = [a for a in mutation_actions if isinstance(a, ActionWriteFile)]
+                    is_write_only_turn = bool(write_only_actions) and len(write_only_actions) == len(mutation_actions) and not standard_info_actions
+                    if is_write_only_turn:
+                        signature = tuple(sorted(str(a.path).strip().lower() for a in write_only_actions))
+                        if len(set(signature)) == 1:
+                            if signature == last_write_only_signature:
+                                write_only_repeat_count += 1
+                            else:
+                                last_write_only_signature = signature
+                                write_only_repeat_count = 1
+                            if write_only_repeat_count >= 2:
+                                target_file = signature[0]
+                                summary = f"Completed task by writing output file: {target_file}"
+                                self._save_trajectory_to_disk(task_idx, reward=1.0)
+                                return True, summary
+                        else:
+                            last_write_only_signature = None
+                            write_only_repeat_count = 0
+                    else:
+                        last_write_only_signature = None
+                        write_only_repeat_count = 0
                     # v_success, v_feedback = self._verify_mutations(content, mutation_actions, allowlist, turn_dir)
                     # if v_success:
                     #     self._save_trajectory_to_disk(task_idx, reward=1.0)
@@ -614,6 +800,11 @@ class UniversalAgent:
             combined_feedback = "\n\n".join(feedback_blocks)
             if not mutation_actions and standard_info_actions:
                 combined_feedback += "\nAnalyze the results and continue."
+            if not combined_feedback.strip():
+                combined_feedback = (
+                    "No new actions were executed in this turn. "
+                    "If the requested output file is already correct, call finish_task now."
+                )
             
             # ===============================================================
             # [NEW] 3. tool execution results (Feedback)
@@ -625,7 +816,7 @@ class UniversalAgent:
             
             feedback_prompt = combined_feedback
             if self.config.enable_turn_limits:
-                feedback_prompt = f"[Current Turn: {current_turn + 1} / Max Turns: {MAX_REACT_TURNS}]\n{feedback_prompt}"
+                feedback_prompt = f"[Current Turn: {display_turn} / Max Turns: {MAX_REACT_TURNS}]\n{feedback_prompt}"
 
             self._log_rl("user", combined_feedback)
             self.messages.append({"role": "user", "content": feedback_prompt})
@@ -635,308 +826,7 @@ class UniversalAgent:
         self._save_trajectory_to_disk(task_idx, reward=-1.0)
         return False, final_result_text
 
-    # [old version]
-    async def execute_task_v1(self, task_goal: str, task_idx: int, allowlist: List[str], prompt_md: str) -> bool:
-        """The core ReAct State Machine."""
-        console.print(f"\n[bold green]=== Starting Agent Task {task_idx+1} ===[/bold green]")
-        
-        self.messages = [
-            {"role": "system", "content": self.system_message},
-            {"role": "user", "content": prompt_md}
-        ]
-        self._log_rl("system", self.system_message)
-        self._log_rl("user", prompt_md)
-
-        MAX_REACT_TURNS = 15
-        current_turn = 0
-
-        while current_turn < MAX_REACT_TURNS:
-            # --- [FIX: Sliding Window Memory] ---
-            # If multiple round, cut the memory to avoid the (Death Spiral)
-            # Keep System(0), Goal(1)，latest 4 message (latest 2 Turn)
-            if len(self.messages) > 8:
-                self.messages = [self.messages[0], self.messages[1]] + self.messages[-4:]
-                console.print("[dim]🧹 Memory window pruned to prevent context overflow and restore token budget.[/dim]")
-            # --------------------------------------------------------
-            
-            turn_dir = self.config.session_dir / f"{task_idx * 100 + current_turn:04d}"
-            turn_dir.mkdir(parents=True, exist_ok=True)
-            (turn_dir / "prompt.md").write_text(self.messages[-1]["content"], encoding="utf-8")
-            
-            console.print(f"\n[bold yellow]>>> ReAct Turn {current_turn + 1} / {MAX_REACT_TURNS}[/bold yellow]")
-            
-            # --- 1. LLM Generation ---
-            # Note: `stream` can be toggled by config.verbose inside llm_wrapper if supported
-            content, actions = await complete_with_continuation_async(
-                client=self.config.client,
-                model=self.config.model,
-                messages=self.messages,
-                max_output_tokens=self.config.max_output,
-                model_max_context=self.config.max_context, # Now uses auto-detected context
-                provider=self.config.provider,
-                session_dir=self.config.session_dir,
-                tools=self.tools,
-                tool_strategy="auto",
-                allowlist=allowlist,
-                backend=getattr(self.config, 'backend', 'vllm'),
-                enable_thinking=getattr(self.config, 'enable_thinking', True)
-            )
-            
-            (turn_dir / "response.md").write_text(content, encoding="utf-8")
-            self._log_rl("assistant", content)
-            
-            # Print full response if verbose
-            if self.config.verbose:
-                console.print(Panel(content, title="LLM Response", border_style="blue"))
-            
-            # --- 2. Conclusion Check ---
-            # --- 3. Action Segregation ---
-            finish_action = next((a for a in actions if getattr(a, 'name', '') == 'finish_task'), None)
-            if finish_action:
-                console.print(f"[bold green]🏁 Agent explicitly finished the task: {finish_action.args.get('summary')}[/bold green]")
-                self._save_trajectory_to_disk(task_idx, reward=1.0)
-                return True
-                
-            if not actions:
-                console.print("[yellow]Agent outputted nothing useful. Forcing format switch.[/yellow]")
-                feedback = (
-                    "⚠️ System Warning: No valid tool calls or file modifications were detected in your last response.\n"
-                    "If you attempted to use a native JSON tool call, it may have failed parsing due to length or syntax errors.\n"
-                    "Please fallback to using **Format B (WRITE_FILE)** directly in the Markdown text instead of using JSON tools for writing code.\n"
-                    "If you are finished, use the `<tool_call><finish_task><summary>done</summary></finish_task></tool_call>` format."
-                )
-                self.messages.append({"role": "assistant", "content": content})
-                self.messages.append({"role": "user", "content": feedback})
-                self._log_rl("user", feedback)
-                current_turn += 1
-                continue
-                
-            # --- 3. Action Segregation ---
-            info_actions = [a for a in actions if isinstance(a, ActionToolCall)]
-            mutation_actions = [a for a in actions if isinstance(a, (ActionWriteFile, ActionApplyDiff, ActionReplaceText))]
-            
-            feedback_blocks = []
-
-            # =====================================================================
-            # [NEW] New Core: Parallel thinking and lazy load (Agentic Map-Reduce)
-            # =====================================================================
-            parallel_action = next((a for a in info_actions if getattr(a, 'name', '') == 'execute_parallel_branches'), None)
-            inspect_action = next((a for a in info_actions if getattr(a, 'name', '') == 'inspect_branch_details'), None)
-            
-            if parallel_action:
-                branches = parallel_action.args.get('branches', [])
-                console.print(f"\n[bold magenta]🚀 Launching {len(branches)} Parallel Branches...[/bold magenta]")
-                
-                # initialize branch records if not exist, to store the full trajectory and results of each branch for later inspection. This allows us to keep the main agent's memory clean and focused on high-level summaries, while still retaining access to the detailed execution history of each branch when needed.
-                if not hasattr(self, 'branch_records'):
-                    self.branch_records = {}
-
-                async def _run_branch(branch: dict) -> str:
-                    b_id = branch.get('branch_id', 'unknown')
-                    b_inst = branch.get('instruction', '')
-                    
-                    # 1. Create isolated workspace for the branch to prevent file conflicts and ensure clean execution environments. Each branch operates in its own directory named after its `branch_id`, allowing for parallel execution without interference and easy retrieval of results and artifacts.
-                    b_workspace = self.config.workspace_dir / b_id
-                    b_workspace.mkdir(parents=True, exist_ok=True)
-                    
-                    # 2. 继承配置，但指向新的工作区。为了防止无限递归，关闭子 Agent 的并发能力
-                    b_config = AgentConfig(**{**self.config.__dict__, "workspace_dir": b_workspace, "verbose": False})
-                    
-                    # 3. 剥离并行工具，防止子 Agent 再次召唤孙子 Agent 导致死循环
-                    b_tools = [t for t in self.tools if t.get('name') not in ['execute_parallel_branches', 'inspect_branch_details']]
-                    
-                    # 4. 构造子 Agent Prompt
-                    b_goal = f"MAIN TASK CONTEXT: {task_goal}\n\nYOUR SPECIFIC BRANCH MISSION: {b_inst}\n\nIMPORTANT: You are running in an isolated directory `{b_id}/`. Write code, test it, and use `finish_task` to provide a detailed summary of your results, test outputs, and discoveries."
-                    b_prompt = PromptRegistry.format_task(b_goal, [], [], b_workspace.name, content_injector)
-                    
-                    # 5. 执行子 Agent
-                    sub_agent = UniversalAgent(config=b_config, system_message=self.system_message, tools=b_tools)
-                    success = await sub_agent.execute_task(task_goal=b_goal, task_idx=task_idx+100, allowlist=[], prompt_md=b_prompt)
-                    
-                    # 6. 提取精华：子 Agent 的最后一个 finish_task summary 或最后的回复
-                    last_msg = next((m['content'] for m in reversed(sub_agent.messages) if m['role'] == 'assistant'), "")
-                    
-                    # 7. 保存全量状态到内存，供后续 inspect_branch_details 懒加载
-                    self.branch_records[b_id] = {
-                        "instruction": b_inst,
-                        "workspace": str(b_workspace),
-                        "full_trajectory": "\n".join([f"[{m['role'].upper()}]: {m['content']}" for m in sub_agent.messages]),
-                        "success": success
-                    }
-                    
-                    # 8. 只返回轻量级摘要给主 Agent
-                    status_emoji = "✅" if success else "❌"
-                    return f"### Branch: {b_id} {status_emoji}\n**Instruction**: {b_inst}\n**Summary**: {last_msg[:800]}..."
-
-                # 并发执行所有分支
-                branch_start = time.time()
-                branch_results = await asyncio.gather(*(_run_branch(b) for b in branches), return_exceptions=True)
-                
-                valid_summaries = [res for res in branch_results if not isinstance(res, Exception)]
-                errors = [str(res) for res in branch_results if isinstance(res, Exception)]
-                
-                combined_report = "\n\n".join(valid_summaries)
-                if errors: combined_report += f"\n\n**Framework Errors:**\n" + "\n".join(errors)
-                
-                console.print(f"[dim]Parallel Branches completed in {time.time() - branch_start:.1f}s[/dim]")
-                
-                feedback = (
-                    f"### Parallel Execution Report\n"
-                    f"The branches have completed. Below are their high-level summaries. Their files are saved in subdirectories named after their `branch_id`.\n\n"
-                    f"{combined_report}\n\n"
-                    f"**Next Steps**:\n"
-                    f"- If you need to see the exact code, tests, or full search text from a branch, use `<tool_call><inspect_branch_details><branch_id>...</branch_id></inspect_branch_details>`.\n"
-                    f"- Once you have enough info, you can copy the best code to the main directory using bash, or synthesize the final report using Format B / Format C."
-                )
-                
-                self.messages.append({"role": "assistant", "content": content})
-                self.messages.append({"role": "user", "content": feedback})
-                self._log_rl("user", feedback)
-                
-                current_turn += 1
-                continue
-
-            elif inspect_action:
-                # =====================================================================
-                # [NEW] 懒加载查阅工具处理
-                # =====================================================================
-                b_id = inspect_action.args.get('branch_id', '')
-                console.print(f"\n[cyan]📖 Agent is inspecting details of branch: {b_id}[/cyan]")
-                
-                if hasattr(self, 'branch_records') and b_id in self.branch_records:
-                    record = self.branch_records[b_id]
-                    # 我们不仅返回它的轨迹，还可以自动去它的目录下读取所有文件内容
-                    import glob
-                    files_content = ""
-                    for filepath in glob.glob(f"{record['workspace']}/**/*", recursive=True):
-                        if os.path.isfile(filepath) and not filepath.endswith('.pyc'):
-                            try:
-                                with open(filepath, 'r') as f:
-                                    files_content += f"\n--- File: {os.path.basename(filepath)} ---\n```\n{f.read()[:4000]}\n```" # 截断防爆
-                            except Exception: pass
-                    
-                    feedback = (
-                        f"### Details for Branch: {b_id}\n"
-                        f"**Workspace**: `{record['workspace']}/`\n"
-                        f"**Generated Files**: {files_content if files_content else 'No files generated.'}\n\n"
-                        f"**Execution Trajectory Snippet**:\n"
-                        f"{record['full_trajectory'][-3000:]}" # 只给最后 3000 字符，通常包含最终代码和测试结果
-                    )
-                else:
-                    feedback = f"Error: Branch ID '{b_id}' not found. Please check the ID."
-
-                self.messages.append({"role": "assistant", "content": content})
-                self.messages.append({"role": "user", "content": feedback})
-                self._log_rl("user", feedback)
-                
-                current_turn += 1
-                continue
-            
-            ## Back to Normal processing
-            # 3A. Execute Info Actions (Concurrently)
-            if info_actions:
-                concurrent_results = await self._execute_tools_concurrently(info_actions, turn_dir, allowlist)
-                feedback_blocks.append(f"### Tool Execution Results\n{concurrent_results}")
-                
-            # 3B. Execute Mutation Actions (Sequentially)
-            has_mutation = False
-            if mutation_actions:
-                # --- UI Polish: Print mutations cleanly ---
-                console.print("\n[cyan]📝 Planning Code Mutations:[/cyan]")
-                for act in mutation_actions:
-                    if isinstance(act, ActionWriteFile):
-                        path = getattr(act, 'path', 'Unknown')
-                        size = len(getattr(act, 'content', ''))
-                        console.print(f"  [dim]- WRITE_FILE: {path} ({size} chars)[/dim]")
-                    elif isinstance(act, ActionApplyDiff):
-                        size = len(getattr(act, 'diff_text', ''))
-                        console.print(f"  [dim]- APPLY_DIFF: ({size} chars)[/dim]")
-
-                # Human-in-the-loop Approval check
-                if self.config.require_approval:
-                    if not Confirm.ask("[bold red]⚠️ Approve these file modifications?[/bold red]"):
-                        console.print("[yellow]Changes rejected by user.[/yellow]")
-                        feedback_blocks.append("### User Override\nThe user REJECTED your file modifications. Please explain your approach or ask for clarification.")
-                        mutation_actions = [] # Clear mutations
-                
-                if mutation_actions:
-                    console.print("[cyan]💾 Applying to Disk (Atomic)...[/cyan]")
-                    handler = UniversalToolHandler(self.config, turn_dir, allowlist)
-                    # We pass the actions to the handler. 
-                    # Ensure the handler itself doesn't print the raw content!
-                    has_mutation, mutation_res = handler.execute(mutation_actions, content)
-                    feedback_blocks.append(mutation_res)
-            
-            # --- 4. Environment Feedback & Verification ---
-            if has_mutation:
-                console.print(f"[cyan]-> Files Mutated. Triggering Verification Sandbox (Target: {self.config.sandbox_container or 'Local'})...[/cyan]")
-                
-                # Robust extraction of modified files
-                modified_files = []
-                for a in mutation_actions:
-                    if hasattr(a, 'path'): modified_files.append(a.path)
-                    elif isinstance(a, ActionApplyDiff):
-                        paths = re.findall(r'^\+\+\+ b/(.+)$', a.diff_text, re.MULTILINE)
-                        modified_files.extend(paths)
-                modified_files = list(set(modified_files))
-                
-                auto_verify_cmd = re.search(r"^Verification:\s*(.+)$", content, re.MULTILINE)
-                v_cmd = auto_verify_cmd.group(1).strip() if auto_verify_cmd else None
-                verify_cmd = _determine_verify_cmd(allowlist, modified_files, v_cmd, self.config)
-                
-                if not verify_cmd:
-                    console.print("[yellow]No verification command found/needed. Assuming Success.[/yellow]")
-                    self._save_trajectory_to_disk(task_idx, reward=1.0)
-                    return True, final_result_text
-                
-                # Approval for running commands
-                if self.config.require_approval:
-                    console.print(f"\n[bold red]⚠️ Agent intends to run a command: [/bold red] `[white]{verify_cmd}[/white]`")
-                    if not Confirm.ask("Do you approve executing this command?"):
-                        console.print("[yellow]Command rejected by user.[/yellow]")
-                        self._save_trajectory_to_disk(task_idx, reward=1.0)
-                        return True, final_result_text
-
-                # Run Verification
-                code, out = run_shell(verify_cmd, cap=20000, sandbox_container=self.config.sandbox_container)
-                (turn_dir / "verify_stdout.txt").write_text(out, encoding='utf-8')
-                
-                if code == 0:
-                    console.print("[bold green]✅ Verification PASSED![/bold green]")
-                    if self.config.verbose: console.print(f"[dim]{out}[/dim]")
-                    self._save_trajectory_to_disk(task_idx, reward=1.0)
-                    return True, final_result_text
-                else:
-                    console.print(f"[bold red]❌ Verification Failed (exit={code})[/bold red]")
-                    
-                    # [FIX 3]: filter the output to extract only relevant error messages, and provide actionable feedback to the agent
-                    smart_error_context = build_debug_prompt(out, root_dir=str(self.config.workspace_dir))
-                    
-                    error_feedback = (
-                        f"⚠️ [Verification Failed] Exit Code: {code}\n"
-                        f"Command: {verify_cmd}\n"
-                        f"{smart_error_context}\n"
-                        f"Please analyze the error. Use tools (`search_code`, `read_file_chunk`) "
-                        f"to investigate if necessary, then provide a fix using Format A (Diff) or Format B (WRITE_FILE)."
-                    )
-                    feedback_blocks.append(error_feedback)
-            
-            # --- 5. Append Observations and Loop ---
-            combined_feedback = "\n\n".join(feedback_blocks)
-            if not has_mutation and info_actions:
-                combined_feedback += "\nAnalyze the results and continue."
-                
-            self.messages.append({"role": "assistant", "content": content})
-            self.messages.append({"role": "user", "content": combined_feedback})
-            self._log_rl("user", combined_feedback)
-            
-            current_turn += 1
-
-        console.print("[bold red]Max ReAct turns exceeded. Task aborted.[/bold red]")
-        self._save_trajectory_to_disk(task_idx, reward=-1.0)
-        return False, final_result_text
-
-
+    
 # ==========================================
 # 4. Helper: API and Context Checker
 # ==========================================
@@ -985,12 +875,15 @@ async def main_async():
     # Provider & Env
     parser.add_argument("--tool-strategy", 
                         choices=["native_all", "hybrid", "text_only"], 
-                        default="native_all",
+                        default="hybrid",
                         help="Choose how the LLM interacts with tools.")
     parser.add_argument("--provider", default="openai", choices=["openai", "anthropic"], help="LLM Provider")
     parser.add_argument("--model", default=os.environ.get("VLLM_MODEL", "qwen3.5-9b"))
     parser.add_argument("--base-url", default=os.environ.get("VLLM_BASE_URL", "http://100.110.236.127:8000/v1")) #100.110.236.127 http://127.0.0.1:8000/v1
     parser.add_argument("--api-key", default=os.environ.get("VLLM_API_KEY", "EMPTY"))
+    parser.add_argument("--embedding-base-url", default=os.environ.get("EMBEDDING_BASE_URL", "http://100.83.246.7:8003/v1"))
+    parser.add_argument("--embedding-api-key", default=os.environ.get("EMBEDDING_API_KEY", "EMPTY"))
+    parser.add_argument("--embedding-model", default=os.environ.get("EMBEDDING_MODEL", "custom_bge_gpu1"))
     parser.add_argument("--serper-key", default=os.environ.get("SERPER_API_KEY", ""), help="API key for Web Search")
     
     # System Features (New Additions)
@@ -1012,16 +905,18 @@ async def main_async():
     args = parser.parse_args()
 
     # --- Directory Setup ---
-    agent_dir = Path(".agent")
+    workspace_dir = Path(args.output_dir).resolve()
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    agent_dir = (workspace_dir / ".agent").resolve()
     ensure_dirs(agent_dir)
     session_dir = agent_dir / "sessions" / now_stamp()
     session_dir.mkdir(parents=True, exist_ok=True)
-
-    workspace_dir = Path(args.output_dir).resolve()
-    workspace_dir.mkdir(parents=True, exist_ok=True)
     
     # CRITICAL: Change working directory so all relative paths generated by LLM land here
     os.chdir(workspace_dir)
+    os.environ["EMBEDDING_BASE_URL"] = args.embedding_base_url
+    os.environ["EMBEDDING_API_KEY"] = args.embedding_api_key
+    os.environ["EMBEDDING_MODEL"] = args.embedding_model
 
     # --- Initialize API Client ---
     if args.provider == "anthropic":
@@ -1049,6 +944,8 @@ async def main_async():
     console.print(f"[green]✔ API Connection Established[/green]")
     console.print(f"[green]✔ Effective Context Limit: {detected_ctx} tokens[/green]")
     console.print(f"[green]✔ Workspace Directory: {workspace_dir}[/green]")
+    console.print(f"[green]✔ Embedding Endpoint: {args.embedding_base_url}[/green]")
+    console.print(f"[green]✔ Embedding Model: {args.embedding_model}[/green]")
     if args.sandbox: console.print(f"[yellow]⚠ Sandbox Execution Enabled: Container '{args.sandbox}'[/yellow]")
     if args.require_approval: console.print(f"[yellow]⚠ Human-in-the-loop Active: Requires approval for mutations[/yellow]")
 
@@ -1070,7 +967,11 @@ async def main_async():
         serper_api_key=args.serper_key,
         domain=args.domain,
         location=args.location,
-        enable_turn_limits=args.enable_turn_limits
+        current_time=os.environ.get("BATCHAGENT_CURRENT_TIME", ""),
+        enable_turn_limits=args.enable_turn_limits,
+        embedding_base_url=args.embedding_base_url,
+        embedding_api_key=args.embedding_api_key,
+        embedding_model=args.embedding_model,
     )
 
     # --- Goal Collection ---
@@ -1104,7 +1005,8 @@ async def main_async():
         strategy=config.tool_strategy, 
         base_tools_list=base_tools,
         domain=config.domain,
-        location=config.location
+        location=config.location,
+        current_time=getattr(config, "current_time", ""),
     )
     # compiled_tools = get_active_tools(config.tool_strategy, config.provider)
     
@@ -1176,4 +1078,13 @@ Create a tool that fetches the English word definition online like a dictionary,
 Search the web for the recent crude oil price and its trend, then write a brief analysis report in markdown format.
 
 create 10 questions based on the book of "art of problem solving - prealgebra chapter 1" into one document
+
+
+python BatchAgent/agent_main.py \
+  --base-url "http://100.110.236.127:8000/v1" \
+  --api-key "EMPTY" \
+  --model "qwen3.5-9b" \
+  --embedding-base-url "http://100.83.246.7:8003/v1" \
+  --embedding-api-key "EMPTY" \
+  --embedding-model "custom_bge_gpu1"
 """

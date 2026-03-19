@@ -2,29 +2,32 @@
 
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
-  Send, Paperclip, FileText, Code, Download, Save, Sparkles,
+  Paperclip, FileText, Code, Download, Save, Sparkles,
   Search, Bot, User, Wrench, X, CheckCircle2, AlertCircle,
   Zap, Clock, BarChart2, ExternalLink, Plus, Trash2, Settings,
-  ChevronRight, ArrowLeft, ChevronDown, ChevronUp, Globe,
-  Copy, Check, Eye, History,
+  ChevronRight, ArrowLeft, ChevronDown, ChevronUp, Globe, Type, CirclePlay, Link2,
+  Copy, Check, History, Mic, Loader2, Pause, Play, Volume2, VolumeX,
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import clsx from 'clsx';
+import { useVoiceInput } from '../audio/useVoiceInput';
+import { useTts } from '../audio/useTts';
+import ChatComposerShell from './ChatComposerShell';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type MessageRole = 'user' | 'assistant' | 'system';
 
-interface TurnHeaderBlock  { type: 'turn_header'; turn: number; maxTurns: number }
-interface ThinkBlock        { type: 'think'; content: string }
-interface ToolBlock         { type: 'tool'; name: string }
-interface TextBlock         { type: 'text'; content: string }
-interface FileBlock         { type: 'file'; name: string; url: string }
-interface CompletionBlock   {
+interface TurnHeaderBlock { type: 'turn_header'; turn: number; maxTurns: number }
+interface ThinkBlock { type: 'think'; content: string }
+interface ToolBlock { type: 'tool'; name: string }
+interface TextBlock { type: 'text'; content: string }
+interface FileBlock { type: 'file'; name: string; url: string; fileState?: 'saved' | 'updated' }
+interface CompletionBlock {
   type: 'completion';
   success: boolean;
-  stats?: { total_prompt_tokens: number; total_completion_tokens: number; total_elapsed_s: number };
+  stats?: { total_prompt_tokens?: number; total_completion_tokens?: number; total_elapsed_s?: number };
 }
 
 type Block = TurnHeaderBlock | ThinkBlock | ToolBlock | TextBlock | FileBlock | CompletionBlock;
@@ -47,12 +50,23 @@ interface AgentSettings {
   domain: string;
   max_turns: number;
   parallel_thinking: boolean;
+  asr_language: 'auto' | 'en' | 'zh';
+  voice_send_mode: 'input' | 'direct';
+  tts_enabled: boolean;
 }
 
 interface SessionFile {
   name: string;
   size: number;
   ext: string;
+  url?: string;
+  file_api_path?: string;
+  download_api_path?: string;
+  content?: string;
+  local_path?: string;
+  source_url?: string;
+  resource_type?: string;
+  resource_title?: string;
 }
 
 interface Session {
@@ -63,6 +77,7 @@ interface Session {
   started_at?: string;
   finished_at?: string;
   files?: SessionFile[];
+  token_stats?: { total_prompt_tokens?: number; total_completion_tokens?: number; total_elapsed_s?: number };
 }
 
 interface TurnApiData {
@@ -85,7 +100,119 @@ interface TurnsApiResponse {
   result?: string;
   total_turns: number;
   turns: TurnApiData[];
+  chat_history?: Array<{
+    type: string;
+    data?: string;
+    turn?: number;
+    max_turns?: number;
+    name?: string;
+    status?: string;
+    url?: string;
+    file_api_path?: string;
+    download_api_path?: string;
+    content?: string;
+    detail?: string;
+    success?: boolean;
+    stats?: { total_prompt_tokens?: number; total_completion_tokens?: number; total_elapsed_s?: number };
+    isFinalSummary?: boolean;
+  }>;
+  token_stats?: { total_prompt_tokens?: number; total_completion_tokens?: number; total_elapsed_s?: number };
   files?: SessionFile[];
+}
+
+type SiteKey = 'default' | 'site_health' | 'site_jwl';
+
+interface SiteAgentUiConfig {
+  title: string;
+  subtitle: string;
+  welcomeMessage: string;
+  inputPlaceholder: string;
+}
+
+interface AiAgentWorkspaceProps {
+  siteKey?: SiteKey;
+  apiBaseUrl?: string;
+  agentApiUrl?: string;
+  embedded?: boolean;
+}
+
+interface AttachedFileItem {
+  id: string;
+  name: string;
+  ext: string;
+  url?: string;
+  snapshot?: string;
+  size?: number;
+  sourceUrl?: string;
+  resourceType?: string;
+  displayTitle?: string;
+  status: 'processing' | 'ready' | 'error';
+}
+
+interface AgentContextResource {
+  name: string;
+  title: string;
+  url: string;
+  source_url: string;
+  resource_type: string;
+  description: string;
+  transcript: string;
+  content: string;
+  include_all: boolean;
+}
+
+const SITE_AGENT_CONFIG: Record<SiteKey, SiteAgentUiConfig> = {
+  default: {
+    title: 'AI Agent',
+    subtitle: 'ReAct Agent with tool use',
+    welcomeMessage: "Hello! I'm your AI Agent. I can search the web, write code, analyze data, and generate documents. What would you like me to do?",
+    inputPlaceholder: 'Describe your task…',
+  },
+  site_health: {
+    title: 'Health AI Agent',
+    subtitle: 'Clinical workflow assistant',
+    welcomeMessage: "Hello! I'm your Health AI Agent. I can generate care notes, summarize context, and create clinical documents. What should we work on?",
+    inputPlaceholder: 'Describe your clinical task…',
+  },
+  site_jwl: {
+    title: 'AI Agent',
+    subtitle: 'Task automation assistant',
+    welcomeMessage: "Hello! I'm your AI Agent. Tell me the task and I will plan and execute it for you.",
+    inputPlaceholder: 'Describe your task…',
+  },
+};
+
+function buildAuthHeaders(extra: Record<string, string> = {}) {
+  if (typeof window === 'undefined') return extra;
+  const token = localStorage.getItem('token') || localStorage.getItem('admin_token') || '';
+  return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
+}
+
+function compactText(value: string, limit: number) {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  if (normalized.length <= limit) return normalized;
+  return `${normalized.slice(0, limit).trimEnd()}…`;
+}
+
+function cleanUnavailable(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  if (/^\[?unavailable\]?$/i.test(trimmed)) return '';
+  return trimmed;
+}
+
+function parseResourceText(raw: string) {
+  const sourceUrl = cleanUnavailable((raw.match(/^\s*Source:\s*(.+)$/mi)?.[1] || '').trim());
+  const title = cleanUnavailable((raw.match(/^\s*Title:\s*(.+)$/mi)?.[1] || '').trim());
+  const descriptionBlock = raw.match(/^\s*Description:\s*([\s\S]*?)^\s*Transcript\s*\([^)]+\):/mi)?.[1] || '';
+  const transcriptBlock = raw.match(/^\s*Transcript\s*\([^)]+\):\s*([\s\S]*)$/mi)?.[1] || '';
+  return {
+    sourceUrl,
+    title,
+    description: cleanUnavailable(descriptionBlock.trim()),
+    transcript: cleanUnavailable(transcriptBlock.trim()),
+  };
 }
 
 // ─── Block renderers ─────────────────────────────────────────────────────────
@@ -113,7 +240,7 @@ function ThinkBox({ content }: { content: string }) {
         <span className="text-indigo-300 text-xs">💭</span>
         <span className="text-xs font-semibold text-indigo-300 tracking-wide">Thinking</span>
         <span className="ml-auto text-indigo-500 text-xs flex items-center gap-0.5">
-          {collapsed ? <><ChevronRight className="w-3 h-3"/> show</> : <><ChevronDown className="w-3 h-3"/> hide</>}
+          {collapsed ? <><ChevronRight className="w-3 h-3" /> show</> : <><ChevronDown className="w-3 h-3" /> hide</>}
         </span>
       </button>
       {!collapsed && (
@@ -137,7 +264,7 @@ function ToolBadge({ name }: { name: string }) {
   );
 }
 
-function FileBadge({ name, url }: { name: string; url: string }) {
+function FileBadge({ name, url, fileState = 'saved' }: { name: string; url: string; fileState?: 'saved' | 'updated' }) {
   const ext = name.split('.').pop()?.toLowerCase() ?? '';
   return (
     <div className="flex items-center gap-3 my-2 p-3 rounded-xl border border-indigo-200 bg-gradient-to-r from-indigo-50 to-blue-50 shadow-sm">
@@ -146,7 +273,7 @@ function FileBadge({ name, url }: { name: string; url: string }) {
       </div>
       <div className="flex-1 min-w-0">
         <p className="text-sm font-semibold text-indigo-900 truncate">{name}</p>
-        <p className="text-xs text-indigo-500 capitalize">{ext || 'file'} · saved to workspace</p>
+        <p className="text-xs text-indigo-500 capitalize">{ext || 'file'} · {fileState === 'updated' ? 'updated in workspace' : 'saved to workspace'}</p>
       </div>
       {url && (
         <a
@@ -169,7 +296,7 @@ function CompletionBadge({ success, stats }: CompletionBlock) {
     <div className={clsx(
       "mt-4 rounded-2xl p-4 border flex flex-col gap-3",
       success ? "bg-gradient-to-br from-emerald-50 to-teal-50 border-emerald-200"
-              : "bg-gradient-to-br from-amber-50 to-orange-50 border-amber-200"
+        : "bg-gradient-to-br from-amber-50 to-orange-50 border-amber-200"
     )}>
       <div className="flex items-center gap-2">
         {success
@@ -208,7 +335,7 @@ function CompletionBadge({ success, stats }: CompletionBlock) {
 function CodeBlock({ lang, children }: { lang: string; children: string }) {
   const [copied, setCopied] = useState(false);
   const copy = async () => {
-    await navigator.clipboard.writeText(children).catch(() => {});
+    await navigator.clipboard.writeText(children).catch(() => { });
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
@@ -275,16 +402,16 @@ function AssistantMessage({ blocks }: { blocks: Block[] }) {
       {blocks.map((block, i) => {
         switch (block.type) {
           case 'turn_header': return <TurnHeader key={i} turn={block.turn} maxTurns={block.maxTurns} />;
-          case 'think':       return <ThinkBox key={i} content={block.content} />;
-          case 'tool':        return <ToolBadge key={i} name={block.name} />;
-          case 'text':        return (
+          case 'think': return <ThinkBox key={i} content={block.content} />;
+          case 'tool': return <ToolBadge key={i} name={block.name} />;
+          case 'text': return (
             <div key={i} className="text-sm text-gray-800">
               <MarkdownContent content={block.content} />
             </div>
           );
-          case 'file':        return <FileBadge key={i} name={block.name} url={block.url} />;
-          case 'completion':  return <CompletionBadge key={i} {...block} />;
-          default:            return null;
+          case 'file': return <FileBadge key={i} name={block.name} url={block.url} fileState={block.fileState} />;
+          case 'completion': return <CompletionBadge key={i} {...block} />;
+          default: return null;
         }
       })}
     </div>
@@ -299,6 +426,14 @@ function appendToLastBlock(blocks: Block[], type: 'think' | 'text', data: string
     return [...blocks.slice(0, -1), { ...last, content: last.content + data }];
   }
   return [...blocks, { type, content: data } as Block];
+}
+
+function extractAssistantText(blocks: Block[]): string {
+  return blocks
+    .filter((block): block is TextBlock => block.type === 'text')
+    .map(block => block.content)
+    .join('\n')
+    .trim();
 }
 
 function fileIcon(ext: string): string {
@@ -321,6 +456,12 @@ function formatDate(iso?: string): string {
 function reconstructBlocksFromHistory(data: TurnsApiResponse): Block[] {
   const blocks: Block[] = [];
   const total = data.total_turns;
+  const fileByName = new Map<string, SessionFile>();
+  const fileWriteCounts = new Map<string, number>();
+  const fileWriteOrder: string[] = [];
+  for (const file of data.files ?? []) {
+    fileByName.set(file.name, file);
+  }
 
   for (const turn of data.turns) {
     blocks.push({ type: 'turn_header', turn: turn.turn + 1, maxTurns: total } as TurnHeaderBlock);
@@ -335,7 +476,12 @@ function reconstructBlocksFromHistory(data: TurnsApiResponse): Block[] {
         // finish_task summary goes in as text after the loop
       } else if (action.type === 'ActionWriteFile') {
         const name = (action.path as string)?.split('/').pop() ?? String(action.path ?? 'file');
-        blocks.push({ type: 'file', name, url: '' } as FileBlock);
+        if (!fileWriteCounts.has(name)) {
+          fileWriteOrder.push(name);
+          fileWriteCounts.set(name, 1);
+        } else {
+          fileWriteCounts.set(name, (fileWriteCounts.get(name) || 0) + 1);
+        }
       } else if (action.name && action.name !== 'json_parse_error') {
         blocks.push({ type: 'tool', name: action.name } as ToolBlock);
       }
@@ -353,18 +499,121 @@ function reconstructBlocksFromHistory(data: TurnsApiResponse): Block[] {
     }
   }
 
+  const finalFileNames: string[] = [];
+  for (const name of fileWriteOrder) {
+    if (finalFileNames.includes(name)) continue;
+    finalFileNames.push(name);
+  }
+  for (const file of data.files ?? []) {
+    if (!finalFileNames.includes(file.name)) {
+      finalFileNames.push(file.name);
+    }
+  }
+  for (const name of finalFileNames) {
+    const file = fileByName.get(name);
+    blocks.push({
+      type: 'file',
+      name,
+      url: file?.download_api_path || file?.url || file?.file_api_path || '',
+      fileState: (fileWriteCounts.get(name) || 0) > 1 ? 'updated' : 'saved',
+    } as FileBlock);
+  }
+
   if (data.status === 'done' || data.status === 'failed') {
-    blocks.push({ type: 'completion', success: data.success ?? false } as CompletionBlock);
+    blocks.push({ type: 'completion', success: data.success ?? false, stats: data.token_stats } as CompletionBlock);
   }
 
   return blocks;
+}
+
+function reconstructBlocksFromChatHistory(data: TurnsApiResponse): Block[] {
+  const blocks: Block[] = [];
+  const events = data.chat_history ?? [];
+  const fileWriteCounts = new Map<string, number>();
+  const fileWriteUrls = new Map<string, string>();
+  const fileWriteOrder: string[] = [];
+  for (const event of events) {
+    if (event.type === 'turn_start') {
+      blocks.push({ type: 'turn_header', turn: Number(event.turn || 1), maxTurns: Number(event.max_turns || data.total_turns || 1) } as TurnHeaderBlock);
+    } else if (event.type === 'think') {
+      blocks.splice(0, blocks.length, ...appendToLastBlock(blocks, 'think', String(event.data ?? '')));
+    } else if (event.type === 'message' || event.type === 'token' || event.type === 'delta') {
+      blocks.splice(0, blocks.length, ...appendToLastBlock(blocks, 'text', String(event.data ?? '')));
+    } else if (event.type === 'tool' && event.name) {
+      const toolName = String(event.name);
+      if (toolName !== 'finish_task' && event.status === 'started') {
+        const last = blocks[blocks.length - 1];
+        if (!(last && last.type === 'tool' && last.name === toolName)) {
+          blocks.push({ type: 'tool', name: toolName } as ToolBlock);
+        }
+      }
+    } else if (event.type === 'file_written' && event.name) {
+      const name = String(event.name);
+      if (!fileWriteCounts.has(name)) {
+        fileWriteOrder.push(name);
+        fileWriteCounts.set(name, 1);
+      } else {
+        fileWriteCounts.set(name, (fileWriteCounts.get(name) || 0) + 1);
+      }
+      fileWriteUrls.set(name, String(event.download_api_path || event.url || event.file_api_path || ''));
+    } else if (event.type === 'error') {
+      blocks.push({ type: 'text', content: `\n\n❌ **Error:** ${String(event.detail ?? 'Unknown error')}` } as TextBlock);
+    } else if (event.type === 'done') {
+      blocks.push({ type: 'completion', success: Boolean(event.success), stats: event.stats } as CompletionBlock);
+    }
+  }
+  for (const name of fileWriteOrder) {
+    blocks.push({
+      type: 'file',
+      name,
+      url: fileWriteUrls.get(name) || '',
+      fileState: (fileWriteCounts.get(name) || 0) > 1 ? 'updated' : 'saved',
+    } as FileBlock);
+  }
+  return blocks;
+}
+
+function upsertFileBlock(blocks: Block[], nextBlock: FileBlock): Block[] {
+  let found = false;
+  const updatedBlocks = blocks.map((block) => {
+    if (block.type !== 'file' || block.name !== nextBlock.name) return block;
+    found = true;
+    return {
+      ...block,
+      url: nextBlock.url || block.url,
+      fileState: 'updated' as const,
+    } as FileBlock;
+  });
+  if (found) return updatedBlocks;
+  return [...updatedBlocks, nextBlock];
 }
 
 // ─── Settings Panel ───────────────────────────────────────────────────────────
 
 const DOMAINS = ['general', 'software_eng', 'science', 'finance', 'medical', 'legal'];
 
-function SettingsPanel({ settings, onChange }: { settings: AgentSettings; onChange: (s: AgentSettings) => void }) {
+function SettingsPanel({
+  settings,
+  onChange,
+  audio,
+}: {
+  settings: AgentSettings;
+  onChange: (s: AgentSettings) => void;
+  audio: {
+    asrType: 'native' | 'webgpu' | 'none';
+    setAsrType: (mode: 'native' | 'webgpu' | 'none') => void;
+    availableASR: Array<'native' | 'webgpu' | 'none'>;
+    ttsType: 'native' | 'webgpu' | 'doubao' | 'none';
+    setTtsType: (mode: 'native' | 'webgpu' | 'doubao' | 'none') => void;
+    availableTTS: Array<'native' | 'webgpu' | 'doubao' | 'none'>;
+    ttsVolume: number;
+    setTtsVolume: (v: number) => void;
+    ttsStatus: string;
+    isSpeaking: boolean;
+    setTtsEnabled: (enabled: boolean) => void;
+    initAudio: () => void;
+  };
+}) {
   const [open, setOpen] = useState(false);
   return (
     <div className="border-t border-gray-100">
@@ -393,8 +642,8 @@ function SettingsPanel({ settings, onChange }: { settings: AgentSettings; onChan
             </div>
             <p className="text-[10px] text-gray-400 mt-1">
               {settings.tool_strategy === 'hybrid' ? 'Best for small models — JSON tools + text write_file' :
-               settings.tool_strategy === 'native_all' ? 'All native JSON calls — may fail for long writes' :
-               'Pure text XML tool calls'}
+                settings.tool_strategy === 'native_all' ? 'All native JSON calls — may fail for long writes' :
+                  'Pure text XML tool calls'}
             </p>
           </div>
 
@@ -440,6 +689,138 @@ function SettingsPanel({ settings, onChange }: { settings: AgentSettings; onChan
               )} />
             </button>
           </div>
+
+          <div className="pt-2 border-t border-gray-200">
+            <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-1">ASR Backend</label>
+            <div className="flex gap-1">
+              {audio.availableASR.includes('native') && (
+                <button
+                  onClick={() => audio.setAsrType('native')}
+                  className={clsx(
+                    "flex-1 py-1 text-xs rounded-md border transition-colors font-medium",
+                    audio.asrType === 'native' ? "bg-indigo-600 text-white border-indigo-600" : "bg-white text-gray-600 border-gray-200 hover:border-indigo-300",
+                  )}
+                >
+                  Native
+                </button>
+              )}
+              {audio.availableASR.includes('webgpu') && (
+                <button
+                  onClick={() => audio.setAsrType('webgpu')}
+                  className={clsx(
+                    "flex-1 py-1 text-xs rounded-md border transition-colors font-medium",
+                    audio.asrType === 'webgpu' ? "bg-indigo-600 text-white border-indigo-600" : "bg-white text-gray-600 border-gray-200 hover:border-indigo-300",
+                  )}
+                >
+                  WebGPU
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-1">ASR Language</label>
+            <select
+              value={settings.asr_language}
+              onChange={e => onChange({ ...settings, asr_language: e.target.value as AgentSettings['asr_language'] })}
+              className="w-full px-2 py-1.5 text-xs border border-gray-200 rounded-md bg-white focus:ring-1 focus:ring-indigo-400 focus:border-indigo-400"
+            >
+              <option value="auto">Auto (Browser)</option>
+              <option value="en">English</option>
+              <option value="zh">Chinese (中文)</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Voice Send Mode</label>
+            <div className="flex gap-1">
+              {(['input', 'direct'] as const).map(mode => (
+                <button
+                  key={mode}
+                  onClick={() => onChange({ ...settings, voice_send_mode: mode })}
+                  className={clsx(
+                    "flex-1 py-1 text-xs rounded-md border transition-colors font-medium",
+                    settings.voice_send_mode === mode ? "bg-indigo-600 text-white border-indigo-600" : "bg-white text-gray-600 border-gray-200 hover:border-indigo-300",
+                  )}
+                >
+                  {mode === 'input' ? 'Input Only' : 'Direct Send'}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="pt-2 border-t border-gray-200">
+            <div className="flex items-center justify-between mb-2">
+              <div>
+                <p className="text-xs font-medium text-gray-700">Text to Speech</p>
+                <p className="text-[10px] text-gray-400">{settings.tts_enabled ? 'Enabled' : 'Disabled'}</p>
+              </div>
+              <button
+                onClick={() => {
+                  const next = !settings.tts_enabled;
+                  onChange({ ...settings, tts_enabled: next });
+                  audio.setTtsEnabled(next);
+                  if (next) {
+                    audio.initAudio();
+                  } else {
+                    audio.setTtsEnabled(false);
+                  }
+                }}
+                className={clsx("relative inline-flex h-5 w-9 items-center rounded-full transition-colors", settings.tts_enabled ? "bg-indigo-600" : "bg-gray-200")}
+              >
+                <span className={clsx("inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform shadow-sm", settings.tts_enabled ? "translate-x-4.5" : "translate-x-0.5")} />
+              </button>
+            </div>
+            {settings.tts_enabled && (
+              <div className="space-y-2">
+                <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wide">TTS Backend</label>
+                <div className="flex gap-1">
+                  {audio.availableTTS.includes('native') && (
+                    <button
+                      onClick={() => audio.setTtsType('native')}
+                      className={clsx("flex-1 py-1 text-xs rounded-md border transition-colors font-medium",
+                        audio.ttsType === 'native' ? "bg-indigo-600 text-white border-indigo-600" : "bg-white text-gray-600 border-gray-200 hover:border-indigo-300")}
+                    >
+                      Native
+                    </button>
+                  )}
+                  {audio.availableTTS.includes('webgpu') && (
+                    <button
+                      onClick={() => audio.setTtsType('webgpu')}
+                      className={clsx("flex-1 py-1 text-xs rounded-md border transition-colors font-medium",
+                        audio.ttsType === 'webgpu' ? "bg-indigo-600 text-white border-indigo-600" : "bg-white text-gray-600 border-gray-200 hover:border-indigo-300")}
+                    >
+                      WebGPU
+                    </button>
+                  )}
+                  {audio.availableTTS.includes('doubao') && (
+                    <button
+                      onClick={() => audio.setTtsType('doubao')}
+                      className={clsx("flex-1 py-1 text-xs rounded-md border transition-colors font-medium",
+                        audio.ttsType === 'doubao' ? "bg-indigo-600 text-white border-indigo-600" : "bg-white text-gray-600 border-gray-200 hover:border-indigo-300")}
+                    >
+                      Cloud
+                    </button>
+                  )}
+                </div>
+                <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wide">
+                  Volume <span className="font-bold text-indigo-600">{Math.round(audio.ttsVolume * 100)}%</span>
+                </label>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.1}
+                  value={audio.ttsVolume}
+                  onChange={e => audio.setTtsVolume(parseFloat(e.target.value))}
+                  className="w-full accent-indigo-600"
+                />
+                {(audio.ttsStatus || audio.isSpeaking) && (
+                  <p className="text-[10px] text-indigo-500">{audio.ttsStatus || 'Speaking...'}</p>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -451,32 +832,46 @@ function SettingsPanel({ settings, onChange }: { settings: AgentSettings; onChan
 function SessionList({
   onNew,
   onSelect,
+  uiConfig,
+  apiBaseUrl,
+  agentApiUrl,
+  embedded,
 }: {
   onNew: () => void;
   onSelect: (session: Session) => void;
+  uiConfig: SiteAgentUiConfig;
+  apiBaseUrl: string;
+  agentApiUrl: string;
+  embedded?: boolean;
 }) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(() => {
     setLoading(true);
-    fetch('/api/v1/agent/sessions?limit=50')
+    fetch(`${agentApiUrl}/agent/sessions?limit=50`, { headers: buildAuthHeaders() })
       .then(r => r.json())
       .then(d => setSessions(d.sessions ?? []))
-      .catch(() => {})
+      .catch(() => { })
       .finally(() => setLoading(false));
-  }, []);
+  }, [apiBaseUrl]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const t = window.setTimeout(() => { load(); }, 0);
+    return () => window.clearTimeout(t);
+  }, [load]);
 
   const deleteSession = async (e: React.MouseEvent, taskId: string) => {
     e.stopPropagation();
-    await fetch(`/api/v1/agent/sessions/${taskId}`, { method: 'DELETE' });
+    await fetch(`${agentApiUrl}/agent/sessions/${taskId}`, { method: 'DELETE', headers: buildAuthHeaders() });
     setSessions(prev => prev.filter(s => s.task_id !== taskId));
   };
 
   return (
-    <div className="-m-8 h-[calc(100vh-5rem)] flex flex-col bg-gray-50">
+    <div className={clsx(
+      "flex flex-col bg-gray-50",
+      embedded ? "h-full" : "-m-8 h-[calc(100vh-5rem)]"
+    )}>
       {/* Header */}
       <div className="bg-white border-b border-gray-200 px-8 py-5 flex items-center justify-between">
         <div className="flex items-center gap-3">
@@ -484,8 +879,8 @@ function SessionList({
             <Sparkles className="w-5 h-5 text-white" />
           </div>
           <div>
-            <h1 className="text-lg font-bold text-gray-900">AI Agent</h1>
-            <p className="text-xs text-gray-500">ReAct Agent with tool use</p>
+            <h1 className="text-lg font-bold text-gray-900">{uiConfig.title}</h1>
+            <p className="text-xs text-gray-500">{uiConfig.subtitle}</p>
           </div>
         </div>
         <button
@@ -527,19 +922,33 @@ function SessionList({
                 <div className={clsx(
                   "w-10 h-10 rounded-xl flex items-center justify-center shrink-0 mt-0.5",
                   session.status === 'done' && session.success ? "bg-emerald-100" :
-                  session.status === 'done' ? "bg-amber-100" :
-                  session.status === 'running' ? "bg-blue-100" : "bg-gray-100"
+                    session.status === 'done' ? "bg-amber-100" :
+                      session.status === 'running' ? "bg-blue-100" : "bg-gray-100"
                 )}>
                   {session.status === 'done' && session.success ? <CheckCircle2 className="w-5 h-5 text-emerald-600" /> :
-                   session.status === 'done' ? <AlertCircle className="w-5 h-5 text-amber-600" /> :
-                   session.status === 'running' ? <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" /> :
-                   <Bot className="w-5 h-5 text-gray-400" />}
+                    session.status === 'done' ? <AlertCircle className="w-5 h-5 text-amber-600" /> :
+                      session.status === 'running' ? <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" /> :
+                        <Bot className="w-5 h-5 text-gray-400" />}
                 </div>
 
                 {/* Content */}
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-semibold text-gray-900 line-clamp-2 mb-1">{session.goal}</p>
                   <p className="text-xs text-gray-400">{formatDate(session.finished_at || session.started_at)}</p>
+                  {(() => {
+                    const promptTokens = session.token_stats?.total_prompt_tokens ?? 0;
+                    const completionTokens = session.token_stats?.total_completion_tokens ?? 0;
+                    const totalTokens = promptTokens + completionTokens;
+                    const elapsed = session.token_stats?.total_elapsed_s ?? 0;
+                    const speed = elapsed > 0 ? Math.round(completionTokens / elapsed) : 0;
+                    if (totalTokens <= 0) return null;
+                    return (
+                      <div className="flex items-center gap-3 mt-2 text-[11px] text-gray-500">
+                        <span className="inline-flex items-center gap-1"><BarChart2 className="w-3 h-3" /> {totalTokens.toLocaleString()} tokens</span>
+                        <span className="inline-flex items-center gap-1"><Zap className="w-3 h-3" /> {speed} t/s</span>
+                      </div>
+                    );
+                  })()}
 
                   {/* Files */}
                   {session.files && session.files.length > 0 && (
@@ -583,21 +992,31 @@ function ChatView({
   onBack,
   taskId,
   initialGoal,
+  uiConfig,
+  apiBaseUrl,
+  agentApiUrl,
+  embedded,
 }: {
   onBack: () => void;
-  taskId?: string;       // set when viewing an existing session (read-only history)
+  taskId?: string;
   initialGoal?: string;
+  uiConfig: SiteAgentUiConfig;
+  apiBaseUrl: string;
+  agentApiUrl: string;
+  embedded?: boolean;
 }) {
   const isHistory = !!taskId;
+  const [currentTaskId, setCurrentTaskId] = useState(taskId ?? '');
 
   const [messages, setMessages] = useState<Message[]>(
     isHistory ? [] : [{
       id: '1', role: 'assistant', content: '',
-      blocks: [{ type: 'text', content: "Hello! I'm your AI Agent. I can search the web, write code, analyze data, and generate documents. What would you like me to do?" }],
+      blocks: [{ type: 'text', content: uiConfig.welcomeMessage }],
     }]
   );
   const [historyLoading, setHistoryLoading] = useState(isHistory);
   const [input, setInput] = useState(isHistory ? '' : (initialGoal ?? ''));
+  const [isVoiceMode, setIsVoiceMode] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamStatus, setStreamStatus] = useState('');
 
@@ -627,7 +1046,9 @@ function ChatView({
     content: '# Welcome\n\nGenerated content will appear here.',
     isCustomizing: false,
   });
-  const [attachedFiles, setAttachedFiles] = useState<{ name: string; type: string }[]>([]);
+  const [attachedFiles, setAttachedFiles] = useState<AttachedFileItem[]>([]);
+  const [showUrlComposer, setShowUrlComposer] = useState(false);
+  const [urlDraft, setUrlDraft] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [activeTools, setActiveTools] = useState<string[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -638,43 +1059,149 @@ function ChatView({
     domain: 'general',
     max_turns: 15,
     parallel_thinking: false,
+    asr_language: 'auto',
+    voice_send_mode: 'input',
+    tts_enabled: false,
   });
+  const [browserLanguage, setBrowserLanguage] = useState<'en' | 'zh'>('en');
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      setBrowserLanguage(window.navigator.language.toLowerCase().startsWith('zh') ? 'zh' : 'en');
+    }
+  }, []);
+
+  useEffect(() => {
+    setCurrentTaskId(taskId ?? '');
+  }, [taskId]);
+
+  const effectiveAsrLanguage = settings.asr_language === 'auto' ? browserLanguage : settings.asr_language;
+  const {
+    isRecording,
+    isProcessing,
+    isReady,
+    transcript,
+    finalTranscript,
+    error: voiceError,
+    statusMessage,
+    asrType,
+    setAsrType,
+    availableASR,
+    startRecording,
+    stopRecording,
+    resetTranscript,
+    requestPermission,
+  } = useVoiceInput(effectiveAsrLanguage);
+  const {
+    setIsEnabled: setIsTtsEnabled,
+    ttsType,
+    setTtsType,
+    availableTTS,
+    speak,
+    pause,
+    resume,
+    cancel,
+    initAudio,
+    isSpeaking,
+    isPaused,
+    statusMessage: ttsStatus,
+    currentId,
+    volume: ttsVolume,
+    setVolume: setTtsVolume,
+  } = useTts(effectiveAsrLanguage);
+
+  useEffect(() => {
+    setIsTtsEnabled(settings.tts_enabled);
+  }, [settings.tts_enabled, setIsTtsEnabled]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
   useEffect(() => {
-    fetch('/api/v1/agent/tools?strategy=native_all')
+    fetch(`${agentApiUrl}/agent/tools?strategy=native_all`)
       .then(r => r.json())
       .then(data => { if (Array.isArray(data.tools)) setActiveTools(data.tools.map((t: { name?: string; function?: { name?: string } }) => t.name || t.function?.name)); })
-      .catch(() => {});
-  }, []);
+      .catch(() => { });
+  }, [apiBaseUrl]);
+
+  const resolveFileUrl = useCallback((raw?: string) => {
+    if (!raw) return '';
+    if (/^https?:\/\//i.test(raw)) return raw;
+    if (raw.startsWith('/')) return `${apiBaseUrl}${raw}`;
+    return `${apiBaseUrl}/${raw}`;
+  }, [apiBaseUrl]);
 
   // Load history when viewing an existing session
   useEffect(() => {
     if (!taskId) return;
     setHistoryLoading(true);
-    fetch(`/api/v1/agent/sessions/${taskId}/turns`)
+    fetch(`${agentApiUrl}/agent/sessions/${taskId}/turns`, { headers: buildAuthHeaders() })
       .then(r => r.json())
-      .then((data: TurnsApiResponse) => {
+      .then(async (data: TurnsApiResponse) => {
+        setCurrentTaskId(data.task_id || taskId);
         const userMsg: Message = { id: 'user-0', role: 'user', content: data.goal };
-        const assistantBlocks = reconstructBlocksFromHistory(data);
+        const turnBlocks = reconstructBlocksFromHistory(data);
+        const hasRichTurnContent = turnBlocks.some((b) => b.type === 'turn_header' || b.type === 'think' || b.type === 'tool' || b.type === 'text');
+        const assistantBlocksRaw = hasRichTurnContent ? turnBlocks : reconstructBlocksFromChatHistory(data);
+        const assistantBlocks = assistantBlocksRaw.map((b) => (
+          b.type === 'file' ? ({ ...b, url: resolveFileUrl(b.url) } as FileBlock) : b
+        ));
         const assistantMsg: Message = {
           id: 'assistant-0', role: 'assistant', content: '',
           blocks: assistantBlocks,
         };
         setMessages([userMsg, assistantMsg]);
+        const mappedFiles = (data.files ?? []).map((f, idx) => ({
+          id: `${f.name}-${idx}`,
+          name: f.name,
+          ext: f.ext || f.name.split('.').pop() || 'file',
+          url: resolveFileUrl(f.url || f.download_api_path || f.file_api_path),
+          snapshot: (f.content || '').slice(0, 300),
+          size: f.size,
+          sourceUrl: f.source_url,
+          resourceType: f.resource_type,
+          displayTitle: f.resource_title || f.name,
+          status: 'ready' as const,
+        }));
+        setAttachedFiles(mappedFiles);
 
-        // Populate document panel with the first .md file found in workspace files
-        const mdFile = data.files?.find(f => f.ext === 'md' || f.ext === 'markdown');
+        const mdFile = data.files?.find(f => f.ext === 'md' || f.ext === 'markdown' || f.name.toLowerCase().endsWith('.md') || f.name.toLowerCase().endsWith('.markdown'));
         if (mdFile) {
-          setDocumentState(prev => ({ ...prev, title: mdFile.name }));
+          if (mdFile.content) {
+            setDocumentState(prev => ({ ...prev, title: mdFile.name, content: mdFile.content ?? '' }));
+            setActiveTab('editor');
+            return;
+          }
+          const resolved = resolveFileUrl(mdFile.url || mdFile.file_api_path);
+          if (resolved) {
+            try {
+              const content = await fetch(resolved, {
+                headers: ((resolved.startsWith(apiBaseUrl) || resolved.startsWith(agentApiUrl)) || resolved.startsWith(agentApiUrl)) ? buildAuthHeaders() : undefined,
+              }).then(r => (r.ok ? r.text() : ''));
+              if (content) {
+                setDocumentState(prev => ({ ...prev, title: mdFile.name, content }));
+                setActiveTab('editor');
+                return;
+              }
+            } catch { }
+          }
+          try {
+            const fileApi = `${agentApiUrl}/agent/sessions/${taskId}/files/content?name=${encodeURIComponent(mdFile.name)}`;
+            const payload = await fetch(fileApi, { headers: buildAuthHeaders() }).then(r => r.ok ? r.json() : null);
+            const text = typeof payload?.content === 'string' ? payload.content : '';
+            if (text) {
+              setDocumentState(prev => ({ ...prev, title: mdFile.name, content: text }));
+              setActiveTab('editor');
+              return;
+            }
+          } catch { }
+          setDocumentState(prev => ({ ...prev, title: mdFile.name, content: prev.content }));
         }
       })
       .catch(console.error)
       .finally(() => setHistoryLoading(false));
-  }, [taskId]);
+  }, [agentApiUrl, apiBaseUrl, taskId, resolveFileUrl]);
 
   const downloadDocument = () => {
     const blob = new Blob([documentState.content], { type: 'text/plain;charset=utf-8' });
@@ -688,14 +1215,239 @@ function ChatView({
     URL.revokeObjectURL(url);
   };
 
-  // Detect if the document is code (not markdown) based on extension
-  const docExt = documentState.title.split('.').pop()?.toLowerCase() ?? '';
-  const isCodeDoc = !['md', 'markdown', 'txt', ''].includes(docExt);
+  const saveDocument = useCallback(async () => {
+    if (!currentTaskId) return;
+    const name = (documentState.title || '').trim();
+    if (!name) return;
+    setStreamStatus('Saving document…');
+    try {
+      const res = await fetch(`${agentApiUrl}/agent/sessions/${currentTaskId}/files/content`, {
+        method: 'PUT',
+        headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ name, content: documentState.content }),
+      });
+      if (!res.ok) throw new Error('Failed to save document');
+      const payload = await res.json().catch(() => null);
+      if (payload?.name) {
+        setDocumentState(prev => ({ ...prev, title: String(payload.name) }));
+      }
+    } catch (error) {
+      console.error('Save document error:', error);
+    } finally {
+      setStreamStatus('');
+    }
+  }, [agentApiUrl, apiBaseUrl, currentTaskId, documentState.content, documentState.title]);
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) setAttachedFiles(prev => [...prev, ...Array.from(e.target.files!).map(f => ({ name: f.name, type: f.name.split('.').pop() || 'file' }))]);
+  const ensureTaskSession = useCallback(async () => {
+    const existingTaskId = currentTaskId || taskId;
+    if (existingTaskId) return existingTaskId;
+    try {
+      const response = await fetch(`${agentApiUrl}/agent/sessions/init`, {
+        method: 'POST',
+        headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ goal: (initialGoal || input || '').trim() }),
+      });
+      if (!response.ok) throw new Error('init failed');
+      const payload = await response.json().catch(() => null);
+      const createdTaskId = String(payload?.task_id || '').trim();
+      if (!createdTaskId) throw new Error('missing task id');
+      setCurrentTaskId(createdTaskId);
+      return createdTaskId;
+    } catch {
+      setStreamStatus('Failed to initialize task session.');
+      return '';
+    }
+  }, [agentApiUrl, apiBaseUrl, currentTaskId, initialGoal, input, taskId]);
+
+  const handleFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files ? Array.from(e.target.files) : [];
     e.target.value = '';
-  };
+    if (files.length === 0) return;
+    const effectiveTaskId = (currentTaskId || taskId) || await ensureTaskSession();
+    if (!effectiveTaskId) {
+      setStreamStatus('Unable to attach files right now.');
+      return;
+    }
+    const pending = files.map((file, idx) => ({
+      id: `${Date.now()}-${idx}-${file.name}`,
+      name: file.name,
+      ext: file.name.split('.').pop() || 'file',
+      snapshot: 'Processing attachment...',
+      size: file.size,
+      status: 'processing' as const,
+    }));
+    setAttachedFiles(prev => [...prev, ...pending]);
+    await Promise.all(pending.map(async (item, idx) => {
+      const file = files[idx];
+      try {
+        const formData = new FormData();
+        formData.append('file', file);
+        const response = await fetch(`${agentApiUrl}/agent/sessions/${effectiveTaskId}/files/upload`, {
+          method: 'POST',
+          headers: buildAuthHeaders(),
+          body: formData,
+        });
+        if (!response.ok) {
+          throw new Error('upload failed');
+        }
+        const payload = await response.json();
+        if (!payload?.saved || !payload?.name) {
+          throw new Error('upload failed');
+        }
+        const ext = String(payload.name).split('.').pop() || file.name.split('.').pop() || 'file';
+        setAttachedFiles(prev => prev.map(existing => {
+          if (existing.id !== item.id) return existing;
+          return {
+            ...existing,
+            name: String(payload.name),
+            ext,
+            url: resolveFileUrl(String(payload.url || payload.download_api_path || payload.file_api_path || '')),
+            snapshot: String(payload.snapshot || '').slice(0, 300),
+            size: Number(payload.size || file.size || 0),
+            sourceUrl: String(payload.source_url || ''),
+            resourceType: String(payload.resource_type || ''),
+            displayTitle: String(payload.resource_title || payload.name || ''),
+            status: 'ready' as const,
+          };
+        }));
+      } catch {
+        setAttachedFiles(prev => prev.map(existing => {
+          if (existing.id !== item.id) return existing;
+          return { ...existing, snapshot: 'Failed to process attachment.', status: 'error' as const };
+        }));
+      }
+    }));
+  }, [agentApiUrl, apiBaseUrl, currentTaskId, ensureTaskSession, resolveFileUrl, taskId]);
+
+  const submitAttachResources = useCallback(async () => {
+    const urls = Array.from(new Set(
+      urlDraft
+        .split('\n')
+        .flatMap(line => line.split(/[,\s]+/))
+        .map(v => v.trim())
+        .filter(v => /^https?:\/\//i.test(v))
+    ));
+    if (urls.length === 0) {
+      setStreamStatus('Please enter at least one valid URL.');
+      return;
+    }
+    const effectiveTaskId = (currentTaskId || taskId) || await ensureTaskSession();
+    if (!effectiveTaskId) {
+      setStreamStatus('Unable to attach links right now.');
+      return;
+    }
+    setStreamStatus('Attaching resource…');
+    const pending = urls.map((sourceUrl, idx) => ({
+      id: `${Date.now()}-url-${idx}`,
+      name: `resource_${idx + 1}.md`,
+      ext: 'md',
+      snapshot: 'Processing resource...',
+      sourceUrl,
+      resourceType: /(youtube\.com|youtu\.be)/i.test(sourceUrl) ? 'youtube' : 'web',
+      displayTitle: sourceUrl,
+      status: 'processing' as const,
+    }));
+    setAttachedFiles(prev => [...prev, ...pending]);
+    setUrlDraft('');
+    setShowUrlComposer(false);
+    await Promise.all(pending.map(async (item) => {
+      try {
+        const response = await fetch(`${agentApiUrl}/agent/sessions/${effectiveTaskId}/resources/attach`, {
+          method: 'POST',
+          headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ url: item.sourceUrl }),
+        });
+        if (!response.ok) {
+          throw new Error('attach failed');
+        }
+        const payload = await response.json();
+        if (!payload?.saved || !payload?.name) {
+          throw new Error('attach failed');
+        }
+        const ext = String(payload.name).split('.').pop() || 'md';
+        setAttachedFiles(prev => prev.map(existing => {
+          if (existing.id !== item.id) return existing;
+          return {
+            ...existing,
+            name: String(payload.name),
+            ext,
+            url: resolveFileUrl(String(payload.url || payload.download_api_path || payload.file_api_path || '')),
+            snapshot: String(payload.snapshot || '').slice(0, 300),
+            size: Number(payload.size || 0),
+            sourceUrl: String(payload.source_url || item.sourceUrl || ''),
+            resourceType: String(payload.resource_type || item.resourceType || 'web'),
+            displayTitle: String(payload.resource_title || payload.name || item.sourceUrl || ''),
+            status: 'ready' as const,
+          };
+        }));
+      } catch {
+        setAttachedFiles(prev => prev.map(existing => {
+          if (existing.id !== item.id) return existing;
+          return { ...existing, snapshot: 'Failed to process URL resource.', status: 'error' as const };
+        }));
+      }
+    }));
+    setStreamStatus('');
+  }, [agentApiUrl, apiBaseUrl, currentTaskId, ensureTaskSession, resolveFileUrl, taskId, urlDraft]);
+
+  const handleAttachResource = useCallback(() => {
+    setShowUrlComposer(prev => !prev);
+  }, []);
+
+  const removeAttachedFile = useCallback(async (item: AttachedFileItem) => {
+    const effectiveTaskId = currentTaskId || taskId;
+    if (!effectiveTaskId || !item.name) {
+      setAttachedFiles(prev => prev.filter(existing => existing.id !== item.id));
+      return;
+    }
+    try {
+      const response = await fetch(
+        `${agentApiUrl}/agent/sessions/${effectiveTaskId}/files?name=${encodeURIComponent(item.name)}`,
+        { method: 'DELETE', headers: buildAuthHeaders() }
+      );
+      if (!response.ok) throw new Error('delete failed');
+      setAttachedFiles(prev => prev.filter(existing => existing.id !== item.id));
+    } catch {
+      setStreamStatus('Failed to delete attached resource.');
+    }
+  }, [agentApiUrl, apiBaseUrl, currentTaskId, taskId]);
+
+  const buildContextResources = useCallback(async (effectiveTaskId?: string): Promise<AgentContextResource[]> => {
+    const readyFiles = attachedFiles.filter(file => file.status === 'ready');
+    const resources = await Promise.all(readyFiles.map(async (file) => {
+      let content = '';
+      if (effectiveTaskId && file.name) {
+        try {
+          const fileApi = `${agentApiUrl}/agent/sessions/${effectiveTaskId}/files/content?name=${encodeURIComponent(file.name)}`;
+          const payload = await fetch(fileApi, { headers: buildAuthHeaders() }).then(r => r.ok ? r.json() : null);
+          if (typeof payload?.content === 'string') {
+            content = payload.content;
+          }
+        } catch { }
+      }
+      const parsed = parseResourceText(content);
+      const title = parsed.title || file.displayTitle || file.name;
+      const sourceUrl = parsed.sourceUrl || file.sourceUrl || '';
+      const fallbackUrl = sourceUrl || file.url || '';
+      const description = compactText(parsed.description || file.snapshot || '', 700);
+      const transcript = compactText(parsed.transcript, 1200);
+      const normalizedContent = compactText(content, 2000);
+      const inlineText = `${description}\n${transcript}\n${normalizedContent}`.trim();
+      const includeAll = inlineText.length > 0 && inlineText.length <= 1800;
+      return {
+        name: file.name,
+        title,
+        url: fallbackUrl,
+        source_url: sourceUrl || fallbackUrl,
+        resource_type: file.resourceType || 'file',
+        description,
+        transcript: includeAll ? transcript : compactText(transcript, 260),
+        content: includeAll ? normalizedContent : compactText(normalizedContent, 260),
+        include_all: includeAll,
+      };
+    }));
+    return resources.filter(resource => Boolean(resource.url || resource.description || resource.content || resource.transcript));
+  }, [agentApiUrl, apiBaseUrl, attachedFiles]);
 
   const updateBlocks = useCallback((updater: (prev: Block[]) => Block[]) => {
     setMessages(prev => {
@@ -705,22 +1457,33 @@ function ChatView({
     });
   }, []);
 
-  const handleSend = async (e?: React.FormEvent) => {
+  const handleSend = useCallback(async (e?: React.FormEvent, forcedInput?: string) => {
     e?.preventDefault();
-    if (!input.trim() || isStreaming) return;
+    const outgoingInput = (forcedInput ?? input).trim();
+    if (!outgoingInput || isStreaming) return;
 
-    const userMsg: Message = { id: Date.now().toString(), role: 'user', content: input };
+    const userMsg: Message = { id: Date.now().toString(), role: 'user', content: outgoingInput };
     setMessages(prev => [...prev, userMsg]);
     setInput('');
     setIsStreaming(true);
-    setMessages(prev => [...prev, { id: (Date.now() + 1).toString(), role: 'assistant', content: '', blocks: [] }]);
+    const assistantId = (Date.now() + 1).toString();
+    setMessages(prev => [...prev, { id: assistantId, role: 'assistant', content: '', blocks: [] }]);
+    let assistantTextBuffer = '';
 
     try {
-      const response = await fetch('/api/v1/agent/stream', {
+      const effectiveTaskId = currentTaskId || taskId || undefined;
+      const contextResources = await buildContextResources(effectiveTaskId);
+      const response = await fetch(`${agentApiUrl}/agent/stream`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: buildAuthHeaders({
+          'Content-Type': 'application/json',
+          'Accept': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+        }),
         body: JSON.stringify({
+          task_id: effectiveTaskId,
           goal: userMsg.content,
+          context_resources: contextResources,
           backend: 'vllm',
           tool_strategy: settings.tool_strategy,
           domain: settings.domain,
@@ -738,35 +1501,121 @@ function ChatView({
         const { value, done } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
+        const events = buffer.split('\n\n');
+        buffer = events.pop() ?? '';
 
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const raw = line.slice(6).trim();
+        for (const eventChunk of events) {
+          const dataLines = eventChunk
+            .split('\n')
+            .map(line => line.trim())
+            .filter(line => line.startsWith('data: '))
+            .map(line => line.slice(6));
+          if (dataLines.length === 0) continue;
+          const raw = dataLines.join('\n').trim();
           if (!raw || raw === '[DONE]') continue;
           try {
             const event = JSON.parse(raw);
-            if (event.type === 'turn_start') {
+            if (event.type === 'start') {
+              if (event.task_id) setCurrentTaskId(String(event.task_id));
+            } else if (event.type === 'turn_start') {
               setStreamStatus(`Turn ${event.turn}/${event.max_turns}`);
               updateBlocks(b => [...b, { type: 'turn_header', turn: event.turn, maxTurns: event.max_turns } as TurnHeaderBlock]);
             } else if (event.type === 'think') {
               updateBlocks(b => appendToLastBlock(b, 'think', event.data ?? ''));
             } else if (event.type === 'message' || event.type === 'token') {
-              updateBlocks(b => appendToLastBlock(b, 'text', event.data ?? ''));
+              const chunk = event.data ?? '';
+              assistantTextBuffer += chunk;
+              updateBlocks(b => appendToLastBlock(b, 'text', chunk));
             } else if (event.type === 'tool' && event.status === 'started' && event.name) {
               setStreamStatus(`${event.name}…`);
               setActiveTools(prev => prev.includes(event.name) ? prev : [...prev, event.name]);
               updateBlocks(b => [...b, { type: 'tool', name: event.name } as ToolBlock]);
             } else if (event.type === 'file_written') {
-              updateBlocks(b => [...b, { type: 'file', name: event.name, url: event.url } as FileBlock]);
-              if (event.name?.endsWith('.md') || event.name?.endsWith('.markdown')) {
-                const md = event.content || (event.url ? await fetch(event.url).then(r => r.text()).catch(() => '') : '');
-                if (md) { setDocumentState(prev => ({ ...prev, title: event.name, content: md })); setActiveTab('editor'); }
+              const resolvedUrl = resolveFileUrl(event.url || event.download_api_path || event.file_api_path);
+              updateBlocks(b => upsertFileBlock(b, { type: 'file', name: event.name, url: resolvedUrl, fileState: 'saved' } as FileBlock));
+              if (event.name) {
+                const writtenName = String(event.name);
+                const writtenExt = writtenName.split('.').pop() || 'file';
+                const writtenSnapshot = typeof event.content === 'string' ? event.content.slice(0, 300) : '';
+                setAttachedFiles(prev => {
+                  const next = prev.filter(item => item.name !== writtenName);
+                  return [...next, {
+                    id: `${Date.now()}-stream-${writtenName}`,
+                    name: writtenName,
+                    ext: writtenExt,
+                    url: resolvedUrl,
+                    snapshot: writtenSnapshot,
+                    sourceUrl: String(event.source_url || ''),
+                    resourceType: String(event.resource_type || ''),
+                    displayTitle: String(event.resource_title || writtenName),
+                    status: 'ready' as const,
+                  }];
+                });
+              }
+              const fileName = String(event.name || '');
+              const lowerName = fileName.toLowerCase();
+              if (lowerName.endsWith('.md') || lowerName.endsWith('.markdown')) {
+                const inline = event.content;
+                if (inline) {
+                  setDocumentState(prev => ({ ...prev, title: fileName || prev.title, content: inline }));
+                  setActiveTab('editor');
+                } else if (resolvedUrl) {
+                  fetch(resolvedUrl, {
+                    headers: ((resolvedUrl.startsWith(apiBaseUrl) || resolvedUrl.startsWith(agentApiUrl)) || resolvedUrl.startsWith(agentApiUrl)) ? buildAuthHeaders() : undefined,
+                  })
+                    .then(r => (r.ok ? r.text() : ''))
+                    .then(md => {
+                      if (md) {
+                        setDocumentState(prev => ({ ...prev, title: fileName || prev.title, content: md }));
+                        setActiveTab('editor');
+                      } else if (currentTaskId) {
+                        const fileApi = `${agentApiUrl}/agent/sessions/${currentTaskId}/files/content?name=${encodeURIComponent(fileName)}`;
+                        fetch(fileApi, { headers: buildAuthHeaders() })
+                          .then(r => r.ok ? r.json() : null)
+                          .then(payload => {
+                            const text = typeof payload?.content === 'string' ? payload.content : '';
+                            if (text) {
+                              setDocumentState(prev => ({ ...prev, title: fileName || prev.title, content: text }));
+                              setActiveTab('editor');
+                            }
+                          })
+                          .catch(() => { });
+                      }
+                    })
+                    .catch(() => { });
+                } else {
+                  if (!currentTaskId) {
+                    setDocumentState(prev => ({ ...prev, title: fileName || prev.title, content: prev.content }));
+                    setActiveTab('editor');
+                    continue;
+                  }
+                  const fileApi = `${agentApiUrl}/agent/sessions/${currentTaskId}/files/content?name=${encodeURIComponent(fileName)}`;
+                  fetch(fileApi, { headers: buildAuthHeaders() })
+                    .then(r => r.ok ? r.json() : null)
+                    .then(payload => {
+                      const text = typeof payload?.content === 'string' ? payload.content : '';
+                      if (text) {
+                        setDocumentState(prev => ({ ...prev, title: fileName || prev.title, content: text }));
+                        setActiveTab('editor');
+                      } else {
+                        setDocumentState(prev => ({ ...prev, title: fileName || prev.title, content: prev.content }));
+                        setActiveTab('editor');
+                      }
+                    })
+                    .catch(() => {
+                      setDocumentState(prev => ({ ...prev, title: fileName || prev.title, content: prev.content }));
+                      setActiveTab('editor');
+                    });
+                }
               }
             } else if (event.type === 'done') {
+              if (event.task_id) setCurrentTaskId(String(event.task_id));
               setStreamStatus('');
               updateBlocks(b => [...b, { type: 'completion', success: event.success, stats: event.stats } as CompletionBlock]);
+              if (settings.tts_enabled && assistantTextBuffer.trim() && Boolean(event.isFinalSummary)) {
+                initAudio();
+                speak(assistantTextBuffer, false, assistantId);
+              }
             } else if (event.type === 'error') {
               setStreamStatus('');
               updateBlocks(b => [...b, { type: 'text', content: `\n\n❌ **Error:** ${event.detail ?? 'Unknown error'}` } as TextBlock]);
@@ -780,10 +1629,39 @@ function ChatView({
       setIsStreaming(false);
       setStreamStatus('');
     }
-  };
+  }, [
+    input,
+    isStreaming,
+    apiBaseUrl,
+    settings.tool_strategy,
+    settings.domain,
+    settings.max_turns,
+    settings.tts_enabled,
+    currentTaskId,
+    updateBlocks,
+    initAudio,
+    speak,
+    resolveFileUrl,
+    buildContextResources,
+    taskId,
+  ]);
+
+  useEffect(() => {
+    const text = finalTranscript.trim();
+    if (!text) return;
+    if (settings.voice_send_mode === 'direct' && !isStreaming) {
+      void handleSend(undefined, text);
+    } else {
+      setInput(prev => (prev ? `${prev} ${text}` : text));
+    }
+    resetTranscript();
+  }, [finalTranscript, settings.voice_send_mode, isStreaming, resetTranscript, handleSend]);
 
   return (
-    <div className="-m-8 h-[calc(100vh-5rem)] flex flex-col bg-white overflow-hidden">
+    <div className={clsx(
+      "flex flex-col bg-white overflow-hidden",
+      embedded ? "h-full" : "-m-8 h-[calc(100vh-5rem)]"
+    )}>
       {/* Top bar */}
       <div className="h-12 border-b border-gray-200 bg-white flex items-center px-4 gap-3 shrink-0 z-10">
         <button onClick={onBack} className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-800 transition-colors px-2 py-1 rounded-lg hover:bg-gray-100">
@@ -803,7 +1681,7 @@ function ChatView({
       </div>
 
       {/* Resizable body — min-h-0 lets flex children shrink properly */}
-      <div ref={containerRef} className="flex-1 flex overflow-hidden select-none min-h-0">
+      <div ref={containerRef} className="flex-1 flex overflow-hidden min-h-0">
         {/* Chat pane */}
         <div className="flex flex-col min-h-0 overflow-hidden" style={{ width: `${splitPct}%` }}>
           {/* Messages */}
@@ -816,31 +1694,75 @@ function ChatView({
                 </div>
               </div>
             )}
-            {messages.map(msg => (
-              <div key={msg.id} className={clsx("flex max-w-[90%]", msg.role === 'user' ? "ml-auto" : "mr-auto")}>
-                {msg.role !== 'user' && (
-                  <div className="w-7 h-7 rounded-full bg-indigo-100 flex items-center justify-center mr-2.5 shrink-0 mt-1">
-                    <Bot className="w-4 h-4 text-indigo-600" />
+            {messages.map(msg => {
+              const assistantText = msg.role === 'assistant' ? extractAssistantText(msg.blocks ?? []) : '';
+              const speakingThis = currentId === msg.id && isSpeaking;
+              return (
+                <div key={msg.id} className={clsx("flex max-w-[90%]", msg.role === 'user' ? "ml-auto" : "mr-auto")}>
+                  {msg.role !== 'user' && (
+                    <div className="w-7 h-7 rounded-full bg-indigo-100 flex items-center justify-center mr-2.5 shrink-0 mt-1">
+                      <Bot className="w-4 h-4 text-indigo-600" />
+                    </div>
+                  )}
+                  <div className={clsx(
+                    "rounded-2xl px-4 py-3 min-w-0 flex-1 text-sm select-text",
+                    msg.role === 'user'
+                      ? "bg-indigo-600 text-white rounded-tr-sm shadow-sm"
+                      : "bg-white border border-gray-200 text-gray-800 rounded-tl-sm shadow-sm"
+                  )}>
+                    {msg.role === 'user'
+                      ? <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
+                      : (
+                        <>
+                          <AssistantMessage blocks={msg.blocks ?? [{ type: 'text', content: msg.content }]} />
+                          <div className="mt-2 flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (!assistantText) return;
+                                initAudio();
+                                if (speakingThis) {
+                                  if (isPaused) {
+                                    resume();
+                                  } else {
+                                    pause();
+                                  }
+                                  return;
+                                }
+                                speak(assistantText, true, msg.id);
+                              }}
+                              disabled={!assistantText}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-gray-200 text-[10px] text-gray-600 hover:bg-gray-50 disabled:opacity-40"
+                            >
+                              {speakingThis ? (
+                                isPaused ? <Play className="w-3 h-3" /> : <Pause className="w-3 h-3" />
+                              ) : (
+                                <Volume2 className="w-3 h-3" />
+                              )}
+                              {speakingThis ? (isPaused ? 'Resume' : 'Pause') : 'Play'}
+                            </button>
+                            {speakingThis && (
+                              <button
+                                type="button"
+                                onClick={() => cancel()}
+                                className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-gray-200 text-[10px] text-gray-600 hover:bg-gray-50"
+                              >
+                                <VolumeX className="w-3 h-3" /> Stop
+                              </button>
+                            )}
+                          </div>
+                        </>
+                      )
+                    }
                   </div>
-                )}
-                <div className={clsx(
-                  "rounded-2xl px-4 py-3 min-w-0 flex-1 text-sm",
-                  msg.role === 'user'
-                    ? "bg-indigo-600 text-white rounded-tr-sm shadow-sm"
-                    : "bg-white border border-gray-200 text-gray-800 rounded-tl-sm shadow-sm"
-                )}>
-                  {msg.role === 'user'
-                    ? <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
-                    : <AssistantMessage blocks={msg.blocks ?? [{ type: 'text', content: msg.content }]} />
-                  }
+                  {msg.role === 'user' && (
+                    <div className="w-7 h-7 rounded-full bg-gray-200 flex items-center justify-center ml-2.5 shrink-0 mt-1">
+                      <User className="w-4 h-4 text-gray-600" />
+                    </div>
+                  )}
                 </div>
-                {msg.role === 'user' && (
-                  <div className="w-7 h-7 rounded-full bg-gray-200 flex items-center justify-center ml-2.5 shrink-0 mt-1">
-                    <User className="w-4 h-4 text-gray-600" />
-                  </div>
-                )}
-              </div>
-            ))}
+              )
+            })}
             {isStreaming && (
               <div className="flex max-w-[90%] mr-auto">
                 <div className="w-7 h-7 rounded-full bg-indigo-100 flex items-center justify-center mr-2.5 shrink-0 mt-1">
@@ -861,28 +1783,81 @@ function ChatView({
 
           {/* Input area + settings */}
           <div className="bg-white border-t border-gray-200 shrink-0">
-            <div className="p-3">
-              <form onSubmit={handleSend}
-                className="flex items-end gap-2 bg-gray-50 border border-gray-300 rounded-2xl p-2 focus-within:ring-2 focus-within:ring-indigo-500 focus-within:border-transparent transition-all"
-              >
-                <button type="button" onClick={() => fileInputRef.current?.click()}
-                  className="p-1.5 text-gray-400 hover:text-gray-600 rounded-full hover:bg-gray-200 transition-colors shrink-0">
+            <ChatComposerShell
+              modes={[
+                { key: 'text', icon: <Type size={15} />, label: 'Text', active: !isVoiceMode, onClick: () => setIsVoiceMode(false) },
+                { key: 'voice', icon: <Mic size={15} />, label: 'Voice', active: isVoiceMode, onClick: () => { setIsVoiceMode(true); requestPermission(); } },
+              ]}
+              onSend={() => { if (!isVoiceMode) void handleSend(); }}
+              sendDisabled={isVoiceMode || !input.trim() || isStreaming}
+              rightSlot={(
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="p-2 text-gray-400 hover:text-gray-600 rounded-full hover:bg-gray-100 transition-colors"
+                  title="Attach files"
+                >
                   <Paperclip className="w-4 h-4" />
                 </button>
-                <input type="file" ref={fileInputRef} className="hidden" onChange={handleFileChange} multiple />
-                <textarea value={input} onChange={e => setInput(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
-                  placeholder="Describe your task…"
-                  className="flex-1 max-h-36 min-h-[36px] bg-transparent border-none focus:ring-0 resize-none py-2 px-1 text-sm text-gray-800"
-                  rows={1}
-                />
-                <button type="submit" disabled={!input.trim() || isStreaming}
-                  className="p-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 disabled:cursor-not-allowed text-white rounded-xl transition-colors shrink-0 mr-0.5 mb-0.5">
-                  <Send className="w-3.5 h-3.5" />
+              )}
+            >
+              <input type="file" ref={fileInputRef} className="hidden" onChange={handleFileChange} multiple />
+              {isVoiceMode ? (
+                <button
+                  type="button"
+                  className={clsx(
+                    "w-full min-h-[84px] rounded-xl border text-sm font-medium transition-colors",
+                    isRecording ? "bg-gray-200 border-gray-300 text-gray-800" :
+                      isProcessing ? "bg-gray-100 border-gray-200 text-gray-400 cursor-wait" :
+                        "bg-white border-gray-200 hover:bg-gray-50 text-gray-700"
+                  )}
+                  onMouseDown={e => { e.preventDefault(); if (settings.tts_enabled) initAudio(); if (!isProcessing) startRecording(); }}
+                  onMouseUp={e => { e.preventDefault(); stopRecording(); }}
+                  onMouseLeave={e => { e.preventDefault(); if (isRecording) stopRecording(); }}
+                  onTouchStart={e => { e.preventDefault(); if (settings.tts_enabled) initAudio(); if (!isProcessing) startRecording(); }}
+                  onTouchEnd={e => { e.preventDefault(); stopRecording(); }}
+                  disabled={isStreaming}
+                >
+                  {isProcessing ? (
+                    <span className="inline-flex items-center gap-2">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      {statusMessage || (isReady ? 'Processing...' : 'Loading Model...')}
+                    </span>
+                  ) : isRecording ? 'Release to Send' : 'Hold to Talk'}
                 </button>
-              </form>
-            </div>
-            <SettingsPanel settings={settings} onChange={setSettings} />
+              ) : (
+                <textarea
+                  value={input}
+                  onChange={e => setInput(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void handleSend(); } }}
+                  placeholder={uiConfig.inputPlaceholder}
+                  className="w-full min-h-[84px] max-h-[220px] bg-white border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-200 focus:border-blue-300 resize-y p-3 text-sm text-gray-800"
+                />
+              )}
+              {(voiceError || transcript || ttsStatus) && (
+                <div className="mt-1 px-1 text-[10px] text-gray-500 truncate">
+                  {voiceError || transcript || ttsStatus}
+                </div>
+              )}
+            </ChatComposerShell>
+            <SettingsPanel
+              settings={settings}
+              onChange={setSettings}
+              audio={{
+                asrType,
+                setAsrType,
+                availableASR,
+                ttsType,
+                setTtsType,
+                availableTTS,
+                ttsVolume,
+                setTtsVolume,
+                ttsStatus,
+                isSpeaking,
+                setTtsEnabled: setIsTtsEnabled,
+                initAudio,
+              }}
+            />
           </div>
         </div>
 
@@ -928,8 +1903,8 @@ function ChatView({
                       <Code className="w-2.5 h-2.5" /> Raw
                     </button>
                   </div>
-                  <button className="p-1 text-gray-400 hover:text-indigo-600 rounded transition-colors"><Save className="w-3.5 h-3.5" /></button>
-                  <button className="p-1 text-gray-400 hover:text-indigo-600 rounded transition-colors"><Download className="w-3.5 h-3.5" /></button>
+                  <button onClick={saveDocument} disabled={!currentTaskId} className={clsx("p-1 rounded transition-colors", currentTaskId ? "text-gray-400 hover:text-indigo-600" : "text-gray-300 cursor-not-allowed")}><Save className="w-3.5 h-3.5" /></button>
+                  <button onClick={downloadDocument} className="p-1 text-gray-400 hover:text-indigo-600 rounded transition-colors"><Download className="w-3.5 h-3.5" /></button>
                 </div>
               </div>
               <div className="flex-1 overflow-auto bg-white">
@@ -952,24 +1927,110 @@ function ChatView({
                 <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3 flex items-center gap-1.5">
                   <Paperclip className="w-3.5 h-3.5" /> Attached Context
                 </h3>
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className="mb-3 w-full py-2 border border-dashed border-gray-300 rounded-xl text-xs text-gray-500 hover:border-indigo-300 hover:text-indigo-500 transition-colors bg-white"
+                >
+                  + Attach files
+                </button>
+                <button
+                  onClick={handleAttachResource}
+                  className="mb-3 w-full py-2 border border-dashed border-gray-300 rounded-xl text-xs text-gray-500 hover:border-indigo-300 hover:text-indigo-500 transition-colors bg-white"
+                >
+                  + Attach link/resource
+                </button>
+                {showUrlComposer && (
+                  <div className="mb-3 rounded-xl border border-indigo-200 bg-indigo-50/50 p-3 space-y-2">
+                    <div className="text-xs text-indigo-900 font-medium">Attach web pages or videos</div>
+                    <div className="text-[11px] text-indigo-700">
+                      Paste one or multiple URLs. Use one per line, or separate multiple URLs with spaces or commas.
+                    </div>
+                    <textarea
+                      value={urlDraft}
+                      onChange={(e) => setUrlDraft(e.target.value)}
+                      placeholder="https://example.com/article
+https://www.youtube.com/watch?v=..."
+                      className="w-full min-h-[88px] rounded-lg border border-indigo-200 bg-white p-2 text-xs text-gray-700 focus:outline-none focus:ring-2 focus:ring-indigo-200"
+                    />
+                    <div className="flex items-center justify-end gap-2">
+                      <button
+                        onClick={() => { setShowUrlComposer(false); setUrlDraft(''); }}
+                        className="px-2.5 py-1 rounded-lg border border-gray-300 text-[11px] text-gray-600 hover:bg-gray-50"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={submitAttachResources}
+                        className="px-2.5 py-1 rounded-lg bg-indigo-600 text-[11px] text-white hover:bg-indigo-500"
+                      >
+                        Add URLs
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {attachedFiles.length > 0 ? (
                   <div className="space-y-1.5">
                     {attachedFiles.map((file, idx) => (
-                      <div key={idx} className="flex items-center gap-2 p-2.5 bg-white border border-gray-200 rounded-xl group hover:border-indigo-200 transition-colors">
-                        <FileText className="w-4 h-4 text-indigo-500 shrink-0" />
-                        <span className="text-xs text-gray-700 flex-1 truncate">{file.name}</span>
-                        <button onClick={e => { e.stopPropagation(); setAttachedFiles(prev => prev.filter((_, i) => i !== idx)); }}
-                          className="p-1 hover:bg-red-50 text-gray-300 hover:text-red-500 rounded transition-colors opacity-0 group-hover:opacity-100">
-                          <X className="w-3 h-3" />
-                        </button>
+                      <div key={file.id || idx} className="p-2.5 bg-white border border-gray-200 rounded-xl group hover:border-indigo-200 transition-colors">
+                        <div className="flex items-center gap-2">
+                          {/youtube/i.test(file.resourceType || '') || /(youtube\.com|youtu\.be)/i.test(file.sourceUrl || '') ? (
+                            <CirclePlay className="w-4 h-4 text-red-500 shrink-0" />
+                          ) : file.sourceUrl ? (
+                            <Globe className="w-4 h-4 text-sky-500 shrink-0" />
+                          ) : (
+                            <FileText className="w-4 h-4 text-indigo-500 shrink-0" />
+                          )}
+                          <div className="min-w-0 flex-1">
+                            <div className="text-xs text-gray-700 truncate">{file.displayTitle || file.name}</div>
+                            {file.sourceUrl && (
+                              <a
+                                href={file.sourceUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center gap-1 text-[10px] text-indigo-600 hover:text-indigo-700 truncate max-w-full"
+                              >
+                                <Link2 className="w-2.5 h-2.5 shrink-0" />
+                                <span className="truncate">{file.sourceUrl}</span>
+                              </a>
+                            )}
+                            {file.snapshot && (
+                              <div
+                                className="mt-1 text-[10px] text-gray-500 whitespace-pre-wrap overflow-hidden"
+                                style={{ display: '-webkit-box', WebkitLineClamp: 4, WebkitBoxOrient: 'vertical' }}
+                              >
+                                {file.snapshot}
+                              </div>
+                            )}
+                          </div>
+                          {file.status === 'processing' ? (
+                            <div className="px-1.5 py-0.5 rounded border border-indigo-200 text-[10px] text-indigo-600 inline-flex items-center gap-1">
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                              Processing
+                            </div>
+                          ) : file.url ? (
+                            <a
+                              href={file.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="px-1.5 py-0.5 rounded border border-indigo-200 text-[10px] text-indigo-600 hover:bg-indigo-50"
+                            >
+                              Open
+                            </a>
+                          ) : (
+                            <span className="px-1.5 py-0.5 rounded border border-red-200 text-[10px] text-red-600">Failed</span>
+                          )}
+                          <button onClick={e => { e.stopPropagation(); void removeAttachedFile(file); }}
+                            className="p-1 hover:bg-red-50 text-gray-300 hover:text-red-500 rounded transition-colors opacity-0 group-hover:opacity-100">
+                            <X className="w-3 h-3" />
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>
                 ) : (
-                  <button onClick={() => fileInputRef.current?.click()}
-                    className="w-full py-4 border-2 border-dashed border-gray-200 rounded-xl text-xs text-gray-400 hover:border-indigo-300 hover:text-indigo-500 transition-colors">
-                    + Attach files
-                  </button>
+                  <div className="py-4 border-2 border-dashed border-gray-200 rounded-xl text-xs text-gray-400 text-center bg-white">
+                    No files attached yet
+                  </div>
                 )}
               </section>
               <section>
@@ -995,14 +2056,45 @@ function ChatView({
 
 // ─── Root page ────────────────────────────────────────────────────────────────
 
-export default function ChatAgentPage() {
+export function AiAgentWorkspace({ siteKey = 'default', apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || '/api/v1', agentApiUrl = process.env.NEXT_PUBLIC_AGENT_API_URL || 'http://localhost:8000', embedded = false }: AiAgentWorkspaceProps) {
+  const uiConfig = SITE_AGENT_CONFIG[siteKey] ?? SITE_AGENT_CONFIG.default;
   const [view, setView] = useState<'list' | 'chat'>('list');
   const [pendingGoal, setPendingGoal] = useState<string | undefined>();
+  const [selectedTaskId, setSelectedTaskId] = useState<string | undefined>();
 
-  const startNew = () => { setPendingGoal(undefined); setView('chat'); };
-  const openSession = (session: Session) => { setPendingGoal(session.goal); setView('chat'); };
-  const goBack = () => { setPendingGoal(undefined); setView('list'); };
+  const startNew = () => {
+    setPendingGoal(undefined);
+    setSelectedTaskId(undefined);
+    setView('chat');
+  };
+  const openSession = (session: Session) => {
+    setPendingGoal(session.goal);
+    setSelectedTaskId(session.task_id);
+    setView('chat');
+  };
+  const goBack = () => {
+    setPendingGoal(undefined);
+    setSelectedTaskId(undefined);
+    setView('list');
+  };
 
-  if (view === 'chat') return <ChatView onBack={goBack} initialGoal={pendingGoal} />;
-  return <SessionList onNew={startNew} onSelect={openSession} />;
+  if (view === 'chat') {
+    return (
+      <ChatView
+        onBack={goBack}
+        taskId={selectedTaskId}
+        initialGoal={pendingGoal}
+        uiConfig={uiConfig}
+        apiBaseUrl={apiBaseUrl}
+        agentApiUrl={agentApiUrl}
+        embedded={embedded}
+      />
+    );
+  }
+  return <SessionList onNew={startNew} onSelect={openSession} uiConfig={uiConfig} apiBaseUrl={apiBaseUrl}
+        agentApiUrl={agentApiUrl} embedded={embedded} />;
+}
+
+export default function ChatAgentPage() {
+  return <AiAgentWorkspace />;
 }

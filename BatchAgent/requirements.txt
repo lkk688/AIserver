@@ -1,0 +1,4 @@
+python-jose[cryptography]
+beautifulsoup4
+markdownify
+python-multipart

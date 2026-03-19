@@ -110,6 +110,12 @@ OBSERVATION_TOOLS = [
             "branch_id": {"type": "string", "description": "The ID of the branch you want to inspect."}
         },
         "required": ["branch_id"]
+    },
+    {
+        "name": "get_document_overview",
+        "description": "Get the structural overview (table of contents with section IDs) of a loaded PDF document. Use this to understand the document structure before searching or reading specific sections.",
+        "properties": {},
+        "required": []
     }
 ]
 

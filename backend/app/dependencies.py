@@ -15,10 +15,13 @@ from backend.app.services.indexing import IndexingService
 from backend.app.services.search import SearchService
 from backend.app.services.jobs import JobRunner
 import os
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[2]
 
 @lru_cache
 def get_config() -> AppConfig:
-    config_path = os.getenv("APP_CONFIG_PATH", "backend/config.yaml")
+    config_path = os.getenv("APP_CONFIG_PATH", str(_ROOT / "backend" / "config.yaml"))
     return load_config(config_path)
 
 def get_metadata_store(config: Annotated[AppConfig, Depends(get_config)] = None) -> MetadataStore:

@@ -29,3 +29,4 @@ yolov8n.pt
 Audio/vibevoice
 artifacts/
 agent_workspace/
+BatchAgent/document_agent/.ia_phase1_data

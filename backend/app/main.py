@@ -1,3 +1,9 @@
+import sys
+from pathlib import Path
+_ROOT = Path(__file__).resolve().parents[2]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,7 +12,7 @@ from backend.app.dependencies import get_job_runner
 import os
 
 # Determine config path, default to relative path from where uvicorn is run (usually root)
-config_path = os.getenv("APP_CONFIG_PATH", "backend/config.yaml")
+config_path = os.getenv("APP_CONFIG_PATH", str(_ROOT / "backend" / "config.yaml"))
 
 try:
     config = load_config(config_path)
@@ -39,7 +45,7 @@ def health_check():
 
 from backend.app.api.routers import router as api_router
 from backend.app.api.llm_router import router as llm_router
-from BatchAgent.agent_service import router as agent_router
+from BatchAgent.agent_route_fastapi import router as agent_router
 
 app.include_router(api_router, prefix="/api/v1")
 app.include_router(llm_router, prefix="/api/v1")
