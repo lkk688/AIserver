@@ -2,3 +2,9 @@ python-jose[cryptography]
 beautifulsoup4
 markdownify
 python-multipart
+pymupdf
+pdfplumber
+python-docx
+pypdf
+ftfy
+markdownify

@@ -116,38 +116,127 @@ def run_shell(
     cmd: str,
     cwd: Optional[str] = None,
     cap: int = 20000,
-    timeout: Optional[int] = 1200,
+    timeout: Optional[int] = None,
     sandbox_container: Optional[str] = None,
 ) -> Tuple[int, str]:
+    """
+    Run a shell command with streaming output and a dynamic timeout.
+
+    Timeout semantics
+    -----------------
+    * ``timeout=None``  → start with a 60 s soft deadline; every time the
+      process emits a line of output the deadline is pushed forward by
+      another 60 s (i.e. "alive as long as it is making progress").  A hard
+      cap of 1 200 s (20 min) prevents runaway jobs.  If the process produces
+      *no output at all* for 30 s straight it is killed (catches GUI windows
+      blocking on ``plt.show()`` etc.).
+    * ``timeout=N``     → fixed hard limit of N seconds, no auto-extension.
+
+    Environment extras
+    ------------------
+    ``MPLBACKEND=Agg`` and ``MPLBACKEND`` are injected so that matplotlib
+    scripts never try to open a display window.
+    """
+    import select
+
     if sandbox_container:
-        if cwd:
-            cmd_to_run = f'docker exec -i -w "{cwd}" {sandbox_container} /bin/bash -c {cmd!r}'
-        else:
-            cmd_to_run = f'docker exec -i {sandbox_container} /bin/bash -c {cmd!r}'
+        cmd_to_run = (
+            f'docker exec -i -w "{cwd}" {sandbox_container} /bin/bash -c {cmd!r}'
+            if cwd
+            else f'docker exec -i {sandbox_container} /bin/bash -c {cmd!r}'
+        )
+        run_cwd = None
     else:
         cmd_to_run = cmd
+        run_cwd = cwd if not sandbox_container else None
+
+    # Force non-interactive / headless matplotlib so plt.show() never blocks.
+    env = dict(os.environ)
+    env["MPLBACKEND"] = "Agg"
+    env["MPLBACKEND"] = env.get("MPLBACKEND", "Agg")   # keep if already set to something else
+    env["DISPLAY"] = env.get("DISPLAY", "")
+
+    fixed_timeout = timeout is not None
+    soft_window   = 60        # extend deadline by this many seconds on each output line
+    no_out_kill   = 30        # kill if no output at all for this many seconds
+    hard_cap      = 1200      # absolute maximum regardless of activity
+    deadline      = time.time() + (timeout if fixed_timeout else soft_window)
+    hard_deadline = time.time() + hard_cap
 
     start_time = time.time()
+    lines: List[str] = []
+    code = 1
+
     try:
-        p = subprocess.run(
+        proc = subprocess.Popen(
             cmd_to_run,
             shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            capture_output=True,
-            cwd=cwd if not sandbox_container else None,
-            timeout=timeout,
+            cwd=run_cwd,
+            env=env,
+            bufsize=1,
         )
-        code = p.returncode
-        out = (p.stdout or "") + (p.stderr or "")
-    except subprocess.TimeoutExpired as e:
-        code = 124
-        out = (e.stdout or "") + (e.stderr or "")
-        out += f"\n[Error] Command timed out after {timeout} seconds!"
-    except Exception as e:
+
+        last_output_time = time.time()
+
+        while True:
+            now = time.time()
+
+            # Hard cap
+            if now >= hard_deadline:
+                proc.kill()
+                lines.append(f"\n[Error] Hard cap reached after {hard_cap}s — killed.")
+                break
+
+            # Fixed or dynamic deadline
+            if fixed_timeout and now >= deadline:
+                proc.kill()
+                lines.append(f"\n[Error] Command timed out after {timeout}s.")
+                break
+
+            # Readable?
+            r, _, _ = select.select([proc.stdout], [], [], 0.1)
+            if r:
+                line = proc.stdout.readline()
+                if line:
+                    lines.append(line)
+                    last_output_time = now
+                    if not fixed_timeout:
+                        # Push the soft deadline forward — process is alive & working
+                        deadline = min(hard_deadline, now + soft_window)
+                elif proc.poll() is not None:
+                    # EOF — drain any remaining bytes
+                    rest = proc.stdout.read()
+                    if rest:
+                        lines.append(rest)
+                    break
+            elif proc.poll() is not None:
+                rest = proc.stdout.read()
+                if rest:
+                    lines.append(rest)
+                break
+            elif not fixed_timeout and (now - last_output_time) >= no_out_kill:
+                proc.kill()
+                lines.append(
+                    f"\n[Error] No output for {no_out_kill}s — process killed "
+                    f"(possible GUI block or infinite wait)."
+                )
+                break
+
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        code = proc.returncode if proc.returncode is not None else 1
+
+    except Exception as exc:
         code = 1
-        out = f"[Error] Failed to execute command: {e}"
+        lines.append(f"[Error] Failed to execute command: {exc}")
 
     elapsed = time.time() - start_time
+    out = "".join(lines)
     out += f"\n[Execution Time: {elapsed:.2f}s]"
 
     if len(out) > cap:
@@ -545,22 +634,81 @@ view_file_content = read_file_chunk
 
 
 def list_directory(dir_path: str = ".") -> str:
+    """
+    Return a compact recursive tree of *dir_path* so the model can see the
+    full workspace layout in a single call.
+
+    Design choices
+    --------------
+    * Depth up to 3 levels (enough to see sub-packages without drowning in
+      deep build artefacts).
+    * At most 10 files shown per directory; a "… N more" line summarises the
+      rest so large output directories stay readable.
+    * Noisy system directories (.git, __pycache__, node_modules, .venv, …)
+      are skipped entirely.
+    * File sizes are shown for quick assessment (KB / MB).
+    """
+    _MAX_DEPTH       = 3
+    _MAX_FILES_DIR   = 10
+    _SKIP_DIRS: Set[str] = {
+        ".git", "__pycache__", ".mypy_cache", ".pytest_cache",
+        "node_modules", ".venv", "venv", ".tox", "dist", "build",
+        ".eggs", "*.egg-info",
+    }
+
     try:
         target_dir = Path(dir_path).resolve()
         if not target_dir.exists() or not target_dir.is_dir():
             return f"[Error] Directory not found or not a directory: {dir_path}"
 
-        result = subprocess.run(
-            ["ls", "-la", str(target_dir)],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-        return f"[Error] ls failed: {result.stderr.strip()}"
-    except Exception as e:
-        return f"[Error] Failed to list directory {dir_path}: {e}"
+        lines: List[str] = [str(target_dir) + "/"]
+
+        def _size_str(p: Path) -> str:
+            try:
+                sz = p.stat().st_size
+                if sz >= 1_048_576:
+                    return f"  ({sz / 1_048_576:.1f} MB)"
+                if sz >= 1_024:
+                    return f"  ({sz / 1_024:.0f} KB)"
+                return f"  ({sz} B)"
+            except OSError:
+                return ""
+
+        def _render(path: Path, prefix: str, depth: int) -> None:
+            if depth > _MAX_DEPTH:
+                return
+            try:
+                entries = sorted(path.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
+            except PermissionError:
+                return
+
+            dirs  = [e for e in entries if e.is_dir()  and e.name not in _SKIP_DIRS
+                     and not any(e.name.endswith(s.lstrip("*")) for s in _SKIP_DIRS if "*" in s)]
+            files = [e for e in entries if e.is_file()]
+
+            shown_files   = files[:_MAX_FILES_DIR]
+            hidden_count  = len(files) - len(shown_files)
+            all_shown     = dirs + shown_files
+
+            for i, entry in enumerate(all_shown):
+                is_last = (i == len(all_shown) - 1) and (hidden_count == 0)
+                connector = "└── " if is_last else "├── "
+                child_prefix = prefix + ("    " if is_last else "│   ")
+
+                if entry.is_dir():
+                    lines.append(f"{prefix}{connector}📁 {entry.name}/")
+                    _render(entry, child_prefix, depth + 1)
+                else:
+                    lines.append(f"{prefix}{connector}{entry.name}{_size_str(entry)}")
+
+            if hidden_count > 0:
+                lines.append(f"{prefix}└── … {hidden_count} more file(s)")
+
+        _render(target_dir, "", 0)
+        return "\n".join(lines)
+
+    except Exception as exc:
+        return f"[Error] Failed to list directory {dir_path}: {exc}"
 
 
 # =============================================================================

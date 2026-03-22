@@ -714,4 +714,6 @@ python3 BatchAgent/batch_eval_v2.py \
 
 
 python3 BatchAgent/batch_eval_v2.py --tool-strategy native_all --verbose
+
+python3 BatchAgent/batch_eval_v2.py --model qwen-35b --base-url http://127.0.0.1:8000/v1 --api-key "myhpcvllmqwen101" --tool-strategy native_all --verbose
 """

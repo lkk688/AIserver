@@ -93,7 +93,8 @@ class AgentConfig:
     enable_thinking: bool = True
 
     # ── Context / output ───────────────────────────────────────────────────────
-    max_context: int = 16384
+    # Sensible fallback; overridden at runtime by detected_ctx / CLI args.
+    max_context: int = 32768
     max_output: int = 4096
 
     # ── Directories ────────────────────────────────────────────────────────────
@@ -610,9 +611,17 @@ class UniversalAgent:
                 f"(est {estimated}/{max_ctx}, {estimated * 100 // max_ctx}%).[/dim]"
             )
 
-        if len(self.messages) > 12:
+        # Scale sliding-window depth with available context.
+        # 16384 is the *reference* baseline (not a cap); formula yields:
+        #   16k → 10 turns  |  32k → 14  |  65k → 20  |  128k → 28  |  256k+ → 30
+        _ctx = self.config.max_context
+        _window = max(10, min(30, int(10 * (_ctx / 16384) ** 0.5)))
+        # Summary token budget: ~6% of context, between 500 and 4096 tokens.
+        _summary_tokens = max(500, min(4096, _ctx // 16))
+
+        if len(self.messages) > max(8, _window - 2):
             if getattr(self.config, "memory_strategy", "sliding_window") == "summarize":
-                msgs_to_compress = self.messages[2:-10]
+                msgs_to_compress = self.messages[2:-_window]
                 text = "\n\n".join(
                     f"Role: {m['role']}\n{m['content']}" for m in msgs_to_compress
                 )
@@ -630,7 +639,7 @@ class UniversalAgent:
                         model=self.config.model,
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0.1,
-                        max_output_tokens=1000,
+                        max_output_tokens=_summary_tokens,
                         model_max_context=self.config.max_context,
                         provider=self.config.provider,
                         stream=False,
@@ -649,15 +658,15 @@ class UniversalAgent:
                     }
                     self.messages = (
                         [self.messages[0], self.messages[1], compressed]
-                        + self.messages[2:][-10:]
+                        + self.messages[2:][-_window:]
                     )
                     console.print("[dim]🧹 Memory compressed via LLM summarization.[/dim]")
                 except Exception as e:
                     console.print(f"[red]Memory summarization failed ({e}), using sliding window.[/red]")
-                    self.messages = [self.messages[0], self.messages[1]] + self.messages[2:][-10:]
+                    self.messages = [self.messages[0], self.messages[1]] + self.messages[2:][-_window:]
             else:
-                self.messages = [self.messages[0], self.messages[1]] + self.messages[2:][-10:]
-                console.print("[dim]🧹 Sliding-window prune: kept last 10 turns.[/dim]")
+                self.messages = [self.messages[0], self.messages[1]] + self.messages[2:][-_window:]
+                console.print(f"[dim]🧹 Sliding-window prune: kept last {_window} turns.[/dim]")
 
         return headroom
 
@@ -693,7 +702,7 @@ class UniversalAgent:
                 model=self.config.model,
                 messages=bs_messages,
                 temperature=temp,
-                max_output_tokens=1024,
+                max_output_tokens=min(2048, self.config.max_output // 2),
                 model_max_context=self.config.max_context,
                 provider=self.config.provider,
                 stream=False,
@@ -781,18 +790,54 @@ class UniversalAgent:
         else:
             console.print(f"[bold red]❌ Verification failed (exit={code})[/bold red]")
             smart_error = build_debug_prompt(out, root_dir=str(self.config.workspace_dir))
+
+            # Extract the error line number and inject that code region so the
+            # model can patch immediately — without needing to re-read the file.
+            context_snippet = ""
+            written_py = [
+                a for a in mutation_actions
+                if hasattr(a, "path") and str(a.path).endswith(".py")
+            ]
+            if written_py:
+                # Find the first line-number reference in the traceback
+                line_match = re.search(r"line (\d+)", out)
+                error_line = int(line_match.group(1)) if line_match else None
+                try:
+                    src_path = Path(written_py[0].path)
+                    if not src_path.is_absolute():
+                        src_path = self.config.workspace_dir / src_path
+                    lines = src_path.read_text(encoding="utf-8").splitlines()
+                    if error_line:
+                        lo = max(0, error_line - 20)
+                        hi = min(len(lines), error_line + 10)
+                    else:
+                        lo, hi = 0, min(60, len(lines))
+                    numbered = "\n".join(
+                        f"{lo + i + 1:4d} | {l}" for i, l in enumerate(lines[lo:hi])
+                    )
+                    context_snippet = (
+                        f"\n## Relevant Code (lines {lo+1}–{hi})\n"
+                        f"```python\n{numbered}\n```\n"
+                        "Use `search_and_replace` or `write_file` to fix the lines above. "
+                        "**Do NOT read the file again** — the content is shown here.\n"
+                    )
+                except Exception:
+                    pass
+
             return (
                 f"⚠️ [Verification Failed] Exit {code}\n"
-                f"Command: {verify_cmd}\n{smart_error}\n\n"
+                f"Command: {verify_cmd}\n{smart_error}\n"
+                f"{context_snippet}\n"
                 "# Debug Task\n"
-                "The file was written but execution failed. **You MUST fix the bug.**\n\n"
+                "The file was written but execution failed. **You MUST fix the bug NOW.**\n\n"
                 "**Required steps:**\n"
-                "1. Read the error traceback above carefully.\n"
-                "2. If it is a syntax error: rewrite the broken function or the whole file "
-                "with `write_file` or `search_and_replace`.\n"
-                "3. If it is a runtime error: trace which line failed and patch it.\n"
-                "4. Do NOT call `finish_task` until the script exits 0.\n"
-                "5. Do NOT stop iterating — keep fixing until verification passes.\n"
+                "1. Read the error traceback above carefully — the broken code is shown.\n"
+                "2. Syntax error → use `search_and_replace` to fix just the bad lines, "
+                "or `write_file` to rewrite the entire file.\n"
+                "3. Runtime error → trace the failing line and patch it with "
+                "`search_and_replace`.\n"
+                "4. Do NOT call `read_file_chunk` — the relevant code is already above.\n"
+                "5. Do NOT call `finish_task` until verification passes (exit 0).\n"
             )
 
     # ------------------------------------------------------------------
@@ -1566,7 +1611,8 @@ async def main_async() -> None:
     parser.add_argument("--sandbox", default=None)
     parser.add_argument("--require-approval", action="store_true")
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--max-context", type=int, default=16384)
+    parser.add_argument("--max-context", type=int, default=0,
+                        help="Override detected context window (0 = auto-detect)")
     parser.add_argument("--domain", default="general",
                         choices=["general", "medical", "academic", "news",
                                  "software_eng", "math", "science", "language",
@@ -1619,8 +1665,12 @@ async def main_async() -> None:
             client, args.provider, args.model, args.max_context
         )
 
+    # Scale max_output proportionally to the detected context window.
+    # 4096 is suitable for 16k contexts; scale linearly, cap at 32768.
+    detected_max_output = min(32768, max(4096, (detected_ctx // 4)))
+
     console.print(f"[green]✔ API Connected[/green]")
-    console.print(f"[green]✔ Context: {detected_ctx} tokens[/green]")
+    console.print(f"[green]✔ Context: {detected_ctx} tokens  /  max_output: {detected_max_output}[/green]")
     console.print(f"[green]✔ Workspace: {workspace_dir}[/green]")
     console.print(f"[green]✔ Embedding: {args.embedding_base_url} / {args.embedding_model}[/green]")
     if args.sandbox:
@@ -1636,7 +1686,7 @@ async def main_async() -> None:
         temperature=0.1,
         backend=args.backend,
         max_context=detected_ctx,
-        max_output=4096,
+        max_output=detected_max_output,
         session_dir=session_dir,
         workspace_dir=workspace_dir,
         agent_dir=agent_dir,
@@ -1737,6 +1787,9 @@ if __name__ == "__main__":
 Example usage:
 
 python BatchAgent/agent_main_v2.py --tool-strategy native_all --verbose
+
+python BatchAgent/agent_main_v2.py --model "qwen-35b" --base-url "http://127.0.0.1:8000/v1" --api-key "myhpcvllmqwen101" --tool-strategy native_all --verbose
+
 
 python BatchAgent/agent_main_v2.py --provider anthropic \\
   --model claude-3-5-sonnet-20241022 --tool-strategy native_all

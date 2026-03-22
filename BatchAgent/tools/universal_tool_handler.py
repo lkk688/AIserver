@@ -294,14 +294,12 @@ class MutationManager:
         Behavior
         --------
         1. Try resolving against the allowlist.
-        2. If unresolved, fall back to CWD / basename.
-        3. If a session_dir exists, the write would land in workspace root, AND the
-           path was NOT explicitly listed in the allowlist, redirect to session_dir
-           so general agent outputs are grouped with the session.
+        2. If unresolved, fall back to CWD / basename of the requested path.
 
-        Rule 3 intentionally does NOT redirect files that are explicitly allowlisted
-        (e.g., a specific output file like ``task.py``).  Those must stay exactly
-        where the caller specified them.
+        The model's path is always honoured — no silent redirects to session_dir.
+        Redirecting would cause the verification command (which runs from CWD) to
+        fail with "No such file or directory" because the file was moved somewhere
+        the model never intended.
         """
         target_path = resolve_path(requested_path, self.ctx.allowlist)
 
@@ -309,27 +307,8 @@ class MutationManager:
             filename = Path(requested_path).name or "output.md"
             target_path = Path.cwd() / filename
             console.print(
-                f"[yellow]Path '{requested_path}' unresolvable — redirecting to {target_path.name}[/yellow]"
+                f"[yellow]Path '{requested_path}' unresolvable — writing to {target_path}[/yellow]"
             )
-
-        session_dir = getattr(self.ctx.config, "session_dir", None)
-        if session_dir:
-            workspace_dir = Path.cwd().resolve()
-            try:
-                # Only redirect if the resolved target is NOT explicitly in the
-                # caller-supplied allowlist.  Allowlisted paths must not be moved.
-                explicitly_allowed = any(
-                    Path(a).resolve() == target_path.resolve()
-                    for a in (self.ctx.allowlist or [])
-                )
-                if (
-                    not explicitly_allowed
-                    and target_path.parent.resolve() == workspace_dir
-                ):
-                    target_path = Path(session_dir) / target_path.name
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
 
         return target_path
 

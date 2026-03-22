@@ -340,39 +340,96 @@ def ensure_dirs(base_dir: Path):
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text("", encoding="utf-8")
 
-def run_shell(cmd: str, cwd: Optional[str] = None, cap: int = 20000, 
-              timeout: Optional[int] = 1200, sandbox_container: Optional[str] = None) -> Tuple[int, str]:
+def run_shell(cmd: str, cwd: Optional[str] = None, cap: int = 20000,
+              timeout: Optional[int] = None, sandbox_container: Optional[str] = None) -> Tuple[int, str]:
+    """
+    Streaming shell runner with dynamic timeout.
+
+    * timeout=None  – soft 60 s deadline, extended on each output line;
+                      killed after 30 s of silence (catches plt.show() etc.);
+                      hard cap 1200 s.
+    * timeout=N     – fixed hard limit of N seconds.
+    MPLBACKEND=Agg is always injected so matplotlib never opens a window.
+    """
+    import select
+
     if sandbox_container:
-        if cwd:
-            cmd_to_run = f'docker exec -i -w "{cwd}" {sandbox_container} /bin/bash -c {cmd!r}'
-        else:
-            cmd_to_run = f'docker exec -i {sandbox_container} /bin/bash -c {cmd!r}'
+        cmd_to_run = (
+            f'docker exec -i -w "{cwd}" {sandbox_container} /bin/bash -c {cmd!r}'
+            if cwd
+            else f'docker exec -i {sandbox_container} /bin/bash -c {cmd!r}'
+        )
+        run_cwd = None
     else:
         cmd_to_run = cmd
+        run_cwd = cwd
 
-    start_time = time.time()
+    env = dict(os.environ)
+    env["MPLBACKEND"] = "Agg"
+    env.setdefault("DISPLAY", "")
+
+    fixed_timeout  = timeout is not None
+    soft_window    = 60
+    no_out_kill    = 30
+    hard_cap       = 1200
+    start_time     = time.time()
+    deadline       = start_time + (timeout if fixed_timeout else soft_window)
+    hard_deadline  = start_time + hard_cap
+    last_out_time  = start_time
+    lines: List[str] = []
+    code = 1
+
     try:
-        p = subprocess.run(
-            cmd_to_run, 
-            shell=True, 
-            text=True, 
-            capture_output=True, 
-            cwd=cwd if not sandbox_container else None, 
-            timeout=timeout
+        proc = subprocess.Popen(
+            cmd_to_run, shell=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, cwd=run_cwd, env=env, bufsize=1,
         )
-        code = p.returncode
-        out = (p.stdout or "") + (p.stderr or "")
-    except subprocess.TimeoutExpired as e:
-        code = 124
-        out = (e.stdout or "") + (e.stderr or "")
-        out += f"\n[Error] Command timed out after {timeout} seconds!"
-    except Exception as e:
-        code = 1
-        out = f"[Error] Failed to execute command: {e}"
+        while True:
+            now = time.time()
+            if now >= hard_deadline:
+                proc.kill()
+                lines.append(f"\n[Error] Hard cap reached after {hard_cap}s — killed.")
+                break
+            if fixed_timeout and now >= deadline:
+                proc.kill()
+                lines.append(f"\n[Error] Command timed out after {timeout}s.")
+                break
+            r, _, _ = select.select([proc.stdout], [], [], 0.1)
+            if r:
+                line = proc.stdout.readline()
+                if line:
+                    lines.append(line)
+                    last_out_time = time.time()
+                    if not fixed_timeout:
+                        deadline = min(hard_deadline, time.time() + soft_window)
+                elif proc.poll() is not None:
+                    rest = proc.stdout.read()
+                    if rest:
+                        lines.append(rest)
+                    break
+            elif proc.poll() is not None:
+                rest = proc.stdout.read()
+                if rest:
+                    lines.append(rest)
+                break
+            elif not fixed_timeout and (time.time() - last_out_time) >= no_out_kill:
+                proc.kill()
+                lines.append(
+                    f"\n[Error] No output for {no_out_kill}s — killed "
+                    f"(possible GUI block or infinite wait)."
+                )
+                break
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        code = proc.returncode if proc.returncode is not None else 1
+    except Exception as exc:
+        lines.append(f"[Error] Failed to execute command: {exc}")
 
     elapsed = time.time() - start_time
-    out += f"\n[Execution Time: {elapsed:.2f}s]"
-
+    out = "".join(lines) + f"\n[Execution Time: {elapsed:.2f}s]"
     if len(out) > cap:
         out = out[-cap:]
     return code, out
