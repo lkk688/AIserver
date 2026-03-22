@@ -24,7 +24,7 @@ class AgentService:
         api_key: str,
         model: str,
         provider: str = "openai",
-        model_max_context: int = 16384,
+        model_max_context: int = 32768,
         max_output_tokens: int = 4096,
         tool_strategy: str = "hybrid",
         domain: str = "general",

@@ -783,9 +783,11 @@ class UniversalAgent:
             if self.config.verbose:
                 console.print(f"[dim]{out}[/dim]")
             return (
-                f"### Verification Result (Exit 0)\n```text\n{out}\n```\n"
-                "**System Prompt**: Script ran without crashing. Review the output against "
-                "the original goal. ONLY call `finish_task` if every requirement is met."
+                f"### ✅ Verification PASSED (exit 0)\n```text\n{out}\n```\n\n"
+                "**The script ran successfully.**\n"
+                "→ Call `finish_task` immediately.\n"
+                "→ Do NOT read, re-run, or rewrite the file — it already works.\n"
+                "→ Do NOT use run_bash_command or read_file_chunk after a passing verification.\n"
             )
         else:
             console.print(f"[bold red]❌ Verification failed (exit={code})[/bold red]")
