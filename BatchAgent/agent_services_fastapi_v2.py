@@ -7,10 +7,11 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
-from BatchAgent.agent_main import AgentConfig, UniversalAgent
+from BatchAgent.agent_main_v2 import AgentConfig, UniversalAgent
 from BatchAgent.mini_batch_agent_libs import ensure_dirs, now_stamp
-from BatchAgent.prompt_registry import PromptRegistry
-from BatchAgent.tools_registry import compile_tools_for_provider, get_base_tools
+from BatchAgent.prompt_registry_v2 import PromptRegistry
+from BatchAgent.tools.tools_registry import compile_tools_for_provider, get_base_tools
+from BatchAgent.tools.tool_registry_runtime import configure_global_tool_registry
 
 _cwd_lock = asyncio.Lock()
 
@@ -40,6 +41,23 @@ class AgentService:
         max_turns: int = 15,
         backend: str = "vllm",
         enable_thinking: bool = True,
+        # v2-only: OCR / document tools
+        ocr_server: str = "http://localhost:8002/v1",
+        ocr_model: str = "allenai/olmOCR-2-7B-1025-FP8",
+        ocr_workspace: str = "./output_old/tmp_ocr",
+        # v2-only: embedding for document RAG
+        embedding_base_url: str = "http://localhost:8081/v1",
+        embedding_api_key: str = "EMPTY",
+        embedding_model: str = "text-embeddings-inference",
+        # v2-only: registry feature flags
+        enable_memory: bool = False,
+        enable_web: bool = True,
+        enable_document: bool = True,
+        enable_code_tools: bool = True,
+        enable_mutation: bool = True,
+        enable_bash: bool = True,
+        enable_parallel: bool = False,
+        enable_meta: bool = True,
     ) -> None:
         self.base_url = base_url
         self.api_key = api_key
@@ -62,6 +80,21 @@ class AgentService:
         self.max_turns = max_turns
         self.backend = backend
         self.enable_thinking = enable_thinking
+        # v2-only fields
+        self.ocr_server = ocr_server
+        self.ocr_model = ocr_model
+        self.ocr_workspace = ocr_workspace
+        self.embedding_base_url = embedding_base_url
+        self.embedding_api_key = embedding_api_key
+        self.embedding_model = embedding_model
+        self.enable_memory = enable_memory
+        self.enable_web = enable_web
+        self.enable_document = enable_document
+        self.enable_code_tools = enable_code_tools
+        self.enable_mutation = enable_mutation
+        self.enable_bash = enable_bash
+        self.enable_parallel = enable_parallel
+        self.enable_meta = enable_meta
 
     def _build_client(self) -> Any:
         if self.provider == "anthropic":
@@ -76,11 +109,17 @@ class AgentService:
             http_client=httpx.AsyncClient(timeout=1200.0),
         )
 
-    def _build_task_prompt(self, goal: str, workspace_dir: Path) -> str:
+    def _build_task_prompt(
+        self, goal: str, workspace_dir: Path, allowlist: List[str]
+    ) -> str:
         def _content_injector(_: List[str]) -> str:
             return ""
 
-        return PromptRegistry.format_task(goal, [], [], workspace_dir.name, _content_injector)
+        # Pass the full absolute path (not just .name) and the allowlist so the
+        # agent sees its permitted output files in the task prompt.
+        return PromptRegistry.format_task(
+            goal, allowlist, [], str(workspace_dir), _content_injector
+        )
 
     async def _run_internal(
         self,
@@ -100,10 +139,49 @@ class AgentService:
 
         agent_dir = (workspace_dir / ".agent").resolve()
         ensure_dirs(agent_dir)
-        session_dir = Path(continue_session_dir).resolve() if continue_session_dir else (workspace_dir / now_stamp())
+        # Put sessions inside .agent/sessions/ so the timestamp folder does NOT
+        # appear in the workspace root where the agent writes its output files.
+        # If the agent sees "2026-03-21_234500/" in its working directory it gets
+        # confused, reads into it, and writes the output file there instead of "./"
+        sessions_root = agent_dir / "sessions"
+        sessions_root.mkdir(parents=True, exist_ok=True)
+        session_dir = (
+            Path(continue_session_dir).resolve()
+            if continue_session_dir
+            else (sessions_root / now_stamp())
+        )
         session_dir.mkdir(parents=True, exist_ok=True)
 
         client = self._build_client()
+
+        # Configure the global tool registry before building tools/prompt
+        configure_global_tool_registry(
+            strategy=self.tool_strategy,
+            profile=self.domain,
+            domain=self.domain,
+            enable_memory=self.enable_memory,
+            enable_web=self.enable_web,
+            enable_document=self.enable_document,
+            enable_code_tools=self.enable_code_tools,
+            enable_mutation=self.enable_mutation,
+            enable_bash=self.enable_bash,
+            enable_parallel=self.enable_parallel,
+            enable_meta=self.enable_meta,
+        )
+
+        base_tools = get_base_tools(strategy=self.tool_strategy, domain=self.domain)
+        compiled_tools = compile_tools_for_provider(
+            base_tools=base_tools,
+            provider=self.provider,
+            strategy=self.tool_strategy,
+        )
+        system_prompt = PromptRegistry.get_system_prompt(
+            strategy=self.tool_strategy,
+            base_tools_list=base_tools,
+            domain=self.domain,
+            location=self.location,
+            current_time=self.current_time,
+        )
 
         config = AgentConfig(
             client=client,
@@ -130,24 +208,16 @@ class AgentService:
             max_turns=self.max_turns,
             stream_callback=on_event,
             enable_thinking=self.enable_thinking,
-        )
-
-        base_tools = get_base_tools(strategy=self.tool_strategy)
-        compiled_tools = compile_tools_for_provider(
-            base_tools=base_tools,
-            provider=self.provider,
-            strategy=self.tool_strategy,
-        )
-        system_prompt = PromptRegistry.get_system_prompt(
-            strategy=self.tool_strategy,
-            base_tools_list=base_tools,
-            domain=self.domain,
-            location=self.location,
-            current_time=self.current_time,
+            ocr_server=self.ocr_server,
+            ocr_model=self.ocr_model,
+            ocr_workspace=self.ocr_workspace,
+            embedding_base_url=self.embedding_base_url,
+            embedding_api_key=self.embedding_api_key,
+            embedding_model=self.embedding_model,
         )
 
         agent = UniversalAgent(config=config, system_message=system_prompt, tools=compiled_tools)
-        task_prompt = self._build_task_prompt(goal, workspace_dir)
+        task_prompt = self._build_task_prompt(goal, workspace_dir, allowlist)
 
         prev_cwd = Path.cwd()
         async with _cwd_lock:

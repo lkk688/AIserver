@@ -1394,15 +1394,21 @@ def apply_write_files(
             norm_allowlist.add(str(Path(*parts[i:])))
     
     for filepath, content in actions:
-        # Normalize the filepath
-        clean_path = filepath.strip().lstrip('/')
-        
+        # Normalize the filepath — preserve absolute paths to avoid path doubling.
+        # When CWD is already workspace_dir, lstrip('/') on an absolute path like
+        # /workspace/report.md would make it relative and double the workspace prefix.
+        raw = filepath.strip()
+        if os.path.isabs(raw):
+            clean_path = raw          # keep absolute as-is
+        else:
+            clean_path = raw.lstrip('/')
+
         # Check if file is in allowlist (flexible matching)
         allowed = False
         for ap in norm_allowlist:
             ap_str = str(ap)
-            if (clean_path == ap_str or 
-                clean_path.endswith(ap_str) or 
+            if (clean_path == ap_str or
+                clean_path.endswith(ap_str) or
                 ap_str.endswith(clean_path) or
                 os.path.basename(clean_path) == ap_str):
                 allowed = True
@@ -1410,12 +1416,12 @@ def apply_write_files(
         # Also allow if no strict allowlist or auto mode
         if not norm_allowlist or not allowlist:
             allowed = True
-            
+
         if not allowed:
             log_parts.append(f"SKIPPED (not in allowlist): {filepath} (allowlist: {[str(a) for a in allowlist]})")
             console.print(f"[yellow]Skipping {filepath} — not in allowlist ({[str(a) for a in allowlist]})[/yellow]")
             continue
-        
+
         try:
             target = Path(clean_path)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -1516,11 +1522,21 @@ def resolve_path(raw_path: str, allowlist: List[str], root_dir: Path = Path(".")
     """
     Robustly resolves an LLM-generated path to a valid local file path.
     Prioritizes:
-    1. Exact match in allowlist.
-    2. Basename match in allowlist (e.g. '/abs/path/task.py' -> 'task.py').
-    3. Relative path from root_dir.
+    1. Absolute path that already resolves correctly (avoids path doubling).
+    2. Exact match in allowlist.
+    3. Basename match in allowlist (e.g. '/abs/path/task.py' -> 'task.py').
+    4. Relative path from root_dir.
     """
-    clean = raw_path.strip().strip("'").strip('"').replace("\\", "/")
+    original = raw_path.strip().strip("'").strip('"')
+    # Fast-path: if an absolute path is given and its parent already exists,
+    # return it directly — avoids the lstrip('/') doubling bug where
+    # /workspace/foo.md becomes workspace/foo.md relative to CWD=workspace.
+    if os.path.isabs(original):
+        abs_candidate = Path(original).resolve()
+        if abs_candidate.exists() or abs_candidate.parent.exists():
+            return abs_candidate
+
+    clean = original.replace("\\", "/")
     clean = re.sub(r"^\./+", "", clean)
     clean = clean.lstrip("/")
     if not clean:

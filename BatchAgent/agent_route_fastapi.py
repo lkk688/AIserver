@@ -795,6 +795,8 @@ class RunRequest(BaseModel):
     domain: str = "general"
     location: str = "California, United States"
     serper_api_key: str = Field(default_factory=lambda: os.environ.get("SERPER_API_KEY", ""))
+    tavily_api_key: str = Field(default_factory=lambda: os.environ.get("TAVILY_API_KEY", ""))
+    enable_youtube: bool = Field(False, description="Enable YouTube search (costs an extra Serper credit per call)")
     allowlist: List[str] = []
     temperature: float = Field(0.1, description="LLM temperature, lower is better for strict format")
     memory_strategy: str = Field("sliding_window", description="'sliding_window' or 'summarize'")
@@ -859,6 +861,8 @@ def _make_service(req: RunRequest) -> AgentService:
         output_dir=req.output_dir,
         verbose=req.verbose,
         serper_api_key=req.serper_api_key,
+        tavily_api_key=req.tavily_api_key,
+        enable_youtube=req.enable_youtube,
         temperature=req.temperature,
         memory_strategy=req.memory_strategy,
         enable_turn_limits=req.enable_turn_limits,

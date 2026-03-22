@@ -1,9 +1,8 @@
-
 services:
   vllm-qwen3:
-    build: 
+    build:
       context: ./vllm-custom
-    profiles: ["qwen", "all"]
+    profiles: ["qwen", "llm", "all"]
     container_name: vllm-qwen3
     env_file:
       - .env
@@ -11,8 +10,7 @@ services:
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
       - CUDA_LAUNCH_BLOCKING=1
-      - FLASHINFER_DISABLE_VERSION_CHECK=1   # Disable flashinfer version check to avoid potential startup issues
-      # 👇 add this line to disable V1, use the classic V0 engine
+      - FLASHINFER_DISABLE_VERSION_CHECK=1
       - VLLM_USE_V1=0
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
@@ -20,7 +18,7 @@ services:
       - "8001:8000"
     ipc: host
     entrypoint: /bin/sh
-    command: 
+    command:
       - -c
       - |
         exec python3 -m vllm.entrypoints.openai.api_server \
@@ -46,15 +44,92 @@ services:
               count: 1
               capabilities: [gpu]
 
+  vllm-olmocr:
+    build:
+      context: ./vllm-custom
+    profiles: ["ocr", "all"]
+    container_name: vllm-olmocr
+    env_file:
+      - .env
+      - olmocr_config.env
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - CUDA_LAUNCH_BLOCKING=1
+      - FLASHINFER_DISABLE_VERSION_CHECK=1
+      - VLLM_USE_V1=0
+      - OLMOCR_MODEL_NAME=allenai/olmOCR-2-7B-1025-FP8
+      - OLMOCR_GPU_MEMORY_UTILIZATION=0.70
+      - OLMOCR_MAX_MODEL_LEN=16384
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    ports:
+      - "8002:8000"
+    ipc: host
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        exec python3 -m vllm.entrypoints.openai.api_server \
+          --model $${OLMOCR_MODEL_NAME} \
+          --served-model-name $${OLMOCR_MODEL_NAME} \
+          --host 0.0.0.0 \
+          --port 8000 \
+          --gpu-memory-utilization $${OLMOCR_GPU_MEMORY_UTILIZATION} \
+          --max-model-len $${OLMOCR_MAX_MODEL_LEN} \
+          --trust-remote-code
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+
+  embedding-tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:cuda-1.9.1
+    profiles: ["embedding", "rag", "all"]
+    container_name: embedding-tei
+    environment:
+      - HF_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+    volumes:
+      - ~/.cache/huggingface:/data
+    ports:
+      - "8081:80"
+    shm_size: "1gb"
+    command:
+      - --model-id
+      - ${EMBEDDING_MODEL_ID:-Qwen/Qwen3-Embedding-0.6B}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:80/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
   litellm:
     image: ghcr.io/berriai/litellm:main-latest
-    profiles: ["litellm", "all", "audio", "cosyvoice"]
+    profiles: ["litellm", "gateway", "all"]
     container_name: litellm
     ports:
       - "4000:4000"
     volumes:
       - ./litellm_config.yaml:/app/config.yaml
-    command: [ "--config", "/app/config.yaml", "--port", "4000", "--num_workers", "8" ]
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "8"]
+    restart: unless-stopped
 
   audio-cosyvoice:
     build: ./Audio/cosyvoice
@@ -101,6 +176,7 @@ services:
 
   postgres:
     image: postgres:15-alpine
+    profiles: ["infra", "db", "rag", "all"]
     container_name: postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
@@ -119,6 +195,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    profiles: ["infra", "cache", "rag", "all"]
     container_name: redis
     volumes:
       - redis_data:/data
@@ -133,6 +210,7 @@ services:
 
   minio:
     image: minio/minio:latest
+    profiles: ["infra", "storage", "rag", "all"]
     container_name: minio
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
@@ -152,15 +230,20 @@ services:
 
   worker:
     build: ./Worker
+    profiles: ["worker", "rag", "all"]
     container_name: worker
     environment:
       POSTGRES_HOST: postgres
       REDIS_HOST: redis
       OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://embedding-tei:80}
+      EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-Qwen/Qwen3-Embedding-0.6B}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      embedding-tei:
         condition: service_healthy
     volumes:
       - ./Worker:/app
@@ -170,4 +253,3 @@ volumes:
   postgres_data:
   redis_data:
   minio_data:
-

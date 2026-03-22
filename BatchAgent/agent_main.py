@@ -30,7 +30,8 @@ from BatchAgent.mini_batch_agent_base import ActionApplyDiff, ActionToolCall, Ac
 from BatchAgent.tools_registry import get_base_tools, compile_tools_for_provider #get_active_tools
 from BatchAgent.prompt_registry import PromptRegistry
 
-from BatchAgent.domain_tools import DOMAIN_REGISTRY
+from BatchAgent.tools.domain_tools import DOMAIN_REGISTRY
+from BatchAgent.working_memory import WorkingMemory, handle_get_memory, handle_update_memory
 
 console = Console()
 
@@ -54,6 +55,8 @@ class AgentConfig:
     verbose: bool = False
     max_retries: int = 4
     serper_api_key: str = ""
+    tavily_api_key: str = ""
+    enable_youtube: bool = False  # When False, YouTube search is skipped (saves Serper credits)
     domain: str = "general"
     location: str = "California, United States"
     current_time: str = ""
@@ -69,7 +72,49 @@ class AgentConfig:
     # Optional: async token callback for SSE streaming (set by agent_service / API layer)
     stream_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
 # ==========================================
-# 3. Universal Agent Class (Single-Track ReAct)
+# 3. Tool-error helpers (module-level so they're accessible everywhere)
+# ==========================================
+_TOOL_ERROR_PATTERNS = (
+    "[Web Search Unavailable]",
+    "[Web Search Error]",
+    "Network Error during search",
+    "Search processing failed",
+    "System Error:",
+    "Exception:",
+    "[Tavily Unavailable]",
+)
+
+def _is_tool_error_result(result_str: str) -> bool:
+    return any(p in result_str for p in _TOOL_ERROR_PATTERNS)
+
+def _extract_tool_error_summary(result_str: str, max_len: int = 150) -> str:
+    m = re.search(r"```text\n(.*?)```", result_str, re.DOTALL)
+    text = m.group(1).strip() if m else result_str
+    return text[:max_len]
+
+# Regex that matches a [Working Memory Snapshot] block at the start of a user message,
+# up to (but not including) the next section heading or a blank line followed by content.
+# The snapshot block always ends before "### " (tool results) or the first non-snapshot line.
+_MEM_SNAPSHOT_RE = re.compile(
+    r'^\[Working Memory Snapshot\]\n.*?(?=\n\n### |\Z)',
+    re.DOTALL,
+)
+
+def _strip_snapshot(content: str) -> str:
+    """Remove the [Working Memory Snapshot] header block from a user message."""
+    stripped = _MEM_SNAPSHOT_RE.sub('', content, count=1).lstrip('\n')
+    return stripped if stripped.strip() else content  # safety: never return blank
+
+def _fmt_args(args: dict) -> str:
+    """Format tool args as 'key=value' pairs, truncated for readability in memory logs."""
+    parts = []
+    for k, v in (args or {}).items():
+        sv = str(v)
+        parts.append(f"{k}={sv[:35]!r}" if len(sv) <= 35 else f"{k}={sv[:32]!r}…")
+    return ", ".join(parts)
+
+# ==========================================
+# 4. Universal Agent Class (Single-Track ReAct)
 # ==========================================
 class UniversalAgent:
     """
@@ -81,10 +126,13 @@ class UniversalAgent:
         self.tools = tools
         self.messages: List[Dict[str, str]] = []
         self.rl_trajectory: List[Dict[str, str]] = []
-        
+
         # [NEW] dynamic tools
         self.dynamic_tools_schema: List[Dict[str, Any]] = []
         self.dynamic_tools_mapping: Dict[str, str] = {} # tool_name -> script_path
+
+        # [NEW] long-task working memory — initialised in execute_task
+        self.working_memory: Optional[WorkingMemory] = None
 
     def _log_rl(self, role: str, content: str):
         self.rl_trajectory.append({"role": role, "content": content})
@@ -103,43 +151,136 @@ class UniversalAgent:
         except Exception as e:
             console.print(f"[red]Failed to write RL trajectory log: {e}[/red]")
 
-    async def _execute_tools_concurrently(self, tool_actions: List[ActionToolCall], turn_dir: Path, allowlist: List[str]) -> str:
-        """Executes information-gathering tools concurrently."""
-        if not tool_actions: return ""
+    async def _execute_tools_concurrently(
+        self,
+        tool_actions: List[ActionToolCall],
+        turn_dir: Path,
+        allowlist: List[str],
+    ) -> tuple:
+        """
+        Executes information-gathering tools concurrently.
+        Returns (combined_result_str, per_action_errors: dict[action_index -> error_summary])
+        """
+        if not tool_actions:
+            return "", {}
         console.print(f"[cyan]🚀 Executing {len(tool_actions)} observation tools concurrently...[/cyan]")
-        
+
         handler = UniversalToolHandler(self.config, turn_dir, allowlist)
-        
+
         async def run_single_tool(action: ActionToolCall) -> str:
-            # Run in thread pool to prevent blocking the async loop
             _, result_str = await asyncio.to_thread(handler.execute, [action], "")
             return result_str
 
         tasks = [run_single_tool(action) for action in tool_actions]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+
         combined_results = []
-        for action, res in zip(tool_actions, results):
+        per_action_errors: dict = {}  # action_index -> error_summary
+
+        for idx, (action, res) in enumerate(zip(tool_actions, results)):
             if isinstance(res, Exception):
                 err = f"### Result for {action.name}\n```text\nException: {str(res)}\n```"
                 combined_results.append(err)
-                if self.config.verbose: console.print(f"[red]{err}[/red]")
+                per_action_errors[idx] = str(res)[:150]
+                if self.config.verbose:
+                    console.print(f"[red]{err}[/red]")
             else:
                 combined_results.append(res)
+                if _is_tool_error_result(res):
+                    per_action_errors[idx] = _extract_tool_error_summary(res)
                 if self.config.verbose:
-                    console.print(Panel(res[:500] + "..." if len(res)>500 else res, title=f"Tool Output: {action.name}", border_style="magenta"))
-                
-        return "\n\n".join(combined_results)
+                    console.print(Panel(
+                        res[:500] + "..." if len(res) > 500 else res,
+                        title=f"Tool Output: {action.name}",
+                        border_style="magenta",
+                    ))
+
+        return "\n\n".join(combined_results), per_action_errors
 
     
-    async def _prune_memory(self):
-        """Intelligent context window management avoiding context loss."""
+    def _clean_history_messages(self) -> None:
+        """
+        In-place cleanup of the message list before sending to the LLM:
+
+        1. Strip stale [Working Memory Snapshot] blocks from all user messages
+           except the most recent one (index -1). The snapshot is re-injected
+           fresh at the end of every turn, so older copies are pure wasted tokens.
+
+        2. Remove near-empty assistant turns (content that is blank after stripping
+           <think> tags). These arise from context-overflow turns where the model
+           produced nothing useful and double the noise in the history.
+        """
+        if len(self.messages) < 3:
+            return
+
+        # --- Pass 1: strip stale snapshots from older user messages ---
+        for msg in self.messages[:-1]:   # all except the latest (freshest) message
+            if msg.get('role') == 'user' and msg.get('content', '').startswith('[Working Memory Snapshot]'):
+                msg['content'] = _strip_snapshot(msg['content'])
+
+        # --- Pass 2: drop near-empty assistant messages from the middle of history ---
+        # Keep system (0) and user goal (1) unconditionally; filter the rest.
+        kept = [self.messages[0], self.messages[1]]
+        for msg in self.messages[2:]:
+            if msg.get('role') == 'assistant':
+                visible = re.sub(r'</?think[^>]*>', '', msg.get('content', ''), flags=re.DOTALL | re.IGNORECASE).strip()
+                if not visible:
+                    console.print("[dim]🧹 Dropped empty assistant turn from history.[/dim]")
+                    continue
+            kept.append(msg)
+        self.messages = kept
+
+    # Correction factor applied to the naive len//4 token estimate.
+    # Empirical measurement on technical PDF content: the LLM reports ~1.44× more tokens
+    # than the simple char-count heuristic produces.  Use 1.6 to stay safely conservative.
+    _TOKEN_ESTIMATE_CORRECTION = 1.6
+
+    async def _prune_memory(self) -> int:
+        """
+        Intelligent context window management.
+
+        Returns:
+            Estimated tokens remaining after pruning (corrected estimate).
+            Callers use this to inject write-pressure when context is tight.
+        """
+        # Always clean stale snapshots and empty assistant turns first.
+        self._clean_history_messages()
+
+        max_ctx = getattr(self.config, 'max_context', 16384)
+        # Apply correction factor: naive char/4 underestimates real token count.
+        raw_est = sum(estimate_tokens(m.get('content', '')) for m in self.messages)
+        estimated = int(raw_est * self._TOKEN_ESTIMATE_CORRECTION)
+        token_headroom = max_ctx - estimated
+
+        # Fire at 55 % usage to leave enough room for the model to generate
+        # a full write_file response (a 2-page summary can be 1–2 k tokens).
+        if token_headroom < max_ctx * 0.45:
+            console.print(
+                f"[yellow]⚠ Context budget low (~{estimated}/{max_ctx} corrected tokens, "
+                f"{estimated*100//max_ctx}% used). Forcing sliding-window prune.[/yellow]"
+            )
+            # Progressively shrink the tail window (6→4→2) until within budget.
+            # IMPORTANT: always slice from messages[2:] to avoid re-including
+            # messages[0] (system) and messages[1] (user goal) — duplicating them
+            # in the middle causes "System message must be at the beginning" errors.
+            for window in (6, 4, 2):
+                tail = self.messages[2:][-window:] if len(self.messages) > 2 else []
+                candidate = [self.messages[0], self.messages[1]] + tail
+                raw_est = sum(estimate_tokens(m.get('content', '')) for m in candidate)
+                estimated = int(raw_est * self._TOKEN_ESTIMATE_CORRECTION)
+                token_headroom = max_ctx - estimated
+                if token_headroom > 0 or window == 2:
+                    self.messages = candidate
+                    break
+            console.print(f"[dim]🧹 Sliding-window prune: kept {len(self.messages)} messages "
+                          f"(est {estimated}/{max_ctx}, {estimated*100//max_ctx}% used).[/dim]")
+
         if len(self.messages) > 12:
             if getattr(self.config, 'memory_strategy', 'sliding_window') == 'summarize':
                 # We need to compress messages from index 2 up to -10
                 msgs_to_compress = self.messages[2:-10]
                 text_to_compress = "\n\n".join([f"Role: {m['role']}\n{m['content']}" for m in msgs_to_compress])
-                
+
                 console.print("\n[magenta]🧠 Compress memory: Summarizing previous actions to preserve context...[/magenta]")
                 prompt = (
                     "Please concisely summarize the following sequence of actions, tool results, and findings. "
@@ -147,7 +288,7 @@ class UniversalAgent:
                     "Do NOT include conversational filler.\n\n"
                     f"{text_to_compress}"
                 )
-                
+
                 from BatchAgent.llm_wrapper import complete_with_async
                 try:
                     summary, _ = await complete_with_async(
@@ -156,21 +297,25 @@ class UniversalAgent:
                         temperature=0.1, max_output_tokens=1000,
                         stream=False, backend=self.config.backend, enable_thinking=False
                     )
-                    
+
                     compressed_msg = {
-                        "role": "user", 
+                        "role": "user",
                         "content": f"[SYSTEM: The following is a summary of earlier actions to preserve context]\n{summary}"
                     }
-                    self.messages = [self.messages[0], self.messages[1], compressed_msg] + self.messages[-10:]
+                    # Use messages[2:][-10:] (not messages[-10:]) to avoid overlap with head
+                    self.messages = [self.messages[0], self.messages[1], compressed_msg] + self.messages[2:][-10:]
                     console.print("[dim]🧹 Memory window gracefully compressed via LLM summarization.[/dim]")
                 except Exception as e:
                     console.print(f"[red]Failed to summarize memory ({e}), falling back to sliding window.[/red]")
-                    self.messages = [self.messages[0], self.messages[1]] + self.messages[-10:]
+                    self.messages = [self.messages[0], self.messages[1]] + self.messages[2:][-10:]
             else:
-                # Keep: System Prompt (0), User Goal (1)
-                # Keep: latest 10 messages
-                self.messages = [self.messages[0], self.messages[1]] + self.messages[-10:]
+                # Keep: System Prompt (0), User Goal (1), latest 10 from the rest
+                # Use messages[2:][-10:] (not messages[-10:]) to prevent duplicating
+                # system/goal when history has ≤12 messages total.
+                self.messages = [self.messages[0], self.messages[1]] + self.messages[2:][-10:]
                 console.print("[dim]🧹 Memory window gracefully pruned (kept last 10 turns).[/dim]")
+
+        return token_headroom
 
     async def _execute_batch_brainstorm(self, action: ActionToolCall, allowlist: List[str]) -> str:
         """
@@ -328,12 +473,21 @@ class UniversalAgent:
             self.messages = [{"role": "system", "content": self.system_message}]
             self._log_rl("system", self.system_message)
 
+        # ── Working Memory: initialise (or resume) ───────────────────────────
+        self.working_memory = WorkingMemory(
+            session_dir=self.config.session_dir,
+            goal=task_goal,
+        )
+        self.working_memory.update_memory({"control": {"status": "active", "stage": "planning"}})
+        console.print("[dim]🧠 Working memory initialised.[/dim]")
+
         MAX_REACT_TURNS = getattr(self.config, 'max_turns', 15)
         from BatchAgent.llm_wrapper import complete_with_continuation_async # Local import
 
         final_result_text = "Task aborted or failed."
         # Loop-detection: track (tool_name, arg_hash) fingerprints from last 3 turns
         _recent_fingerprints: list = []
+        _failed_fingerprints: dict = {}  # fingerprint -> error_summary for calls that returned errors
         _recent_mutation_fingerprints: list = []
         consecutive_json_parse_turns = 0
         last_write_only_signature = None
@@ -363,8 +517,11 @@ class UniversalAgent:
                 normalized_args = str(args)
             return (name, normalized_args)
 
+        max_ctx = getattr(self.config, 'max_context', 16384)
+        _write_pressure_injected: bool = False  # only inject write-pressure once
+
         for current_turn in range(MAX_REACT_TURNS):
-            await self._prune_memory()
+            ctx_headroom = await self._prune_memory()
             
             absolute_turn = start_turn_index + current_turn
             display_turn = absolute_turn + 1
@@ -372,14 +529,17 @@ class UniversalAgent:
             turn_dir.mkdir(parents=True, exist_ok=True)
 
             # ===============================================================
-            # [NEW] 1. complete Prompt for debug
+            # [NEW] 1. Save full LLM input context for debugging
             # ===============================================================
-            # (turn_dir / "full_prompt_context.json").write_text(
-            #     json.dumps(self.messages, indent=2, ensure_ascii=False), 
-            #     encoding="utf-8"
-            # )
-            # # Human readable version of the prompt for easier debugging
-            # (turn_dir / "latest_instruction.md").write_text(self.messages[-1]["content"], encoding="utf-8")
+            (turn_dir / "full_prompt_context.json").write_text(
+                json.dumps(self.messages, indent=2, ensure_ascii=False),
+                encoding="utf-8"
+            )
+            # Human-readable view of the last user message (most recent instruction)
+            if self.messages:
+                (turn_dir / "latest_instruction.md").write_text(
+                    self.messages[-1]["content"], encoding="utf-8"
+                )
             
             console.print(f"\n[bold yellow]>>> ReAct Turn {display_turn} / {MAX_REACT_TURNS}[/bold yellow]")
 
@@ -395,23 +555,35 @@ class UniversalAgent:
             current_user_prompt = prompt_md if current_turn == 0 else "" # Initial prompt is only for the first turn
             if self.config.enable_turn_limits:
                 current_user_prompt = f"[Current Turn: {display_turn} / Max Turns: {MAX_REACT_TURNS}]\n{current_user_prompt}"
-            
+
             if current_turn == 0:
                 self._log_rl("user", prompt_md)
                 self.messages.append({"role": "user", "content": current_user_prompt})
                 (turn_dir / "user_prompt.md").write_text(prompt_md, encoding="utf-8")
-            
+
             # --- 1. LLM Generation ---
-            content, actions = await complete_with_continuation_async(
-                client=self.config.client, model=self.config.model, messages=self.messages,
-                temperature=getattr(self.config, 'temperature', 0.1), max_output_tokens=self.config.max_output,
-                model_max_context=self.config.max_context, provider=self.config.provider,
-                stream=True, verbose=self.config.verbose, session_dir=self.config.session_dir,
-                tools=self.tools, tool_strategy=self.config.tool_strategy, allowlist=allowlist,
-                on_event=getattr(self.config, 'stream_callback', None),  # SSE forwarding hook
-                backend=getattr(self.config, 'backend', 'vllm'),
-                enable_thinking=getattr(self.config, 'enable_thinking', True)
-            )
+            # Spinner only when NOT in verbose mode: streaming tokens already show progress,
+            # and the spinner's Rich live-display conflicts with per-token console.print() calls.
+            _use_spinner = not self.config.verbose
+            async def _run_llm():
+                return await complete_with_continuation_async(
+                    client=self.config.client, model=self.config.model, messages=self.messages,
+                    temperature=getattr(self.config, 'temperature', 0.1), max_output_tokens=self.config.max_output,
+                    model_max_context=self.config.max_context, provider=self.config.provider,
+                    stream=True, verbose=self.config.verbose, session_dir=self.config.session_dir,
+                    tools=self.tools, tool_strategy=self.config.tool_strategy, allowlist=allowlist,
+                    on_event=getattr(self.config, 'stream_callback', None),  # SSE forwarding hook
+                    backend=getattr(self.config, 'backend', 'vllm'),
+                    enable_thinking=getattr(self.config, 'enable_thinking', True)
+                )
+            if _use_spinner:
+                with console.status(
+                    f"[yellow]Thinking... (Turn {display_turn}/{MAX_REACT_TURNS})",
+                    spinner="dots",
+                ):
+                    content, actions = await _run_llm()
+            else:
+                content, actions = await _run_llm()
             
             (turn_dir / "response.md").write_text(content, encoding="utf-8")
             self._log_rl("assistant", content)
@@ -435,7 +607,69 @@ class UniversalAgent:
             # --- 2. Check for Conclusion ---
             finish_task_action = next((a for a in actions if getattr(a, 'name', '') == 'finish_task'), None)
             if finish_task_action:
+                # Validate: reject finish_task if the task required writing a file but none exists.
+                _output_files = (
+                    self.working_memory.get_memory("artifacts").get("output_files", [])
+                    if self.working_memory else []
+                )
+                # Verify files listed in memory actually exist on disk
+                _confirmed_files = [f for f in _output_files if Path(f).exists()]
+
+                # Use memory stage to detect if writing was expected (more reliable than keywords).
+                # Stage "writing" means the agent actually executed a write_file action this session.
+                _mem_stage = (
+                    self.working_memory.get_memory("control").get("stage", "")
+                    if self.working_memory else ""
+                )
+                # Keyword fallback: goal explicitly asks for a written artifact
+                _WRITE_KEYWORDS = ('write', 'document', 'report', 'summary', 'save', 'output', 'create', 'generate')
+                _goal_lower = task_goal.lower()
+                _task_needs_file = (
+                    _mem_stage == "writing"  # memory tracked an actual write action
+                    or any(kw in _goal_lower for kw in _WRITE_KEYWORDS)  # keyword fallback
+                )
+
+                if _task_needs_file and not _confirmed_files:
+                    console.print("[bold red]🚫 finish_task REJECTED — task requires a written output file but none was found on disk.[/bold red]")
+                    rejection = (
+                        "❌ **finish_task REJECTED**: Your task requires writing an output file "
+                        f"(goal contains: {[kw for kw in _WRITE_KEYWORDS if kw in _goal_lower]}), "
+                        "but no output file was found on disk.\n\n"
+                        "You MUST write the file first using `write_file`, then call `finish_task`.\n"
+                        "Use the information you have already gathered — do NOT read more sections.\n"
+                        "Write the complete output document now."
+                    )
+                    self.messages.append({"role": "assistant", "content": content})
+                    feedback_prompt = rejection
+                    if self.config.enable_turn_limits:
+                        feedback_prompt = f"[Current Turn: {display_turn} / Max Turns: {MAX_REACT_TURNS}]\n{feedback_prompt}"
+                    self._log_rl("user", rejection)
+                    self.messages.append({"role": "user", "content": feedback_prompt})
+                    (turn_dir / "finish_task_rejected.md").write_text(rejection, encoding="utf-8")
+                    (turn_dir / "user_feedback.md").write_text(feedback_prompt, encoding="utf-8")
+                    continue
+
                 console.print("[bold green]🏁 Agent explicitly finished the task.[/bold green]")
+                # Post-task: surface output file paths and upload to MinIO if not already done
+                _final_outputs = (
+                    self.working_memory.get_memory("artifacts").get("output_files", [])
+                    if self.working_memory else []
+                )
+                for _fpath in _final_outputs:
+                    if Path(_fpath).exists():
+                        console.print(f"[bold blue]📄 Output: {_fpath}[/bold blue]")
+                        try:
+                            from BatchAgent.minio_uploader import upload_file as _upload_file
+                            _session_name = getattr(self.config, "session_dir", Path(".")).name
+                            _obj_name = f"agent/{_session_name}/{Path(_fpath).name}"
+                            _minio_url = _upload_file(_fpath, object_name=_obj_name) or ""
+                            if _minio_url:
+                                console.print(f"[bold cyan]🌐 MinIO URL: {_minio_url}[/bold cyan]")
+                        except Exception as _upload_err:
+                            console.print(f"[dim]MinIO upload skipped: {_upload_err}[/dim]")
+                if self.working_memory:
+                    self.working_memory.update_memory({"control": {"status": "done", "stage": "done"}})
+                    self.working_memory.save_memory()
                 self._save_trajectory_to_disk(task_idx, reward=1.0)
                 summary = finish_task_action.args.get('summary', final_result_text)
                 return True, summary
@@ -598,21 +832,54 @@ class UniversalAgent:
                 continue # get all the ideas, then let the agent decide how to proceed in the next turn, instead of rushing into tool execution or file mutations
 
             # --- 5. Execute Standard Tools (Concurrently) ---
-            standard_info_actions = [a for a in info_actions if a.name not in ['brainstorm_solutions', 'finish_task', 'load_domain_tools', 'register_custom_tool', 'json_parse_error']]
+            _MEMORY_TOOL_NAMES = {'get_memory', 'update_memory'}
+            standard_info_actions = [a for a in info_actions if a.name not in ['brainstorm_solutions', 'finish_task', 'load_domain_tools', 'register_custom_tool', 'json_parse_error'] + list(_MEMORY_TOOL_NAMES)]
+
+            # Handle memory tools synchronously (fast dict ops; must run before concurrent tools)
+            memory_tool_actions = [a for a in info_actions if a.name in _MEMORY_TOOL_NAMES]
+            if memory_tool_actions and self.working_memory:
+                for mem_action in memory_tool_actions:
+                    if mem_action.name == 'get_memory':
+                        mem_result = handle_get_memory(self.working_memory, mem_action.args)
+                    else:
+                        mem_result = handle_update_memory(self.working_memory, mem_action.args)
+                    feedback_blocks.append(mem_result)
+                    console.print(f"[dim]🧠 Memory tool: {mem_action.name}[/dim]")
+
+            # Auto-update stage + current_step to reflect what the model is actually doing
+            if self.working_memory and standard_info_actions:
+                tool_names = [a.name for a in standard_info_actions]
+                self.working_memory.update_memory({
+                    "control": {
+                        "stage": "gathering",
+                        "current_step": f"T{display_turn}: {', '.join(tool_names[:3])}",
+                    }
+                })
 
             # Loop detection: skip actions whose (name, args) fingerprint appeared in the last 2 turns
             if standard_info_actions:
-                deduped, skipped = [], []
+                deduped, skipped_ok, skipped_err = [], [], []
                 for a in standard_info_actions:
                     fp = _tool_fingerprint(a)
                     if _recent_fingerprints.count(fp) >= 1:
-                        skipped.append(a.name)
+                        if fp in _failed_fingerprints:
+                            skipped_err.append((a.name, _failed_fingerprints[fp]))
+                        else:
+                            skipped_ok.append(a.name)
                     else:
                         deduped.append(a)
-                if skipped:
-                    console.print(f"[yellow]⚠️ Loop detected — skipping repeated calls: {skipped}[/yellow]")
+                if skipped_err:
+                    console.print(f"[yellow]⚠️ Blocking retry of failed tool calls: {[n for n,_ in skipped_err]}[/yellow]")
+                    for tool_name, err_summary in skipped_err:
+                        feedback_blocks.append(
+                            f"⚠️ **Tool unavailable**: `{tool_name}` previously failed with: \"{err_summary}\". "
+                            "Do NOT retry this call — the service is unavailable. "
+                            "Proceed using other tools or complete the task with the information already gathered."
+                        )
+                if skipped_ok:
+                    console.print(f"[yellow]⚠️ Loop detected — skipping repeated calls: {skipped_ok}[/yellow]")
                     feedback_blocks.append(
-                        f"⚠️ **Loop detected**: You already called {skipped} with identical arguments in a previous turn. "
+                        f"⚠️ **Loop detected**: You already called {skipped_ok} with identical arguments in a previous turn. "
                         "The results were already provided. Use the information you have to proceed — "
                         "either synthesize what you know into a `write_file` call or call `finish_task`."
                     )
@@ -626,7 +893,21 @@ class UniversalAgent:
                 if len(_recent_fingerprints) > 12:
                     _recent_fingerprints[:] = _recent_fingerprints[-12:]
 
-                concurrent_results = await self._execute_tools_concurrently(standard_info_actions, turn_dir, allowlist)
+                concurrent_results, per_action_errors = await self._execute_tools_concurrently(standard_info_actions, turn_dir, allowlist)
+                # Track which fingerprints returned errors so loop detection can give accurate messages
+                for idx, err_summary in per_action_errors.items():
+                    if idx < len(standard_info_actions):
+                        _failed_fingerprints[_tool_fingerprint(standard_info_actions[idx])] = err_summary
+                # Auto-record tool calls in working memory with actual arg values
+                if self.working_memory:
+                    for idx, a in enumerate(standard_info_actions):
+                        self.working_memory.record_action(
+                            f"T{display_turn}: {a.name}({_fmt_args(a.args)})"
+                        )
+                        if idx in per_action_errors:
+                            self.working_memory.record_failure(
+                                f"T{display_turn}: {a.name} → {per_action_errors[idx][:80]}"
+                            )
                 feedback_blocks.append(f"### Tool Execution Results\n{concurrent_results}")
             
             # =====================================================================
@@ -760,6 +1041,20 @@ class UniversalAgent:
                         })
 
                 if has_mutation:
+                    # Auto-record written files in working memory + update stage.
+                    # Use handler.written_files (actual on-disk paths, which may differ from
+                    # action.path when a path redirect occurred, e.g. data/pdftest/ → session_dir/).
+                    if self.working_memory:
+                        written_paths = list(getattr(handler, 'written_files', []))
+                        for fpath in written_paths:
+                            self.working_memory.record_artifact(fpath, is_output=True)
+                        if written_paths:
+                            self.working_memory.update_memory({
+                                "control": {
+                                    "stage": "writing",
+                                    "current_step": f"T{display_turn}: writing {written_paths[0]}",
+                                }
+                            })
                     if current_mutation_fingerprints:
                         _recent_mutation_fingerprints.extend(current_mutation_fingerprints)
                         if len(_recent_mutation_fingerprints) > 8:
@@ -772,6 +1067,26 @@ class UniversalAgent:
                     is_write_only_turn = bool(write_only_actions) and len(write_only_actions) == len(mutation_actions) and not standard_info_actions
                     if is_write_only_turn:
                         signature = tuple(sorted(str(a.path).strip().lower() for a in write_only_actions))
+                        no_verification = v_feedback and "No code execution was required" in v_feedback
+                        if no_verification:
+                            # Tell the model what was written and what to do next.
+                            # Repeating pattern detection (via _recent_fingerprints) handles
+                            # the case where the model loops; we no longer force-stop here.
+                            written_file = str(write_only_actions[0].path) if write_only_actions else ""
+                            feedback_blocks.append(
+                                f"\n✅ **File written**: `{written_file}`\n\n"
+                                "**What to do next — choose exactly one:**\n"
+                                "1. **Output is complete** (all sections written, task done): "
+                                "call `finish_task` NOW. Do NOT read more content to make minor improvements.\n"
+                                "2. **Output has unfinished markers** (`[TODO]`, `# PLACEHOLDER`, `...`, etc.): "
+                                "read the next batch of source content, then use `search_and_replace` to fill "
+                                "the next placeholder. Update `progress.completed_steps` in memory after each fill.\n"
+                                "3. **Long task — more source content remains unread**: use `update_memory` to "
+                                "record what you just wrote, then continue the read→write→update cycle.\n\n"
+                                "⚠️ **Do NOT call `read_document_section` or `read_file_chunk` unless you have a "
+                                "specific placeholder or section left to fill.** If the output is already complete, "
+                                "call `finish_task` immediately."
+                            )
                         if len(set(signature)) == 1:
                             if signature == last_write_only_signature:
                                 write_only_repeat_count += 1
@@ -797,13 +1112,89 @@ class UniversalAgent:
                     #     feedback_blocks.append(v_feedback)
 
             # --- 7. Loop Feedback ---
+            # Compact memory every 5 turns to keep it lean
+            if self.working_memory and current_turn > 0 and current_turn % 5 == 0:
+                self.working_memory.compact_memory()
+                console.print("[dim]🧠 Working memory compacted.[/dim]")
+
             combined_feedback = "\n\n".join(feedback_blocks)
             if not mutation_actions and standard_info_actions:
-                combined_feedback += "\nAnalyze the results and continue."
+                # Check if output files already exist — if so, push toward finishing, not more reading
+                _cur_out_files = (
+                    self.working_memory.get_memory("artifacts").get("output_files", [])
+                    if self.working_memory else []
+                )
+                if _cur_out_files:
+                    combined_feedback += (
+                        f"\nResults above from your read. Output file exists: `{_cur_out_files[0]}`. "
+                        "If it is complete, call `finish_task` now. "
+                        "Only continue reading if you have a specific placeholder/section left to fill."
+                    )
+                else:
+                    combined_feedback += "\nAnalyze the results and continue."
             if not combined_feedback.strip():
                 combined_feedback = (
                     "No new actions were executed in this turn. "
                     "If the requested output file is already correct, call finish_task now."
+                )
+
+            # ── Incremental write-strategy injection ─────────────────────────
+            # When context approaches 60% used (headroom < 40%), guide the model to
+            # switch from read-heavy to an incremental read→write→update cycle.
+            # This applies to any long task: document summarization, code generation,
+            # analysis reports, etc.
+            _ctx_pct_used = 100 - int(ctx_headroom * 100 / max_ctx)
+            if ctx_headroom < max_ctx * 0.40 and not _write_pressure_injected:
+                _write_pressure_injected = True   # inject only once per task
+                _out_files = (
+                    self.working_memory.get_memory("artifacts").get("output_files", [])
+                    if self.working_memory else []
+                )
+                if not _out_files:
+                    # No file written yet — teach the general long-task skill
+                    write_pressure = (
+                        f"\n\n📋 **LONG-TASK STRATEGY ({_ctx_pct_used}% context used — switch modes now)**\n\n"
+                        "You have read enough to start writing. **Stop reading and create the output file NOW.** "
+                        "Use this cycle for the rest of the task:\n\n"
+                        "**Cycle: Read batch → Write/update → Track → Repeat**\n"
+                        "1. **Write the output file** (`write_file`) with what you know. "
+                        "For unread sections, insert a short marker like `[PENDING: <section>]` or a code stub.\n"
+                        "2. **Fill one batch at a time**: read the next section/chunk, then immediately "
+                        "`search_and_replace` the marker with real content (or add a new function/block to code).\n"
+                        "3. **Track progress**: `update_memory({\"progress\": {\"completed_steps\": [\"wrote: <X>\"]}})`\n"
+                        "4. **Repeat** until all markers are gone and the output is complete.\n"
+                        "5. **Call `finish_task`** — do not keep reading once the output is complete.\n\n"
+                        "**Alternative — Parallel mode** (for independent sections): use `brainstorm_solutions` "
+                        "to launch parallel reads of multiple sections simultaneously, collect all results, "
+                        "then write the full output in one pass.\n\n"
+                        "⚡ **Act now**: call `write_file` to create the initial output, then begin the fill cycle."
+                    )
+                else:
+                    # File already written — guide to finish the fill cycle or call finish_task
+                    write_pressure = (
+                        f"\n\n📋 **CONTINUE LONG-TASK CYCLE ({_ctx_pct_used}% context used)**\n"
+                        f"Output file already created: `{_out_files[0]}`.\n"
+                        "- If any `[PENDING]` markers or incomplete sections remain: read the next batch, "
+                        "then `search_and_replace` the marker. Update `progress.completed_steps` after each fill.\n"
+                        "- If the output is complete (no markers, no missing sections): "
+                        "call `finish_task` NOW — do not keep reading.\n"
+                        "Check `progress.completed_steps` in working memory to see what is already done."
+                    )
+                combined_feedback += write_pressure
+                console.print(f"[bold yellow]⚠ Incremental write strategy injected ({_ctx_pct_used}% context used).[/bold yellow]")
+
+            # Prepend a compact memory snapshot so the agent always sees its current state
+            if self.working_memory:
+                self.working_memory.save_memory()
+                # Also save a per-turn JSON snapshot for offline debugging
+                (turn_dir / "working_memory_snapshot.json").write_text(
+                    json.dumps(self.working_memory.get_memory(), indent=2, ensure_ascii=False),
+                    encoding="utf-8"
+                )
+                mem_snapshot = self.working_memory.to_context_string()
+                combined_feedback = (
+                    f"[Working Memory Snapshot]\n{mem_snapshot}\n\n"
+                    + combined_feedback
                 )
             
             # ===============================================================
@@ -823,6 +1214,9 @@ class UniversalAgent:
             (turn_dir / "user_feedback.md").write_text(feedback_prompt, encoding="utf-8")
 
         console.print("[bold red]Max ReAct turns exceeded. Task aborted.[/bold red]")
+        if self.working_memory:
+            self.working_memory.update_memory({"control": {"status": "failed", "stage": "done"}})
+            self.working_memory.save_memory()
         self._save_trajectory_to_disk(task_idx, reward=-1.0)
         return False, final_result_text
 
@@ -884,7 +1278,9 @@ async def main_async():
     parser.add_argument("--embedding-base-url", default=os.environ.get("EMBEDDING_BASE_URL", "http://100.83.246.7:8003/v1"))
     parser.add_argument("--embedding-api-key", default=os.environ.get("EMBEDDING_API_KEY", "EMPTY"))
     parser.add_argument("--embedding-model", default=os.environ.get("EMBEDDING_MODEL", "custom_bge_gpu1"))
-    parser.add_argument("--serper-key", default=os.environ.get("SERPER_API_KEY", ""), help="API key for Web Search")
+    parser.add_argument("--serper-key", default=os.environ.get("SERPER_API_KEY", ""), help="Serper API key for web search (1 credit per call)")
+    parser.add_argument("--tavily-key", default=os.environ.get("TAVILY_API_KEY", ""), help="Tavily API key used as fallback when Serper is unavailable")
+    parser.add_argument("--enable-youtube", action="store_true", help="Enable YouTube search via Serper (costs an extra credit per web_search call)")
     
     # System Features (New Additions)
     parser.add_argument("--parallel-thinking", action="store_true", help="Enable Batched LLM calls for branching thoughts (Free for local vLLM, expensive for APIs).")
@@ -965,6 +1361,8 @@ async def main_async():
         sandbox_container=args.sandbox,
         verbose=args.verbose,
         serper_api_key=args.serper_key,
+        tavily_api_key=args.tavily_key,
+        enable_youtube=args.enable_youtube,
         domain=args.domain,
         location=args.location,
         current_time=os.environ.get("BATCHAGENT_CURRENT_TIME", ""),
@@ -1087,4 +1485,31 @@ python BatchAgent/agent_main.py \
   --embedding-base-url "http://100.83.246.7:8003/v1" \
   --embedding-api-key "EMPTY" \
   --embedding-model "custom_bge_gpu1"
+
+
+python BatchAgent/agent_main.py \
+  --base-url "https://b8bwvh7j-8000.usw3.devtunnels.ms/v1" \
+  --api-key "myhpcvllmqwen" \
+  --model "qwen-27b"
+
+python BatchAgent/agent_main.py   --base-url "https://b8bwvh7j-8000.usw3.devtunnels.ms/v1"   --api-key "myhpcvllmqwen"   --model "qwen-27b" --verbose --embedding-base-url "http://100.83.246.7:8003/v1" \
+  --embedding-api-key "EMPTY" \
+  --embedding-model "custom_bge_gpu1"
+
+python BatchAgent/agent_main.py   \
+    --base-url "https://b8bwvh7j-8000.usw3.devtunnels.ms/v1"   \
+    --api-key "myhpcvllmqwen"   \
+    --model "qwen-27b" --verbose \
+    --embedding-base-url "http://localhost:8080/v1" \
+    --embedding-api-key "EMPTY" \
+    --embedding-model "text-embeddings-inference"
+
+
+python BatchAgent/agent_main.py   \
+    --base-url "http://100.110.236.127:8000/v1"   \
+    --api-key "EMPTY"   \
+    --model "qwen3.5-9b" --verbose \
+    --embedding-base-url "http://localhost:8080/v1" \
+    --embedding-api-key "EMPTY" \
+    --embedding-model "text-embeddings-inference"
 """

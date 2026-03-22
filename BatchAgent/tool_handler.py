@@ -1012,16 +1012,27 @@ def _perform_serper_domain_search(final_query: str, cat: str, api_key: str) -> s
     req.add_header("Content-Type", "application/json")
 
     if cat == "general":
+        num_results = 10
+    elif cat in ("math", "academic", "science", "medical", "research"):
         num_results = 8
-    elif cat in ("math", "academic", "science", "medical"):
-        num_results = 6
     else:
-        num_results = 5
+        num_results = 8
 
     data = json.dumps({"q": final_query, "num": num_results}).encode("utf-8")
 
-    with urllib.request.urlopen(req, data=data, timeout=15) as response:
-        res_data = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, data=data, timeout=15) as response:
+            res_data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return (
+                f"[Web Search Unavailable] Serper API rejected the request (HTTP {e.code}). "
+                "The SERPER_API_KEY is invalid, expired, or not configured. "
+                "Do NOT retry this search — proceed using only local knowledge or other available tools."
+            )
+        return f"[Web Search Error] HTTP {e.code}: {e.reason}. Do not retry — proceed with available information."
+    except urllib.error.URLError as e:
+        return f"[Web Search Unavailable] Network error contacting Serper: {e.reason}. Do not retry — proceed with available information."
 
     organic = res_data.get("organic", [])
     answer_box = res_data.get("answerBox", {})
@@ -1043,7 +1054,14 @@ def _perform_serper_domain_search(final_query: str, cat: str, api_key: str) -> s
         date_str = f" ({date})" if date else ""
         results.append(f"[{i+1}] {title}{date_str}\n{snippet}\nURL: {link}\n")
 
-    return "\n".join(results) if len(results) > 1 else f"🔎 [Source: Serper Web Search]\nNo results found for '{final_query}'."
+    if len(results) <= 1:
+        return (
+            f"🔎 [Source: Serper Web Search]\n"
+            f"No results found for '{final_query}'. "
+            "This topic may not exist or may be too new/niche. "
+            "Do NOT retry with the same or similar query — proceed with the information you already have."
+        )
+    return "\n".join(results)
 
 
 def wikimedia_search(query: str, top_k: int = 3) -> List[Dict[str, str]]:
@@ -1054,6 +1072,7 @@ def wikimedia_search(query: str, top_k: int = 3) -> List[Dict[str, str]]:
         method="GET",
     )
     req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "BatchAgent/1.0 (https://github.com/lkklkk; contact@example.com)")
     with urllib.request.urlopen(req, timeout=15) as response:
         payload = json.loads(response.read().decode("utf-8"))
     items = payload.get("query", {}).get("search", []) or []
@@ -1115,14 +1134,58 @@ def _perform_document_rag_search(query: str, top_k: int = 3) -> str:
         return ""
 
 
-def perform_domain_aware_search(query: str, category: str, api_key: str, current_time: str = "") -> str:
-    if not api_key or api_key == "EMPTY":
-        return "System Error: SERPER_API_KEY is not configured."
+def _is_serper_error(text: str) -> bool:
+    """Return True if the Serper result string indicates a failure."""
+    return text.startswith("[Web Search Unavailable]") or text.startswith("[Web Search Error]")
 
-    # ── Domain filter map (covers all DOMAIN_REGISTRY keys + common aliases) ──
-    # Filters are deliberately broad — multiple high-quality sources, not single-site
+
+def _perform_tavily_search(query: str, api_key: str, num_results: int = 5) -> str:
+    """Fallback web search via Tavily API. Returns empty string on any failure."""
+    if not api_key or api_key == "EMPTY":
+        return ""
+    try:
+        payload = json.dumps({
+            "api_key": api_key,
+            "query": query,
+            "search_depth": "basic",
+            "max_results": num_results,
+            "include_answer": True,
+        }).encode("utf-8")
+        req = urllib.request.Request("https://api.tavily.com/search", method="POST")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, data=payload, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        items = data.get("results", [])
+        if not items:
+            return ""
+        blocks = ["🔎 [Source: Tavily Search (Serper fallback)]"]
+        if data.get("answer"):
+            blocks.append(f"⭐ [Direct Answer]: {data['answer']}\n")
+        for i, item in enumerate(items):
+            title = item.get("title", "")
+            content = (item.get("content") or item.get("snippet") or "")[:250]
+            url = item.get("url", "")
+            blocks.append(f"[{i+1}] {title}\n{content}\nURL: {url}\n")
+        return "\n".join(blocks)
+    except urllib.error.HTTPError as e:
+        console.print(f"[dim]Tavily fallback HTTP {e.code}: check TAVILY_API_KEY[/dim]")
+        return ""
+    except Exception as e:
+        console.print(f"[dim]Tavily fallback failed: {e}[/dim]")
+        return ""
+
+
+def perform_domain_aware_search(
+    query: str,
+    category: str,
+    serper_api_key: str,
+    current_time: str = "",
+    enable_youtube: bool = False,
+    tavily_api_key: str = "",
+) -> str:
+
+    # ── Domain filter map ─────────────────────────────────────────────────────
     domain_filters: Dict[str, str] = {
-        # Core DOMAIN_REGISTRY keys
         "news":         "site:reuters.com OR site:apnews.com OR site:bbc.com OR site:bloomberg.com OR site:theguardian.com",
         "academic":     "site:arxiv.org OR site:scholar.google.com OR site:semanticscholar.org OR site:pubmed.ncbi.nlm.nih.gov OR site:researchgate.net",
         "medical":      "site:pubmed.ncbi.nlm.nih.gov OR site:medlineplus.gov OR site:nih.gov OR site:mayoclinic.org OR site:webmd.com",
@@ -1133,88 +1196,104 @@ def perform_domain_aware_search(query: str, category: str, api_key: str, current
         "business":     "site:sec.gov OR site:finance.yahoo.com OR site:bloomberg.com OR site:investopedia.com OR site:marketwatch.com",
         "assistant":    "site:superuser.com OR site:askubuntu.com OR site:serverfault.com OR site:apple.stackexchange.com",
         "sales_support":"site:zendesk.com OR site:hubspot.com OR site:salesforce.com OR site:freshdesk.com",
-        # Common aliases
         "code":         "site:github.com OR site:stackoverflow.com OR site:docs.python.org OR site:pypi.org OR site:realpython.com",
         "finance":      "site:sec.gov OR site:finance.yahoo.com OR site:bloomberg.com OR site:investopedia.com",
         "health":       "site:pubmed.ncbi.nlm.nih.gov OR site:nih.gov OR site:mayoclinic.org OR site:webmd.com",
         "programming":  "site:stackoverflow.com OR site:github.com OR site:realpython.com OR site:docs.python.org",
         "research":     "site:arxiv.org OR site:semanticscholar.org OR site:scholar.google.com OR site:jstor.org",
-        # Default fallback
         "general":      "",
     }
-
-    # ── Category alias normalisation ──────────────────────────────────────────
     _aliases: Dict[str, str] = {
-        "software":            "software_eng",
-        "software_engineering":"software_eng",
-        "engineering":         "software_eng",
-        "medicine":            "medical",
-        "biology":             "medical",
-        "physics":             "science",
-        "chemistry":           "science",
-        "mathematics":         "math",
-        "maths":               "math",
-        "statistics":          "math",
-        "economics":           "business",
-        "stock":               "business",
-        "stocks":              "business",
-        "investment":          "business",
-        "support":             "sales_support",
-        "crm":                 "sales_support",
-        "system":              "assistant",
-        "computer":            "assistant",
-        "paper":               "academic",
-        "papers":              "academic",
-        "python":              "code",
-        "javascript":          "code",
-        "js":                  "code",
+        "software": "software_eng", "software_engineering": "software_eng",
+        "engineering": "software_eng", "medicine": "medical", "biology": "medical",
+        "physics": "science", "chemistry": "science", "mathematics": "math",
+        "maths": "math", "statistics": "math", "economics": "business",
+        "stock": "business", "stocks": "business", "investment": "business",
+        "support": "sales_support", "crm": "sales_support",
+        "system": "assistant", "computer": "assistant",
+        "paper": "academic", "papers": "academic",
+        "python": "code", "javascript": "code", "js": "code",
     }
 
-    cat = category.lower().strip()
-    cat = _aliases.get(cat, cat)  # resolve alias first
+    cat = _aliases.get(category.lower().strip(), category.lower().strip())
     if cat not in domain_filters:
-        cat = "general"  # safe fallback
-
+        cat = "general"
     filter_str = domain_filters[cat]
-    # Only append site filter when non-empty (avoids polluting general queries)
+
+    # ── Query enrichment ──────────────────────────────────────────────────────
     reference_year = _extract_reference_year(current_time)
     normalized_query = query.strip()
     has_year = bool(re.search(r"\b(19|20)\d{2}\b", normalized_query))
-    has_relative_time = bool(re.search(r"\b(latest|newest|current|today|this year|recent)\b", normalized_query, flags=re.IGNORECASE))
+    has_relative_time = bool(re.search(
+        r"\b(latest|newest|current|today|this year|recent)\b", normalized_query, re.IGNORECASE))
     if reference_year and not has_year and has_relative_time:
         normalized_query = f"{normalized_query} in {reference_year}"
-    if reference_year and not has_year and not has_relative_time:
+    elif reference_year and not has_year:
         normalized_query = f"{normalized_query} as of {reference_year}"
     final_query = f"{normalized_query} {filter_str}".strip() if filter_str else normalized_query
 
-    console.print(f"[dim]Routing search -> Category: '{cat}', Final Query: '{final_query}'[/dim]")
+    serper_enabled = bool(serper_api_key) and serper_api_key != "EMPTY"
+    yt_enabled = enable_youtube and serper_enabled  # YouTube uses Serper credits too
+    console.print(
+        f"[dim]Search -> cat='{cat}' serper={'✓' if serper_enabled else '✗'} "
+        f"youtube={'✓' if yt_enabled else '✗'} tavily={'✓' if tavily_api_key else '✗'}[/dim]"
+    )
+
+    # ── Parallel fetch: Serper (optional) + Wikimedia + Document RAG + YouTube (optional) ──
+    web_output = ""
+    wikimedia_items: List[Dict[str, str]] = []
+    doc_output = ""
+    youtube_items: List[Dict[str, str]] = []
 
     try:
+        futures: Dict[str, Any] = {}
         with ThreadPoolExecutor(max_workers=4) as executor:
-            web_future = executor.submit(_perform_serper_domain_search, final_query, cat, api_key)
-            yt_future = executor.submit(youtube_search_and_extract, normalized_query, api_key, None)
-            wm_future = executor.submit(wikimedia_search, normalized_query, _resolve_youtube_top_k(None))
-            doc_future = executor.submit(_perform_document_rag_search, normalized_query)
-            web_output = web_future.result()
-            youtube_items = yt_future.result()
-            wikimedia_items = wm_future.result()
-            doc_output = doc_future.result()
-        youtube_output = _format_youtube_search_results(youtube_items)
-        wikimedia_output = _format_wikimedia_search_results(wikimedia_items)
-        outputs = [web_output]
-        if doc_output:
-            outputs.append(doc_output)
-        if youtube_output:
-            outputs.append(youtube_output)
-        if wikimedia_output:
-            outputs.append(wikimedia_output)
-        if outputs:
-            return "\n\n".join(outputs)
-        return web_output
-    except urllib.error.URLError as e:
-        return f"Network Error during search: {str(e)}"
+            if serper_enabled:
+                futures["web"] = executor.submit(
+                    _perform_serper_domain_search, final_query, cat, serper_api_key)
+            futures["wm"] = executor.submit(
+                wikimedia_search, normalized_query, _resolve_youtube_top_k(None))
+            futures["doc"] = executor.submit(_perform_document_rag_search, normalized_query)
+            if yt_enabled:
+                futures["yt"] = executor.submit(
+                    youtube_search_and_extract, normalized_query, serper_api_key, None)
+
+            web_output      = futures["web"].result() if "web" in futures else ""
+            wikimedia_items = futures["wm"].result()
+            doc_output      = futures["doc"].result()
+            youtube_items   = futures["yt"].result() if "yt" in futures else []
     except Exception as e:
-        return f"Search processing failed: {str(e)}"
+        console.print(f"[red]Search parallel fetch error: {e}[/red]")
+
+    # ── Tavily fallback: only when Serper failed or wasn't configured ─────────
+    if _is_serper_error(web_output) or (not serper_enabled):
+        if tavily_api_key:
+            console.print("[dim]Serper unavailable — trying Tavily fallback...[/dim]")
+            tavily_result = _perform_tavily_search(normalized_query, tavily_api_key)
+            if tavily_result and not tavily_result.startswith("[Tavily Unavailable]"):
+                web_output = tavily_result
+        # If both failed, keep the Serper error message (or add a note if Serper wasn't configured)
+        if not web_output:
+            web_output = (
+                "[Web Search Unavailable] Neither Serper nor Tavily is configured. "
+                "Set SERPER_API_KEY or TAVILY_API_KEY to enable web search."
+            )
+
+    # ── Assemble output ───────────────────────────────────────────────────────
+    outputs: List[str] = []
+    if web_output:
+        outputs.append(web_output)
+    if doc_output:
+        outputs.append(doc_output)
+    if yt_enabled:
+        yt_output = _format_youtube_search_results(youtube_items)
+        if yt_output:
+            outputs.append(yt_output)
+    wm_output = _format_wikimedia_search_results(wikimedia_items)
+    if wm_output:
+        outputs.append(wm_output)
+
+    return "\n\n".join(outputs) if outputs else "No search results available."
 
 
 # ==========================================
@@ -1249,6 +1328,8 @@ class UniversalToolHandler:
             session_name = getattr(self.config, "session_dir", Path(".")).name
             object_name = f"agent/{session_name}/{file_path.name}"
             url = upload_file(str(file_path), object_name=object_name) or ""
+            if url:
+                console.print(f"[blue]MinIO: {url}[/blue]")
         except Exception:
             url = ""
         return {
@@ -1260,12 +1341,19 @@ class UniversalToolHandler:
             "content": content,
         }
 
-    def _execute_code_mutations(self, actions: List[AgentAction], full_content: str) -> bool:
+    def _execute_code_mutations(
+        self, actions: List[AgentAction], full_content: str
+    ) -> Tuple[bool, List[str]]:
         """
-        Executes file modification actions. 
-        Returns True if any file was successfully changed.
+        Executes file modification actions.
+
+        Returns:
+            (changes_applied, per_action_errors)
+            changes_applied: True only if at least one file was actually written to disk.
+            per_action_errors: list of human-readable error strings for failed/skipped actions.
         """
         changes_applied = False
+        per_action_errors: List[str] = []
         
         for action in actions:
             if isinstance(action, ActionApplyDiff):
@@ -1316,14 +1404,28 @@ class UniversalToolHandler:
                     
             elif isinstance(action, ActionWriteFile):
                 target_path = resolve_path(action.path, self.allowlist)
-                if target_path:
-                    if apply_write_files([(str(target_path), action.content)], self.allowlist, self.turn_dir):
-                        changes_applied = True
-                        self.written_files.append(str(target_path))
-                        self.written_file_records.append(self._build_written_file_record(target_path))
-                else:
-                    console.print(f"[red]Skipping WRITE_FILE for unresolved path: {action.path}[/red]")
-                    
+                if target_path is None:
+                    # Model wrote to a path whose parent directory doesn't exist (e.g. data/pdftest/).
+                    # Redirect: strip directory components and use just the filename at workspace root.
+                    filename = Path(action.path).name or "output.md"
+                    target_path = Path.cwd() / filename
+                    console.print(f"[yellow]Path '{action.path}' unresolvable — redirecting to {target_path.name}[/yellow]")
+                # Redirect workspace-root outputs into the session log directory so
+                # all outputs are co-located with the session logs.
+                session_dir = getattr(self.config, "session_dir", None)
+                if session_dir:
+                    workspace_dir = Path.cwd().resolve()
+                    try:
+                        if target_path.parent.resolve() == workspace_dir:
+                            target_path = Path(session_dir) / target_path.name
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                    except Exception:
+                        pass
+                if apply_write_files([(str(target_path), action.content)], self.allowlist, self.turn_dir):
+                    changes_applied = True
+                    self.written_files.append(str(target_path))
+                    self.written_file_records.append(self._build_written_file_record(target_path))
+
             elif isinstance(action, ActionReplaceText):
                 target_path = resolve_path(action.path, self.allowlist)
                 if target_path and target_path.exists():
@@ -1334,9 +1436,16 @@ class UniversalToolHandler:
                         console.print(f"[green]Replaced text in {target_path}[/green]")
                         changes_applied = True
                     else:
-                        console.print(f"[red]search_and_replace failed: 'old_text' not found in {target_path}[/red]")
+                        err = f"search_and_replace FAILED — 'old_text' not found in '{action.path}'. The file content may have changed."
+                        console.print(f"[red]{err}[/red]")
+                        per_action_errors.append(err)
                 else:
-                    console.print(f"[red]search_and_replace skipped: unresolved or missing file {action.path}[/red]")
+                    err = (
+                        f"search_and_replace FAILED — could not resolve or find file '{action.path}'. "
+                        "Use write_file to create it first."
+                    )
+                    console.print(f"[red]{err}[/red]")
+                    per_action_errors.append(err)
 
         # Fallback: Check for extractable new files if diff methods failed entirely
         if not changes_applied and full_content and extract_all_diffs(full_content):
@@ -1351,7 +1460,7 @@ class UniversalToolHandler:
                         self.written_file_records.append(self._build_written_file_record(resolved))
                 console.print("[green]Wrote new files extracted from diff.[/green]")
 
-        return changes_applied
+        return changes_applied, per_action_errors
 
     def execute(self, actions: List[AgentAction], full_llm_content: str) -> Tuple[bool, str]:
         """
@@ -1392,18 +1501,116 @@ class UniversalToolHandler:
                         query = args.get("query", "")
                         category = args.get("category", "general")
                         configured_time = getattr(self.config, "current_time", "") or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        res = perform_domain_aware_search(query, category, getattr(self.config, 'serper_api_key', ''), configured_time)
+                        res = perform_domain_aware_search(
+                            query, category,
+                            getattr(self.config, "serper_api_key", ""),
+                            configured_time,
+                            enable_youtube=getattr(self.config, "enable_youtube", False),
+                            tavily_api_key=getattr(self.config, "tavily_api_key", ""),
+                        )
 
                     elif name == "get_document_overview":
                         try:
+                            from BatchAgent.document_agent.document_agent_v1 import (
+                                get_active_section_agent, create_full_pipeline_from_pdf
+                            )
+                            filepath = str(args.get("filepath") or "").strip()
+                            agent = get_active_section_agent()
+
+                            # Auto-load the PDF when a path is supplied and not yet loaded
+                            if filepath and agent is None:
+                                from pathlib import Path as _Path
+                                raw = _Path(filepath)
+                                # Search candidates in order: as-is → CWD-relative → project-root-relative
+                                # The agent chdir's to workspace_dir, so relative paths like
+                                # "data/pdftest/foo.pdf" must also be tried against the project root.
+                                _project_root = _Path(__file__).resolve().parent.parent
+                                _search_order = [
+                                    raw,                       # absolute or already correct relative
+                                    _Path.cwd() / raw,        # relative to workspace_dir (CWD)
+                                    _project_root / raw,      # relative to project root
+                                ]
+                                candidate = next((p for p in _search_order if p.exists()), None)
+                                if candidate is None:
+                                    tried = [str(p) for p in _search_order]
+                                    res = (
+                                        f"File not found: '{filepath}'. "
+                                        f"Searched: {tried}. "
+                                        "Provide the correct path relative to the project root."
+                                    )
+                                else:
+                                    # Pick embedding backend: use API if env var is configured
+                                    emb_type = "api" if os.environ.get("EMBEDDING_BASE_URL") else "local"
+                                    console.print(
+                                        f"[cyan]Loading document: {candidate.name} "
+                                        f"(embedding={emb_type}) — this may take a moment...[/cyan]"
+                                    )
+                                    pipeline = create_full_pipeline_from_pdf(
+                                        str(candidate), embedding_type=emb_type
+                                    )
+                                    agent = pipeline.get("section_agent")
+                                    if agent is None:
+                                        res = "Pipeline loaded but section agent construction failed."
+
+                            # Build final response (only if res not already set above)
+                            if not res:
+                                if agent:
+                                    res = agent.get_overview()
+                                elif filepath:
+                                    res = (
+                                        "Section agent unavailable. "
+                                        "The PDF may have been loaded but parsing produced no sections."
+                                    )
+                                else:
+                                    res = (
+                                        "No document is currently loaded. "
+                                        "Call get_document_overview with a filepath to load a PDF first, "
+                                        "e.g.: get_document_overview(filepath='data/paper.pdf')"
+                                    )
+                        except Exception as e:
+                            import traceback
+                            res = f"Error loading/reading document: {e}\n{traceback.format_exc()}"
+
+                    elif name == "read_document_section":
+                        try:
                             from BatchAgent.document_agent.document_agent_v1 import get_active_section_agent
                             agent = get_active_section_agent()
-                            if agent:
-                                res = agent.get_overview()
+                            if not agent:
+                                res = (
+                                    "No document is currently loaded. "
+                                    "Use the document pipeline to load a PDF first."
+                                )
                             else:
-                                res = "No document is currently loaded. Load a PDF with the document pipeline first."
+                                section_id = str(args.get("section_id") or "").strip()
+                                page = args.get("page")
+                                if section_id:
+                                    res = agent.read_details(section_id)
+                                elif page is not None:
+                                    page_num = int(page)
+                                    # Collect all sections that include this page
+                                    matches = [
+                                        agent.read_details(sid)
+                                        for sid, sec in agent.sections.items()
+                                        if page_num in (sec.get("pages") or set())
+                                    ]
+                                    if matches:
+                                        res = (
+                                            f"Sections on page {page_num} "
+                                            f"({len(matches)} found):\n\n"
+                                            + "\n\n---\n\n".join(matches)
+                                        )
+                                    else:
+                                        res = (
+                                            f"No sections found on page {page_num}. "
+                                            "Use get_document_overview to check available pages."
+                                        )
+                                else:
+                                    res = (
+                                        "Please provide either section_id (from get_document_overview) "
+                                        "or a page number."
+                                    )
                         except Exception as e:
-                            res = f"Error getting document overview: {e}"
+                            res = f"Error reading document section: {e}"
 
                     elif name == "read_url":
                         url = args.get("url", "")
@@ -1459,7 +1666,7 @@ class UniversalToolHandler:
                                 
                     # [NEW] 拦截并执行领域特定工具
                     else:
-                        from BatchAgent.domain_tools import DOMAIN_FUNCTIONS
+                        from BatchAgent.tools.domain_tools import DOMAIN_FUNCTIONS
                         if name in DOMAIN_FUNCTIONS:
                             try:
                                 func = DOMAIN_FUNCTIONS[name]
@@ -1477,7 +1684,8 @@ class UniversalToolHandler:
                 # 2. Write / Patch Tools (The "Hands")
                 # -----------------------------------------
                 elif isinstance(action, (ActionWriteFile, ActionApplyDiff, ActionReplaceText)):
-                    has_mutation = True
+                    # NOTE: has_mutation is set only after _execute_code_mutations confirms
+                    # something was actually written to disk — NOT here.
                     mutation_actions.append(action)
 
             except Exception as e:
@@ -1488,11 +1696,24 @@ class UniversalToolHandler:
         # Process all code mutations atomically
         if mutation_actions:
             console.print("[cyan]📝 Applying Code Mutations to Disk...[/cyan]")
-            success = self._execute_code_mutations(mutation_actions, full_llm_content)
+            success, mut_errors = self._execute_code_mutations(mutation_actions, full_llm_content)
+            # has_mutation is True ONLY when something was physically written to disk
+            has_mutation = success
             if success:
-                tool_results.append("### System Action\nFile modifications were successfully applied to the disk. Please proceed to verify or conclude.")
-            else:
-                tool_results.append("### System Error\nFailed to apply file modifications. The diff may be malformed or the file path is incorrect. Please try again using WRITE_FILE format.")
+                tool_results.append(
+                    "### System Action\n"
+                    "✅ File modifications successfully applied to disk. Please proceed to verify or conclude."
+                )
+            # Surface each per-action failure explicitly so the model knows exactly what went wrong
+            for err in mut_errors:
+                tool_results.append(f"### ❌ File Write Error\n{err}")
+                console.print(f"[red]{err}[/red]")
+            if not success and not mut_errors:
+                tool_results.append(
+                    "### System Error\n"
+                    "Failed to apply file modifications. The diff may be malformed or the file path is incorrect. "
+                    "Please retry using the WRITE_FILE XML format with a valid workspace-relative path."
+                )
 
         return has_mutation, "\n\n".join(tool_results)
 

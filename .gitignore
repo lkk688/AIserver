@@ -12,6 +12,8 @@ docs
 Audio/vibevoice
 
 .agent/
+.cache
+.claude
 output
 */output/
 output
@@ -30,3 +32,6 @@ Audio/vibevoice
 artifacts/
 agent_workspace/
 BatchAgent/document_agent/.ia_phase1_data
+eval_output/tasks/
+eval_output/
+eval_output0322

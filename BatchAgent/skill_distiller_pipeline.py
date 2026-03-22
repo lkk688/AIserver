@@ -1257,9 +1257,9 @@ async def main():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     
     parser = argparse.ArgumentParser(description="Skill Distiller Background Agent Tester")
-    parser.add_argument("--model", default=os.environ.get("VLLM_MODEL", "qwen3.5-9b"))
-    parser.add_argument("--base-url", default=os.environ.get("VLLM_BASE_URL", "http://100.110.236.127:8000/v1"))
-    parser.add_argument("--api-key", default=os.environ.get("VLLM_API_KEY", "EMPTY"))
+    parser.add_argument("--model", default=os.environ.get("VLLM_MODEL", "qwen-27b"))
+    parser.add_argument("--base-url", default=os.environ.get("VLLM_BASE_URL", "https://b8bwvh7j-8000.usw3.devtunnels.ms/v1"))
+    parser.add_argument("--api-key", default=os.environ.get("VLLM_API_KEY", "myhpcvllmqwen"))
     # 修改默认值，删掉后面的路径
     parser.add_argument("--embedding-base-url", default=os.environ.get("EMBEDDING_BASE_URL", "http://100.81.148.35:8003"))
     parser.add_argument("--embedding-api-key", default=os.environ.get("EMBEDDING_API_KEY", "EMPTY"))
@@ -1374,5 +1374,5 @@ if __name__ == "__main__":
     asyncio.run(main())
 
 """
-python BatchAgent/skill_distiller_pipeline.py --run-real-idle --discovery-urls https://github.com/K-Dense-AI/claude-scientific-skills/tree/main/scientific-skills/geopandas https://github.com/K-Dense-AI/claude-scientific-skills/tree/main/scientific-skills/dask
+python BatchAgent/skill_distiller_pipeline.py --export-sft --run-real-idle --discovery-urls https://github.com/K-Dense-AI/claude-scientific-skills/tree/main/scientific-skills/geopandas https://github.com/K-Dense-AI/claude-scientific-skills/tree/main/scientific-skills/dask
 """

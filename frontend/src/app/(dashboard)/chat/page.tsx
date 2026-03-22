@@ -626,7 +626,7 @@ function SettingsPanel({
         {open ? <ChevronUp className="w-3 h-3 ml-auto" /> : <ChevronDown className="w-3 h-3 ml-auto" />}
       </button>
       {open && (
-        <div className="px-4 pb-4 space-y-3 bg-gray-50/80 border-t border-gray-100">
+        <div className="px-4 pb-4 space-y-3 bg-gray-50/80 border-t border-gray-100 max-h-72 overflow-y-auto">
           {/* Tool strategy */}
           <div className="pt-3">
             <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Tool Strategy</label>
@@ -1554,7 +1554,8 @@ function ChatView({
               }
               const fileName = String(event.name || '');
               const lowerName = fileName.toLowerCase();
-              if (lowerName.endsWith('.md') || lowerName.endsWith('.markdown')) {
+              const isTextDoc = ['.md', '.markdown', '.txt', '.rst', '.log', '.csv'].some(ext => lowerName.endsWith(ext));
+              if (isTextDoc) {
                 const inline = event.content;
                 if (inline) {
                   setDocumentState(prev => ({ ...prev, title: fileName || prev.title, content: inline }));
@@ -1903,6 +1904,44 @@ function ChatView({
                       <Code className="w-2.5 h-2.5" /> Raw
                     </button>
                   </div>
+                  {/* Audio read-aloud button — same TTS hook used by chat messages */}
+                  {documentState.content && (() => {
+                    const docId = 'doc-panel';
+                    const speakingDoc = currentId === docId && isSpeaking;
+                    return (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            initAudio();
+                            if (speakingDoc) {
+                              isPaused ? resume() : pause();
+                            } else {
+                              speak(documentState.content, true, docId);
+                            }
+                          }}
+                          title={speakingDoc ? (isPaused ? 'Resume reading' : 'Pause reading') : 'Read aloud'}
+                          className="p-1 text-gray-400 hover:text-indigo-600 rounded transition-colors"
+                        >
+                          {speakingDoc ? (
+                            isPaused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />
+                          ) : (
+                            <Volume2 className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+                        {speakingDoc && (
+                          <button
+                            type="button"
+                            onClick={() => cancel()}
+                            title="Stop reading"
+                            className="p-1 text-gray-400 hover:text-red-500 rounded transition-colors"
+                          >
+                            <VolumeX className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </>
+                    );
+                  })()}
                   <button onClick={saveDocument} disabled={!currentTaskId} className={clsx("p-1 rounded transition-colors", currentTaskId ? "text-gray-400 hover:text-indigo-600" : "text-gray-300 cursor-not-allowed")}><Save className="w-3.5 h-3.5" /></button>
                   <button onClick={downloadDocument} className="p-1 text-gray-400 hover:text-indigo-600 rounded transition-colors"><Download className="w-3.5 h-3.5" /></button>
                 </div>
@@ -2056,7 +2095,7 @@ https://www.youtube.com/watch?v=..."
 
 // ─── Root page ────────────────────────────────────────────────────────────────
 
-export function AiAgentWorkspace({ siteKey = 'default', apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || '/api/v1', agentApiUrl = process.env.NEXT_PUBLIC_AGENT_API_URL || 'http://localhost:8000', embedded = false }: AiAgentWorkspaceProps) {
+export function AiAgentWorkspace({ siteKey = 'default', apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || '/api/v1', agentApiUrl = process.env.NEXT_PUBLIC_AGENT_API_URL || '', embedded = false }: AiAgentWorkspaceProps) {
   const uiConfig = SITE_AGENT_CONFIG[siteKey] ?? SITE_AGENT_CONFIG.default;
   const [view, setView] = useState<'list' | 'chat'>('list');
   const [pendingGoal, setPendingGoal] = useState<string | undefined>();

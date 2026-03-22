@@ -195,8 +195,8 @@ async def _execute_openai_async(
             reasoning = delta.model_dump().get("reasoning_content")
             if reasoning:
                 if verbose:
-                    sys.stdout.write(f"\033[90m{reasoning}\033[0m")
-                    sys.stdout.flush()
+                    # Use console.print so Rich's live display (spinner) isn't disrupted
+                    console.print(reasoning, end="", style="dim", highlight=False, markup=False)
                 if on_event:
                     await on_event({"type": "think", "data": reasoning})
             
@@ -231,8 +231,7 @@ async def _execute_openai_async(
                 # Text processing logic
                 if in_think:
                     if verbose:
-                        sys.stdout.write(f"\033[90m{clean_chunk}\033[0m")
-                        sys.stdout.flush()
+                        console.print(clean_chunk, end="", style="dim", highlight=False, markup=False)
                     if on_event and clean_chunk:
                         await on_event({"type": "think", "data": clean_chunk})
                 elif in_tool:
@@ -254,8 +253,10 @@ async def _execute_openai_async(
                     # Normal message token — strip any stray tag fragments before emitting
                     if clean_chunk:
                         if verbose:
-                            sys.stdout.write(clean_chunk)
-                            sys.stdout.flush()
+                            # Use console.print (end="") so output coordinates properly with
+                            # Rich's live display (spinner). sys.stdout.write() conflicts with
+                            # Rich's background refresh thread and produces broken/split text.
+                            console.print(clean_chunk, end="", highlight=False, markup=False)
                         if on_event:
                             await on_event({"type": "message", "data": clean_chunk})
                 
@@ -476,7 +477,11 @@ async def complete_with_continuation_async(
         elapsed = time.time() - start_time
         if not usage_info:
             usage_info = {"prompt_tokens": input_est, "completion_tokens": estimate_tokens(content)}
-        
+
+        if verbose:
+            # Ensure the LLM stats line starts on a new line after streaming tokens (end="" leaves no \n)
+            console.print()
+
         speed_metrics = compute_stream_speed_metrics(
             prompt_tokens=int(usage_info.get("prompt_tokens", input_est) or 0),
             completion_tokens=int(usage_info.get("completion_tokens", estimate_tokens(content)) or 0),
