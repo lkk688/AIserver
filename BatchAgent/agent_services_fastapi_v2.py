@@ -7,7 +7,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
-from BatchAgent.agent_main_v2 import AgentConfig, UniversalAgent
+from BatchAgent.agent_main_v2 import AgentConfig, UniversalAgent, check_api_and_context
 from BatchAgent.mini_batch_agent_libs import ensure_dirs, now_stamp
 from BatchAgent.prompt_registry_v2 import PromptRegistry
 from BatchAgent.tools.tools_registry import compile_tools_for_provider, get_base_tools
@@ -24,8 +24,8 @@ class AgentService:
         api_key: str,
         model: str,
         provider: str = "openai",
-        model_max_context: int = 32768,
-        max_output_tokens: int = 4096,
+        model_max_context: int = 0,   # 0 = auto-detect via API
+        max_output_tokens: int = 0,   # 0 = derive from detected context
         tool_strategy: str = "hybrid",
         domain: str = "general",
         location: str = "California, United States",
@@ -154,6 +154,20 @@ class AgentService:
 
         client = self._build_client()
 
+        # Auto-detect the model's actual context window unless the caller
+        # pinned it explicitly.  max_output scales proportionally (ctx/4).
+        if self.model_max_context > 0:
+            detected_ctx = self.model_max_context
+        else:
+            detected_ctx = await check_api_and_context(
+                client, self.provider, self.model, 0
+            )
+        detected_max_output = (
+            self.max_output_tokens
+            if self.max_output_tokens > 0
+            else min(32768, max(4096, detected_ctx // 4))
+        )
+
         # Configure the global tool registry before building tools/prompt
         configure_global_tool_registry(
             strategy=self.tool_strategy,
@@ -188,8 +202,8 @@ class AgentService:
             model=self.model,
             session_dir=session_dir,
             workspace_dir=workspace_dir,
-            max_context=self.model_max_context,
-            max_output=self.max_output_tokens,
+            max_context=detected_ctx,
+            max_output=detected_max_output,
             require_approval=False,
             agent_dir=agent_dir,
             tool_strategy=self.tool_strategy,

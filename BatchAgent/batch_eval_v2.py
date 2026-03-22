@@ -690,6 +690,10 @@ python3 BatchAgent/batch_eval_v2.py
 
 # Run a single task with verbose output:
 python3 BatchAgent/batch_eval_v2.py --task-id linreg_lvl1_raw_tensors --verbose
+python3 BatchAgent/batch_eval_v2.py --task-id logreg_lvl4_calibration_thresholding --verbose
+
+python3 BatchAgent/batch_eval_v2.py --tasks-json "CodeAgent/python_tasks.json" --verbose
+
 
 # Retry all failed tasks:
 python3 BatchAgent/batch_eval_v2.py --redo-failed

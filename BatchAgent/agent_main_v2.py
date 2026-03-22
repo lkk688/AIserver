@@ -793,51 +793,96 @@ class UniversalAgent:
             console.print(f"[bold red]❌ Verification failed (exit={code})[/bold red]")
             smart_error = build_debug_prompt(out, root_dir=str(self.config.workspace_dir))
 
-            # Extract the error line number and inject that code region so the
-            # model can patch immediately — without needing to re-read the file.
+            # Inject the broken code region so the model can patch immediately
+            # without re-reading the file.  Also detect the common "truncation"
+            # pattern where an LLM write hit its output-token limit and left the
+            # file ending mid-string or mid-expression.
             context_snippet = ""
+            truncation_hint = ""
             written_py = [
                 a for a in mutation_actions
                 if hasattr(a, "path") and str(a.path).endswith(".py")
             ]
             if written_py:
-                # Find the first line-number reference in the traceback
                 line_match = re.search(r"line (\d+)", out)
                 error_line = int(line_match.group(1)) if line_match else None
                 try:
                     src_path = Path(written_py[0].path)
                     if not src_path.is_absolute():
                         src_path = self.config.workspace_dir / src_path
-                    lines = src_path.read_text(encoding="utf-8").splitlines()
-                    if error_line:
-                        lo = max(0, error_line - 20)
-                        hi = min(len(lines), error_line + 10)
+                    file_lines = src_path.read_text(encoding="utf-8").splitlines()
+                    total_lines = len(file_lines)
+
+                    # Truncation detection: error near the end of a large file
+                    # AND the last non-empty line looks like a mid-expression cut.
+                    _TRUNC_PATTERNS = (
+                        r'["\']$',          # open string at end of line
+                        r'[\(\[{,\\]$',     # open paren / bracket / trailing comma/backslash
+                        r'\bf["\']',        # f-string open without close
+                    )
+                    last_nonempty = next(
+                        (l.rstrip() for l in reversed(file_lines) if l.strip()), ""
+                    )
+                    is_truncated = (
+                        error_line is not None
+                        and total_lines > 50
+                        and (total_lines - error_line) <= 15
+                        and any(re.search(p, last_nonempty) for p in _TRUNC_PATTERNS)
+                    )
+
+                    if is_truncated:
+                        # Show the broken tail so the model can complete it
+                        tail_start = max(0, error_line - 5)
+                        tail_lines = file_lines[tail_start:]
+                        numbered_tail = "\n".join(
+                            f"{tail_start + i + 1:4d} | {l}"
+                            for i, l in enumerate(tail_lines)
+                        )
+                        truncation_hint = (
+                            f"\n## ⚠️ Truncated File Detected\n"
+                            f"The file has {total_lines} lines and the syntax error is at "
+                            f"line {error_line} (near the end) — the previous `write_file` "
+                            f"was cut off mid-expression by the output-token limit.\n\n"
+                            f"**Broken tail (lines {tail_start+1}–{total_lines}):**\n"
+                            f"```python\n{numbered_tail}\n```\n\n"
+                            "**Fix strategy (choose one):**\n"
+                            "- Use `search_and_replace` with `old_text` = the broken last "
+                            "few lines and `new_text` = the corrected, complete version.\n"
+                            "- OR use `write_file` once more — but this time make sure "
+                            "the file ends with a complete `if __name__ == '__main__':` "
+                            "block and no open strings.\n"
+                            "**Do NOT read the file** — the broken tail is shown above.\n"
+                        )
                     else:
-                        lo, hi = 0, min(60, len(lines))
-                    numbered = "\n".join(
-                        f"{lo + i + 1:4d} | {l}" for i, l in enumerate(lines[lo:hi])
-                    )
-                    context_snippet = (
-                        f"\n## Relevant Code (lines {lo+1}–{hi})\n"
-                        f"```python\n{numbered}\n```\n"
-                        "Use `search_and_replace` or `write_file` to fix the lines above. "
-                        "**Do NOT read the file again** — the content is shown here.\n"
-                    )
+                        if error_line:
+                            lo = max(0, error_line - 20)
+                            hi = min(total_lines, error_line + 10)
+                        else:
+                            lo, hi = 0, min(60, total_lines)
+                        numbered = "\n".join(
+                            f"{lo + i + 1:4d} | {l}"
+                            for i, l in enumerate(file_lines[lo:hi])
+                        )
+                        context_snippet = (
+                            f"\n## Relevant Code (lines {lo+1}–{hi} of {total_lines})\n"
+                            f"```python\n{numbered}\n```\n"
+                            "Use `search_and_replace` to fix the broken lines above. "
+                            "**Do NOT read the file again** — the content is shown here.\n"
+                        )
                 except Exception:
                     pass
 
             return (
                 f"⚠️ [Verification Failed] Exit {code}\n"
                 f"Command: {verify_cmd}\n{smart_error}\n"
-                f"{context_snippet}\n"
+                f"{truncation_hint or context_snippet}\n"
                 "# Debug Task\n"
                 "The file was written but execution failed. **You MUST fix the bug NOW.**\n\n"
                 "**Required steps:**\n"
-                "1. Read the error traceback above carefully — the broken code is shown.\n"
-                "2. Syntax error → use `search_and_replace` to fix just the bad lines, "
-                "or `write_file` to rewrite the entire file.\n"
-                "3. Runtime error → trace the failing line and patch it with "
-                "`search_and_replace`.\n"
+                "1. Read the error and the broken code shown above.\n"
+                "2. **Prefer `search_and_replace`** — only replace the broken lines, "
+                "not the whole file.\n"
+                "3. Only use `write_file` if more than half the file needs to change.\n"
                 "4. Do NOT call `read_file_chunk` — the relevant code is already above.\n"
                 "5. Do NOT call `finish_task` until verification passes (exit 0).\n"
             )
