@@ -26,11 +26,14 @@ Dispatch order
 3. Optional domain tools (reserved for later)
 """
 
+import ast
+import asyncio
 import datetime
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from BatchAgent.tools.tool_registry_runtime import GLOBAL_TOOL_REGISTRY
 from BatchAgent.tools.document_tools import DocumentToolManager
@@ -123,9 +126,8 @@ class ToolRouter:
             "load_domain_tools": self._handle_load_domain_tools,
             "register_custom_tool": self._handle_register_custom_tool,
 
-            # optional / placeholders
+            # parallel / brainstorm (active only when enable_parallel=True)
             "execute_parallel_branches": self._handle_execute_parallel_branches,
-            "inspect_branch_details": self._handle_inspect_branch_details,
         }
 
         self._validate_registry_bindings()
@@ -395,12 +397,318 @@ class ToolRouter:
         )
 
     # ------------------------------------------------------------------
-    # Optional / placeholders
+    # Parallel branches
     # ------------------------------------------------------------------
 
-    def _handle_execute_parallel_branches(self, args: Dict[str, Any]) -> str:
-        return "Parallel branch execution is not implemented in this router yet."
+    # If the merged inline results exceed this many characters, the full
+    # content is stored in working_memory.knowledge.summaries and a compact
+    # overview is returned instead, preventing context overflow.
+    _BRANCH_INLINE_LIMIT = 8_000   # ~2 000 tokens
+    _BRANCH_PREVIEW_LEN  = 600     # chars shown per branch in the overview
+    _BRANCH_STORE_LEN    = 3_000   # chars stored per branch in memory
 
-    def _handle_inspect_branch_details(self, args: Dict[str, Any]) -> str:
-        branch_id = args.get("branch_id", "")
-        return f"Branch inspection not implemented yet for branch_id='{branch_id}'."
+    def _handle_execute_parallel_branches(self, args: Dict[str, Any]) -> str:
+        """
+        Execute multiple instruction branches concurrently.
+
+        Each branch makes one LLM call, executes any returned tool calls
+        synchronously, and returns the raw result.  All branches run in
+        parallel via asyncio.gather inside asyncio.run() (safe because this
+        handler is always called from asyncio.to_thread).
+
+        Overflow protection
+        -------------------
+        If the combined results exceed _BRANCH_INLINE_LIMIT chars, the first
+        _BRANCH_STORE_LEN chars of each branch are saved to working memory
+        (knowledge.summaries) and only a compact overview is returned.
+        The model can call get_memory('knowledge') to read the stored
+        summaries, or use read_document_section / other tools for full content.
+        """
+        branches_raw = args.get("branches", [])
+        branches = self._parse_branches(branches_raw)
+        if not branches:
+            return "execute_parallel_branches: no valid branches provided."
+
+        console.print(
+            f"[cyan]🌿 Parallel branches: executing {len(branches)} branches concurrently…[/cyan]"
+        )
+
+        results: List[Tuple[str, str]] = asyncio.run(
+            self._gather_branches(branches)
+        )
+
+        total_chars = sum(len(r) for _, r in results)
+
+        if total_chars <= self._BRANCH_INLINE_LIMIT:
+            # Small enough — return everything inline
+            parts = []
+            for branch_id, result in results:
+                parts.append(f"### Branch `{branch_id}`\n{result}")
+            return "\n\n".join(parts)
+
+        # ── Overflow path: store in memory, return compact overview ────────
+        console.print(
+            f"[yellow]⚠️  Branch results too large ({total_chars:,} chars). "
+            f"Storing in memory, returning overview.[/yellow]"
+        )
+        self._store_branches_in_memory(results)
+
+        lines = [
+            f"⚠️  Branch results too large to return inline "
+            f"(~{total_chars // 4:,} tokens total). "
+            "Stored in memory. Call `get_memory('knowledge')` to retrieve summaries.\n",
+            "Branch overview:",
+        ]
+        for branch_id, result in results:
+            clean = re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL).strip()
+            size_tok = max(1, len(result) // 4)
+            tok_str = f"~{size_tok/1000:.1f}k tok" if size_tok >= 1000 else f"~{size_tok} tok"
+            preview = clean[: self._BRANCH_PREVIEW_LEN].replace("\n", " ")
+            if len(clean) > self._BRANCH_PREVIEW_LEN:
+                preview += "…"
+            lines.append(f"- `{branch_id}` ({tok_str}): {preview}")
+
+        lines.append(
+            "\nTo get full content: call `read_document_section` (or other tools) "
+            "directly for specific sections, or call `get_memory('knowledge')` for "
+            "the stored summaries."
+        )
+        return "\n".join(lines)
+
+    def _store_branches_in_memory(self, results: List[Tuple[str, str]]) -> None:
+        """Persist branch results (truncated) to working_memory.knowledge.summaries."""
+        memory = getattr(self.ctx.config, "working_memory", None)
+        if memory is None:
+            return
+        summaries: Dict[str, str] = {}
+        for branch_id, result in results:
+            clean = re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL).strip()
+            summaries[f"branch_{branch_id}"] = clean[: self._BRANCH_STORE_LEN]
+        try:
+            memory.update_memory({"knowledge": {"summaries": summaries}})
+        except Exception:
+            pass  # Memory unavailable — fail silently
+
+    # ------------------------------------------------------------------
+    # Parallel branch helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_branches(raw: Any) -> List[Dict[str, str]]:
+        """Parse the `branches` argument from JSON string, Python repr, or list."""
+        if isinstance(raw, list):
+            return raw
+        if not isinstance(raw, str):
+            return []
+        raw = raw.strip()
+        # Try JSON first (double-quoted), then Python literal (single-quoted)
+        for loader in (json.loads, ast.literal_eval):
+            try:
+                result = loader(raw)
+                if isinstance(result, list):
+                    return result
+            except Exception:
+                pass
+        return []
+
+    async def _gather_branches(
+        self, branches: List[Dict[str, str]]
+    ) -> List[Tuple[str, str]]:
+        """Run all branches concurrently and return (branch_id, result) pairs."""
+        tasks = [
+            self._run_branch_async(
+                branch_id=str(b.get("branch_id", f"branch_{i}")),
+                instruction=str(b.get("instruction", "")),
+            )
+            for i, b in enumerate(branches)
+        ]
+        raw = await asyncio.gather(*tasks, return_exceptions=True)
+        results = []
+        for i, (b, res) in enumerate(zip(branches, raw)):
+            bid = str(b.get("branch_id", f"branch_{i}"))
+            if isinstance(res, Exception):
+                results.append((bid, f"Error: {res}"))
+            else:
+                results.append((bid, str(res)))
+        return results
+
+    @staticmethod
+    def _make_branch_client(config: Any) -> Any:
+        """
+        Create a fresh, isolated HTTP client for branch calls.
+
+        We intentionally do NOT reuse config.client here because that client's
+        underlying httpx connection pool is bound to the main event loop.
+        Running asyncio.run() inside asyncio.to_thread() creates a new event
+        loop in the worker thread; sharing the main-loop client across loops
+        causes connection-pool interference and transient connection errors on
+        the next main-agent LLM call.
+
+        Connection params (base_url, api_key) are read from the existing
+        config.client since AgentConfig does not store them directly.
+        """
+        provider = getattr(config, "provider", "openai")
+        existing = config.client  # already-constructed async client
+
+        if provider == "anthropic":
+            from anthropic import AsyncAnthropic
+            api_key = getattr(existing, "api_key", None) or "EMPTY"
+            return AsyncAnthropic(api_key=api_key)
+
+        import httpx
+        from openai import AsyncOpenAI
+
+        # AsyncOpenAI exposes base_url as a httpx.URL; convert to str.
+        raw_url = getattr(existing, "base_url", None)
+        base_url = str(raw_url) if raw_url is not None else None
+        api_key = getattr(existing, "api_key", None) or "EMPTY"
+
+        kwargs: Dict[str, Any] = {
+            "api_key": api_key,
+            "http_client": httpx.AsyncClient(timeout=300.0),
+        }
+        if base_url:
+            kwargs["base_url"] = base_url
+        return AsyncOpenAI(**kwargs)
+
+    async def _run_branch_async(self, branch_id: str, instruction: str) -> str:
+        """
+        One branch execution:
+          1. Send the instruction to the LLM (non-streaming, tools enabled).
+          2. Execute any returned tool calls via self.dispatch().
+          3. Return tool results (or LLM text if no tools were called).
+
+        Uses a fresh HTTP client (see _make_branch_client) to avoid
+        polluting the main agent's connection pool.
+        """
+        config = self.ctx.config
+        model = config.model
+        provider = getattr(config, "provider", "openai")
+        temperature = getattr(config, "temperature", 0.1)
+        max_context = getattr(config, "max_context", 32768)
+        backend = getattr(config, "backend", "openai")
+        enable_thinking = getattr(config, "enable_thinking", False)
+
+        # Fresh client isolated from main agent's connection pool
+        client = self._make_branch_client(config)
+
+        # Read-only tools only (no mutation)
+        read_tools = [
+            t.to_openai_function()
+            for t in GLOBAL_TOOL_REGISTRY.active_tools()
+            if t.category != "mutation"
+        ]
+
+        safe_max = min(4096, max(512, max_context // 8))
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    f"[Parallel Branch: {branch_id}]\n\n{instruction}\n\n"
+                    "Execute this instruction using the available tools. "
+                    "Return a detailed, complete result."
+                ),
+            }
+        ]
+
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": safe_max,
+            "stream": False,
+        }
+        if backend in ("llama.cpp", "vllm"):
+            kwargs["extra_body"] = {
+                "chat_template_kwargs": {"enable_thinking": enable_thinking}
+            }
+            kwargs["stop"] = ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
+        if read_tools:
+            kwargs["tools"] = read_tools
+
+        # Anthropic uses a different client API
+        if provider == "anthropic":
+            anthropic_tools = [
+                t.to_anthropic_tool()
+                for t in GLOBAL_TOOL_REGISTRY.active_tools()
+                if t.category != "mutation"
+            ]
+            return await self._run_branch_anthropic(
+                client, model, instruction, branch_id, anthropic_tools, safe_max, temperature
+            )
+
+        try:
+            resp = await client.chat.completions.create(**kwargs)
+        except Exception as e:
+            return f"LLM call failed: {e}"
+
+        choice = resp.choices[0] if resp.choices else None
+        if not choice:
+            return "No response from LLM."
+
+        text_content: str = choice.message.content or ""
+        native_tool_calls = getattr(choice.message, "tool_calls", None) or []
+
+        tool_results = []
+        for tc in native_tool_calls:
+            try:
+                tool_name = tc.function.name
+                args_str = tc.function.arguments
+                try:
+                    tool_args = json.loads(args_str)
+                except Exception:
+                    tool_args = {}
+                result = self.dispatch(tool_name, tool_args)
+                tool_results.append(f"**{tool_name}** →\n{result}")
+            except Exception as exc:
+                tool_results.append(f"Tool error: {exc}")
+
+        parts = []
+        if text_content:
+            clean = re.sub(r"<think>.*?</think>", "", text_content, flags=re.DOTALL).strip()
+            if clean:
+                parts.append(clean)
+        parts.extend(tool_results)
+        return "\n\n".join(parts) if parts else "No output."
+
+    async def _run_branch_anthropic(
+        self,
+        client: Any,
+        model: str,
+        instruction: str,
+        branch_id: str,
+        tools: List[Dict[str, Any]],
+        max_tokens: int,
+        temperature: float,
+    ) -> str:
+        """Anthropic-specific single-shot branch call."""
+        try:
+            resp = await client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            f"[Parallel Branch: {branch_id}]\n\n{instruction}\n\n"
+                            "Execute this instruction and return a detailed result."
+                        ),
+                    }
+                ],
+                tools=tools if tools else [],
+            )
+        except Exception as e:
+            return f"LLM call failed: {e}"
+
+        parts = []
+        for block in getattr(resp, "content", []):
+            if hasattr(block, "text"):
+                parts.append(block.text)
+            elif hasattr(block, "type") and block.type == "tool_use":
+                try:
+                    result = self.dispatch(block.name, block.input or {})
+                    parts.append(f"**{block.name}** →\n{result}")
+                except Exception as exc:
+                    parts.append(f"Tool error: {exc}")
+        return "\n\n".join(parts) if parts else "No output."

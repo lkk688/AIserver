@@ -183,7 +183,11 @@ class AgentService:
             enable_meta=self.enable_meta,
         )
 
-        base_tools = get_base_tools(strategy=self.tool_strategy, domain=self.domain)
+        base_tools = get_base_tools(
+            strategy=self.tool_strategy,
+            enable_parallel=self.enable_parallel,
+            domain=self.domain,
+        )
         compiled_tools = compile_tools_for_provider(
             base_tools=base_tools,
             provider=self.provider,

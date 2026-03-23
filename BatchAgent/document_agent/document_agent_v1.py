@@ -308,14 +308,58 @@ class StructuredDocumentAgent:
         self.section_embeddings = self._get_embeddings(texts)
 
     def get_overview(self) -> str:
+        def _section_chars(node: Dict) -> int:
+            total = len(node.get("content", ""))
+            for child in node.get("children", []):
+                total += _section_chars(child)
+            return total
+
         def build_toc(nodes: List[Dict], indent=""):
             toc = []
             for node in nodes:
-                if node["id"] != "root" or node["title"] != "Document Start":
-                    toc.append(f"{indent}- [{node['id']}] {node['title']}")
+                if node["id"] == "root" and node["title"] == "Document Start":
+                    toc.extend(build_toc(node["children"], indent))
+                    continue
+                pages = sorted(node.get("pages", set()))
+                page_str = (
+                    f"p.{pages[0]}" if len(pages) == 1
+                    else f"p.{pages[0]}-{pages[-1]}" if pages
+                    else ""
+                )
+                sec_tok = max(1, _section_chars(node) // 4)
+                tok_str = f"~{sec_tok/1000:.1f}k tok" if sec_tok >= 1000 else f"~{sec_tok} tok"
+                loc = f" ({page_str}, {tok_str})" if page_str else f" ({tok_str})"
+                toc.append(f"{indent}- [{node['id']}] {node['title']}{loc}")
                 toc.extend(build_toc(node["children"], indent + "  "))
             return toc
-        return "Document Overview:\n" + "\n".join(build_toc(self.tree))
+
+        toc_lines = build_toc(self.tree)
+        all_chars = sum(
+            len(sec.get("content", ""))
+            for sec_id, sec in self.sections.items()
+            if sec_id != "root"
+        )
+        total_tok = max(1, all_chars // 4)
+        grand_str = f"~{total_tok/1000:.1f}k" if total_tok >= 1000 else f"~{total_tok}"
+        toc_lines.append("")
+        toc_lines.append(f"📊 Total document content: {grand_str} tokens across {len(self.sections)} sections.")
+        if total_tok <= 4000:
+            toc_lines.append(
+                "✅ Strategy: Document is SHORT. Use parallel tool calls — include multiple "
+                "`read_document_section` calls in a single response."
+            )
+        elif total_tok <= 12000:
+            toc_lines.append(
+                "⚠️  Strategy: Document is MEDIUM. Group sections into 2-3 batches of parallel "
+                "`read_document_section` calls."
+            )
+        else:
+            toc_lines.append(
+                "🚨 Strategy: Document is LARGE (risk of context overflow). "
+                "You MUST use `execute_parallel_branches` to divide reading across branches. "
+                "Do NOT read sections sequentially — context WILL overflow."
+            )
+        return "Document Overview:\n" + "\n".join(toc_lines)
 
     def read_details(self, section_id: str) -> str:
         if section_id not in self.sections: return "Error: Section ID not found."

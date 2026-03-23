@@ -318,6 +318,275 @@ class PromptRegistry:
 
         return base_md
 
-"""
+    # ------------------------------------------------------------------
+    # Verification feedback prompts
+    # ------------------------------------------------------------------
 
-"""
+    @staticmethod
+    def get_verification_escalation_prompt(n_fails: int) -> str:
+        """
+        Return an escalation hint based on consecutive failure count.
+        Returns "" for n_fails < 2 (no escalation needed).
+        """
+        if n_fails >= 3:
+            return (
+                f"\n🚨 **SAME ERROR {n_fails}x IN A ROW — "
+                "YOU MUST CHANGE YOUR APPROACH**\n\n"
+                "Incremental `search_and_replace` patches are NOT fixing this bug.\n"
+                "**Mandatory action**: Rewrite the entire affected function "
+                "from scratch using `write_file`.\n"
+                "- Think carefully about the root cause BEFORE writing.\n"
+                "- Do NOT copy the old broken logic.\n"
+                "- Write a completely new, correct implementation.\n"
+            )
+        if n_fails == 2:
+            return (
+                f"\n⚠️ Same error **{n_fails} times in a row**.\n"
+                "Your fix is not working. Consider rewriting the affected "
+                "function entirely instead of patching it.\n"
+            )
+        return ""
+
+    @staticmethod
+    def get_pattern_hint(out: str, written_src: str = "") -> str:
+        """
+        Return a pattern-specific coaching hint based on the error output and
+        (optionally) the source of the first written Python file.
+
+        Covered patterns
+        ----------------
+        - Numba NoneType callable  ('NoneType' object is not callable + njit/numba)
+        - Multiprocessing hang     (No output for 30s | Hard cap reached)
+        - AssertionError           (wrong algorithm output, model should fix logic not tests)
+        """
+        if "'NoneType' object is not callable" in out:
+            if "njit" in written_src or "numba" in out or "numba" in written_src:
+                return (
+                    "\n## 💡 Hint: Numba Conditional Decorator\n"
+                    "The error is caused by `@njit` being applied when numba is unavailable "
+                    "(the fallback `njit` stub returns `None`, not a callable).\n"
+                    "Replace the decorator with a conditional pattern:\n"
+                    "```python\n"
+                    "try:\n"
+                    "    from numba import njit, prange\n"
+                    "    HAS_NUMBA = True\n"
+                    "except ImportError:\n"
+                    "    HAS_NUMBA = False\n"
+                    "    prange = range\n"
+                    "    def njit(*args, **kwargs):\n"
+                    "        return args[0] if args and callable(args[0]) else (lambda f: f)\n"
+                    "\n"
+                    "def _my_func(x):  # define WITHOUT decorator\n"
+                    "    ...\n"
+                    "\n"
+                    "_my_func = njit(parallel=True, fastmath=True)(_my_func) if HAS_NUMBA else _my_func\n"
+                    "```\n"
+                    "Do NOT use `@njit(parallel=True)` as a class-level decorator when numba may be absent.\n"
+                )
+        if "No output for 30s — killed" in out or "Hard cap reached" in out:
+            return (
+                "\n## 💡 Hint: Multiprocessing Guard Required\n"
+                "The script was killed after producing no output — this is almost always "
+                "caused by multiprocessing code running without the "
+                "`if __name__ == '__main__':` guard.\n\n"
+                "**Fix**: Wrap ALL multiprocessing/Process/Pool creation in:\n"
+                "```python\n"
+                "if __name__ == '__main__':\n"
+                "    # pool = multiprocessing.Pool(...)  ← must be inside this block\n"
+                "    # p = Process(target=..., ...)      ← must be inside this block\n"
+                "    main()\n"
+                "```\n"
+                "Without this guard each worker subprocess re-imports the module and "
+                "spawns more workers recursively, hanging forever.\n"
+            )
+        if "AssertionError" in out:
+            return (
+                "\n## 💡 Hint: Fix the Algorithm, Not the Test\n"
+                "An `AssertionError` means your implementation returned the **wrong answer**.\n"
+                "The expected value in the test assertion is the ground truth — "
+                "do NOT change it.\n"
+                "- Read the assertion: `assert your_result == expected_value`\n"
+                "- Fix the **algorithm/logic** in your function, not the `assert` line.\n"
+                "- Trace through your code manually with the failing input to find the bug.\n"
+            )
+        return ""
+
+    # ------------------------------------------------------------------
+    # Execute-task feedback prompts
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def finish_task_rejected(task_goal: str, found_kws: List[str]) -> str:
+        return (
+            "❌ **finish_task REJECTED**: Your task requires writing an output file "
+            f"(goal matches: {found_kws}), "
+            "but no output file was found on disk.\n\n"
+            "Write the file first using `write_file`, then call `finish_task`.\n"
+            "Use information already gathered — do NOT read more sections."
+        )
+
+    @staticmethod
+    def json_parse_strategy_switch() -> str:
+        return (
+            "System switched strategy native_all → hybrid after repeated "
+            "write_file JSON parse failures. Use native JSON for observations "
+            "and XML write_file / search_and_replace for file mutations."
+        )
+
+    @staticmethod
+    def no_action_warning(strategy: str) -> str:
+        if strategy == "native_all":
+            return (
+                "⚠️ System Warning: No valid tool calls detected.\n"
+                "Use native JSON function calling (e.g. `web_search`, `write_file`). "
+                "Do NOT put JSON in plain-text code blocks."
+            )
+        if strategy == "text_only":
+            return (
+                "⚠️ System Warning: No valid XML tool calls detected.\n"
+                "Use `<tool_call><web_search><query>…</query></web_search></tool_call>` "
+                "or the XML write_file format."
+            )
+        return (
+            "⚠️ System Warning: No valid tool calls or file modifications detected.\n"
+            "Use native JSON tools for searching/reading and `write_file` / "
+            "`search_and_replace` for file mutations. "
+            "Call `finish_task` if done."
+        )
+
+    @staticmethod
+    def domain_loaded(domain: str, tool_names: List[str]) -> str:
+        return (
+            f"✅ Loaded domain plugin '{domain}'.\n"
+            f"New tools: {', '.join(tool_names)}. Use them to complete the task."
+        )
+
+    @staticmethod
+    def domain_unknown(domain: str) -> str:
+        return f"❌ Unknown domain plugin: '{domain}'."
+
+    @staticmethod
+    def custom_tool_registered(tool_name: str) -> str:
+        return (
+            f"✅ Custom tool `{tool_name}` registered and available immediately. "
+            "Call it like any native tool."
+        )
+
+    @staticmethod
+    def tool_retry_blocked(tool_name: str, err_summary: str) -> str:
+        return (
+            f"⚠️ **Tool unavailable**: `{tool_name}` previously failed: "
+            f'"{err_summary}". Do NOT retry — proceed with what you have.'
+        )
+
+    @staticmethod
+    def loop_detected(skipped_names: List[str]) -> str:
+        return (
+            f"⚠️ **Loop detected**: You already called {skipped_names} with identical "
+            "arguments. Results already provided. Synthesize what you know — "
+            "call `write_file` or `finish_task`."
+        )
+
+    @staticmethod
+    def mutation_dedup(verify_failed: bool) -> str:
+        if verify_failed:
+            return (
+                "⚠️ Repeated identical file mutation skipped — "
+                "and the previous verification FAILED with the same fix.\n"
+                "Your incremental edit is NOT fixing the bug. "
+                "Read the error carefully and write a DIFFERENT, correct fix. "
+                "Do NOT repeat the same search_and_replace."
+            )
+        return (
+            "⚠️ Repeated identical file mutation skipped. "
+            "The same write/edit was already applied. "
+            "Call `finish_task` if the goal is completed."
+        )
+
+    @staticmethod
+    def write_only_guidance(written_file: str) -> str:
+        return (
+            f"\n✅ **File written**: `{written_file}`\n\n"
+            "**What to do next — choose exactly one:**\n"
+            "1. **Output complete** → call `finish_task` NOW.\n"
+            "2. **Placeholders remain** (`[PENDING:]`, `[TODO]`, etc.) → "
+            "read or recall the content, then `search_and_replace` each marker.\n"
+            "3. **More source content unread** → `update_memory` what you wrote, "
+            "then continue the read→write→fill cycle.\n\n"
+            "⚠️ Do NOT read more unless you have a specific placeholder to fill."
+        )
+
+    @staticmethod
+    def pending_markers_report(markers: List[str]) -> str:
+        """Report [PENDING:...] markers found in a written file."""
+        marker_list = "\n".join(f"  - {m}" for m in markers[:10])
+        return (
+            f"\n📌 **Your draft has {len(markers)} pending marker(s)** — fill them next:\n"
+            f"{marker_list}\n\n"
+            "For each marker:\n"
+            "1. Use `get_memory('knowledge')`, `read_document_section`, or `web_search` "
+            "to get the content.\n"
+            "2. Call `search_and_replace` to replace the marker with the real content.\n"
+            "3. Repeat until all markers are filled, then call `finish_task`."
+        )
+
+    @staticmethod
+    def parallel_branches_complete() -> str:
+        """Injected immediately after execute_parallel_branches returns results."""
+        return (
+            "\n✅ **Parallel reading complete** — all branch results are now in memory.\n\n"
+            "**NEXT STEP: Write the output NOW** using `write_file`.\n"
+            "- Use `[PENDING: <topic>]` markers for any parts you haven't read yet.\n"
+            "- Do NOT read more sections sequentially — everything you need is "
+            "available via `get_memory('knowledge')` or specific section reads.\n"
+            "- After writing the skeleton, fill each `[PENDING:]` marker with "
+            "`search_and_replace` and the relevant content from memory.\n"
+            "⚡ **Act now**: call `write_file` to create the output."
+        )
+
+    @staticmethod
+    def read_only_guidance(output_file: Optional[str]) -> str:
+        if output_file:
+            return (
+                f"\nResults above from your read. "
+                f"Output file exists: `{output_file}`. "
+                "If complete, call `finish_task` now. "
+                "Only continue reading if you have a specific placeholder to fill."
+            )
+        return "\nAnalyze the results and continue."
+
+    @staticmethod
+    def empty_turn_fallback() -> str:
+        return (
+            "No new actions were executed. "
+            "If the output file is already correct, call `finish_task` now."
+        )
+
+    @staticmethod
+    def write_pressure(ctx_pct: int, output_file: Optional[str]) -> str:
+        if not output_file:
+            return (
+                f"\n\n📋 **LONG-TASK STRATEGY ({ctx_pct}% context used — switch now)**\n\n"
+                "You have read enough. **Stop reading. Create the output file NOW.**\n\n"
+                "**Cycle: Read batch → Write/update → Track → Repeat**\n"
+                "1. `write_file` with what you know; use `[PENDING: <section>]` markers.\n"
+                "2. Read next batch → `search_and_replace` the marker.\n"
+                "3. `update_memory` progress after each fill.\n"
+                "4. Repeat until no markers remain.\n"
+                "5. `finish_task` — do not keep reading once complete.\n\n"
+                "⚡ **Act now**: call `write_file` to create the initial output."
+            )
+        return (
+            f"\n\n📋 **CONTINUE LONG-TASK CYCLE ({ctx_pct}% context used)**\n"
+            f"Output file: `{output_file}`.\n"
+            "- Markers remain → read next batch, `search_and_replace` each one.\n"
+            "- Output complete → `finish_task` NOW.\n"
+            "Check `progress.completed_steps` in memory for what is already done."
+        )
+
+    @staticmethod
+    def json_parse_soft_warning() -> str:
+        return (
+            "Tool JSON parsing failed for at least one call. "
+            "If writing files, use the JSON write_file/search_and_replace tool."
+        )

@@ -314,16 +314,64 @@ class SectionIndex:
         paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
         return paras[0] if paras else text.strip()
 
+    @staticmethod
+    def _section_total_chars(node: "SectionNode") -> int:
+        """Recursively sum content chars for a node and all its descendants."""
+        total = len(node.content)
+        for child in node.children:
+            total += SectionIndex._section_total_chars(child)
+        return total
+
     def get_overview(self) -> str:
         lines = ["Document Overview:"]
-        for node in self._flatten_tree():
-            if node.id == "root":
-                continue
+        all_nodes = [n for n in self._flatten_tree() if n.id != "root"]
+
+        # Compute per-section token estimates (content of each leaf shown)
+        # and grand total across ALL leaf sections so the model can plan.
+        total_chars = sum(len(n.content) for n in all_nodes)
+        total_tok = max(1, total_chars // 4)
+
+        for node in all_nodes:
             pages = sorted(node.pages)
             page_str = f"p.{pages[0]}" if len(pages) == 1 else f"p.{pages[0]}-{pages[-1]}"
             indent = "  " * max(node.level - 1, 0)
             preview = f" | Preview: {node.preview}" if node.preview else ""
-            lines.append(f"{indent}- [{node.id}] {node.title} ({page_str}){preview}")
+            # Include descendant content in the size so the model knows how
+            # much it will receive when it calls read_document_section.
+            sec_chars = self._section_total_chars(node)
+            sec_tok = max(1, sec_chars // 4)
+            tok_str = f"~{sec_tok/1000:.1f}k tok" if sec_tok >= 1000 else f"~{sec_tok} tok"
+            lines.append(
+                f"{indent}- [{node.id}] {node.title} ({page_str}, {tok_str}){preview}"
+            )
+
+        # Grand-total summary + reading strategy guidance
+        grand_str = f"~{total_tok/1000:.1f}k" if total_tok >= 1000 else f"~{total_tok}"
+        lines.append("")
+        lines.append(f"📊 Total document content: {grand_str} tokens across {len(all_nodes)} sections.")
+
+        if total_tok <= 4000:
+            lines.append(
+                "✅ Strategy: Document is SHORT. "
+                "Use parallel tool calls — include multiple `read_document_section` calls "
+                "in a single response to read all sections at once."
+            )
+        elif total_tok <= 12000:
+            lines.append(
+                "⚠️  Strategy: Document is MEDIUM. "
+                "Group sections into 2-3 batches of parallel `read_document_section` calls. "
+                "Avoid reading the entire document in one turn to prevent context overflow."
+            )
+        else:
+            lines.append(
+                "🚨 Strategy: Document is LARGE (risk of context overflow). "
+                "You MUST use `execute_parallel_branches` to divide reading work across branches. "
+                "Each branch should read a subset of sections independently, "
+                "then synthesize the combined results into the final output. "
+                "Do NOT read sections one-by-one sequentially — "
+                "the accumulated context WILL overflow before you finish."
+            )
+
         return "\n".join(lines)
 
     def _flatten_tree(self) -> List[SectionNode]:

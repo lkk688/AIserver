@@ -119,7 +119,15 @@ OBSERVATION_TOOLS = [
     },
     {
         "name": "execute_parallel_branches",
-        "description": "Execute multiple independent exploration, research, or coding paths simultaneously. Each branch runs in an isolated workspace and reports back a summary. Use this for brainstorming, testing different algorithms, or parallel web searching.",
+        "description": (
+            "Execute multiple independent instruction branches concurrently. "
+            "USE THIS when the document is LARGE (🚨 flag in get_document_overview) or when you need to "
+            "brainstorm multiple distinct approaches simultaneously. "
+            "Each branch gets one LLM call + tool access and runs in parallel. "
+            "If the combined results exceed the context window, they are stored in memory automatically — "
+            "call get_memory('knowledge') to retrieve branch summaries, "
+            "or call read_document_section / other tools directly for full content."
+        ),
         "properties": {
             "branches": {
                 "type": "array",
@@ -127,22 +135,14 @@ OBSERVATION_TOOLS = [
                 "items": {
                     "type": "object",
                     "properties": {
-                        "branch_id": {"type": "string", "description": "Unique alphanumeric ID for this branch, e.g., 'branch_a_quick_sort'"},
-                        "instruction": {"type": "string", "description": "Highly specific instruction for what this branch should do (e.g., 'Write and test a QuickSort algorithm', or 'Search for Python 3.13 typing features')."}
+                        "branch_id": {"type": "string", "description": "Unique snake_case ID, e.g. 'branch_intro' or 'branch_quicksort'"},
+                        "instruction": {"type": "string", "description": "Specific instruction for this branch (e.g. 'Read sections sec_4 and sec_5', or 'Search for Python 3.13 typing features')."}
                     },
                     "required": ["branch_id", "instruction"]
                 }
             }
         },
         "required": ["branches"]
-    },
-    {
-        "name": "inspect_branch_details",
-        "description": "Retrieve the full details, generated code, and test results of a specific branch executed previously.",
-        "properties": {
-            "branch_id": {"type": "string", "description": "The ID of the branch you want to inspect."}
-        },
-        "required": ["branch_id"]
     },
     {
         "name": "get_document_overview",
@@ -334,29 +334,7 @@ def get_base_tools(strategy: str, enable_parallel: bool = False, domain: str = "
     - This function simply reads the currently active tools.
     """
     from BatchAgent.tools.tool_registry_runtime import GLOBAL_TOOL_REGISTRY
-    active_tools = [_strip_runtime_fields(t) for t in GLOBAL_TOOL_REGISTRY.active_tools()]
-
-    # Optional compatibility brainstorm tool
-    if enable_parallel:
-        active_tools.append({
-            "name": "brainstorm_solutions",
-            "description": (
-                "Trigger parallel LLM thinking. Use this when facing a complex problem "
-                "to brainstorm multiple distinct approaches before writing code."
-            ),
-            "properties": {
-                "problem_statement": {"type": "string"},
-                "n_variations": {
-                    "type": "integer",
-                    "description": "Number of parallel approaches to generate (max 4).",
-                },
-            },
-            "required": ["problem_statement", "n_variations"],
-            "category": "meta",
-            "handler_name": None,
-        })
-
-    return active_tools
+    return [_strip_runtime_fields(t) for t in GLOBAL_TOOL_REGISTRY.active_tools()]
 
 
 def compile_tools_for_provider(base_tools: List[Dict[str, Any]], provider: str, strategy: str) -> List[Dict[str, Any]]:

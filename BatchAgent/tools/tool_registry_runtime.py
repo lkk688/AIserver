@@ -196,8 +196,8 @@ def _default_profiles_for_tool(name: str, category: str) -> Set[str]:
     if name in {"load_domain_tools", "register_custom_tool"}:
         return {"coding", "research", "general"}
 
-    if name in {"execute_parallel_branches", "inspect_branch_details"}:
-        return {"coding", "research", "general"}
+    if name == "execute_parallel_branches":
+        return {"coding", "research", "general", "document"}
 
     return {"general"}
 
@@ -481,7 +481,7 @@ class ToolRegistryRuntime:
         if name == "run_bash_command" and not config.enable_bash:
             return False
 
-        if name in {"execute_parallel_branches", "inspect_branch_details"} and not config.enable_parallel:
+        if name == "execute_parallel_branches" and not config.enable_parallel:
             return False
 
         if category == "meta" and not config.enable_meta:

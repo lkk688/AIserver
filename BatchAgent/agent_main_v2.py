@@ -40,7 +40,7 @@ import argparse
 import httpx
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt
 from rich.status import Status
 from rich.text import Text
 
@@ -56,13 +56,10 @@ from BatchAgent.tools.tool_router import ToolRouter
 
 # ── shared libs (unchanged between v1 and v2) ──────────────────────────────────
 from BatchAgent.mini_batch_agent_libs import (
-    _determine_verify_cmd,
-    build_debug_prompt,
     ensure_dirs,
     estimate_tokens,
     now_stamp,
     read_file,
-    run_shell,
     sha1_text,
     truncate_to_tokens,
 )
@@ -74,8 +71,22 @@ from BatchAgent.mini_batch_agent_base import (
 )
 from BatchAgent.tools.domain_tools import DOMAIN_REGISTRY
 from BatchAgent.working_memory import WorkingMemory
+from BatchAgent.verification_manager import VerificationManager
 
 console = Console()
+
+# ---------------------------------------------------------------------------
+# Pending-marker regex (used by _detect_pending_markers and _handle_mutations)
+# ---------------------------------------------------------------------------
+_PENDING_RE = re.compile(r'\[(?:PENDING|TODO|PLACEHOLDER):[^\]]*\]', re.IGNORECASE)
+
+
+def _detect_pending_markers(file_path: str) -> List[str]:
+    """Scan a written file for [PENDING:...] / [TODO:...] / [PLACEHOLDER:...] markers."""
+    try:
+        return _PENDING_RE.findall(Path(file_path).read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return []
 
 
 # =============================================================================
@@ -382,6 +393,21 @@ class LoopDetector:
 
 
 # =============================================================================
+# 3b. Per-task mutable state
+# =============================================================================
+
+@dataclass
+class _TaskState:
+    """Per-task mutable state carried through the execute_task loop."""
+    loop_detector: LoopDetector = field(default_factory=LoopDetector)
+    consecutive_json_parse_turns: int = 0
+    last_write_only_sig: Optional[tuple] = None
+    write_only_repeat_count: int = 0
+    write_pressure_injected: bool = False
+    parallel_complete_pending: bool = False  # True = inject write directive next turn
+
+
+# =============================================================================
 # 4. Universal Agent
 # =============================================================================
 
@@ -419,6 +445,17 @@ class UniversalAgent:
         # keeps its loaded-document state between get_document_overview and
         # subsequent read_document_section / search_document calls.
         self._tool_router: Optional[ToolRouter] = None
+
+        # Verification manager — handles shell sandbox, skilldb, escalation.
+        # skilldb lives under agent_dir/skilldb (same convention as mini_batch_agent).
+        _skilldb_dir = getattr(config, "agent_dir", config.session_dir) / "skilldb"
+        self._vm = VerificationManager(
+            config=config,
+            skilldb_dir=_skilldb_dir,
+            llm_client=config.client,
+            model=config.model,
+            provider=config.provider,
+        )
 
     # ------------------------------------------------------------------
     # RL trajectory helpers
@@ -727,185 +764,17 @@ class UniversalAgent:
         )
 
     # ------------------------------------------------------------------
-    # Mutation verification
+    # execute_task helpers
     # ------------------------------------------------------------------
 
-    def _verify_mutations(
-        self,
-        content: str,
-        mutation_actions: List[Any],
-        allowlist: List[str],
-        turn_dir: Path,
-    ) -> str:
-        """
-        Run a sandbox verification command after mutations.
-        Returns a feedback string for the agent.
-        """
-        modified_files = []
-        for a in mutation_actions:
-            if hasattr(a, "path"):
-                modified_files.append(a.path)
-            elif isinstance(a, ActionApplyDiff):
-                paths = re.findall(
-                    r"^\+\+\+ b/(.+)$", getattr(a, "diff_text", ""), re.MULTILINE
-                )
-                modified_files.extend(paths)
-        modified_files = list(set(modified_files))
-
-        auto_cmd_match = re.search(r"^Verification:\s*(.+)$", content, re.MULTILINE)
-        auto_cmd = auto_cmd_match.group(1).strip() if auto_cmd_match else None
-        verify_cmd = _determine_verify_cmd(allowlist, modified_files, auto_cmd, self.config)
-
-        if not verify_cmd:
-            console.print("[yellow]No verification command needed.[/yellow]")
-            return (
-                "✅ File modifications applied to disk.\n"
-                "**System Prompt**: No code execution required. "
-                "If the task is complete, call `finish_task` immediately. "
-                "Do NOT rewrite files unless you found an error."
-            )
-
-        if getattr(self.config, "require_approval", False):
-            console.print(f"\n[bold red]⚠️ Command requires approval:[/bold red] `{verify_cmd}`")
-            if not Confirm.ask("Approve execution?"):
-                return f"⚠️ User skipped verification for: {verify_cmd}"
-
-        console.print("[cyan]→ Running verification sandbox...[/cyan]")
-        code, out = run_shell(
-            verify_cmd,
-            cap=20000,
-            sandbox_container=getattr(self.config, "sandbox_container", None),
-        )
-        (turn_dir / "verify_stdout.txt").write_text(out, encoding="utf-8")
-
-        if code == 0:
-            console.print("[bold green]✅ Verification: Exit 0[/bold green]")
-            if self.config.verbose:
-                console.print(f"[dim]{out}[/dim]")
-            return (
-                f"### ✅ Verification PASSED (exit 0)\n```text\n{out}\n```\n\n"
-                "**The script ran successfully.**\n"
-                "→ Call `finish_task` immediately.\n"
-                "→ Do NOT read, re-run, or rewrite the file — it already works.\n"
-                "→ Do NOT use run_bash_command or read_file_chunk after a passing verification.\n"
-            )
-        else:
-            console.print(f"[bold red]❌ Verification failed (exit={code})[/bold red]")
-            smart_error = build_debug_prompt(out, root_dir=str(self.config.workspace_dir))
-
-            # Inject the broken code region so the model can patch immediately
-            # without re-reading the file.  Also detect the common "truncation"
-            # pattern where an LLM write hit its output-token limit and left the
-            # file ending mid-string or mid-expression.
-            context_snippet = ""
-            truncation_hint = ""
-            written_py = [
-                a for a in mutation_actions
-                if hasattr(a, "path") and str(a.path).endswith(".py")
-            ]
-            if written_py:
-                line_match = re.search(r"line (\d+)", out)
-                error_line = int(line_match.group(1)) if line_match else None
-                try:
-                    src_path = Path(written_py[0].path)
-                    if not src_path.is_absolute():
-                        src_path = self.config.workspace_dir / src_path
-                    file_lines = src_path.read_text(encoding="utf-8").splitlines()
-                    total_lines = len(file_lines)
-
-                    # Truncation detection: error near the end of a large file
-                    # AND the last non-empty line looks like a mid-expression cut.
-                    _TRUNC_PATTERNS = (
-                        r'["\']$',          # open string at end of line
-                        r'[\(\[{,\\]$',     # open paren / bracket / trailing comma/backslash
-                        r'\bf["\']',        # f-string open without close
-                    )
-                    last_nonempty = next(
-                        (l.rstrip() for l in reversed(file_lines) if l.strip()), ""
-                    )
-                    is_truncated = (
-                        error_line is not None
-                        and total_lines > 50
-                        and (total_lines - error_line) <= 15
-                        and any(re.search(p, last_nonempty) for p in _TRUNC_PATTERNS)
-                    )
-
-                    if is_truncated:
-                        # Show the broken tail so the model can complete it
-                        tail_start = max(0, error_line - 5)
-                        tail_lines = file_lines[tail_start:]
-                        numbered_tail = "\n".join(
-                            f"{tail_start + i + 1:4d} | {l}"
-                            for i, l in enumerate(tail_lines)
-                        )
-                        truncation_hint = (
-                            f"\n## ⚠️ Truncated File Detected\n"
-                            f"The file has {total_lines} lines and the syntax error is at "
-                            f"line {error_line} (near the end) — the previous `write_file` "
-                            f"was cut off mid-expression by the output-token limit.\n\n"
-                            f"**Broken tail (lines {tail_start+1}–{total_lines}):**\n"
-                            f"```python\n{numbered_tail}\n```\n\n"
-                            "**Fix strategy (choose one):**\n"
-                            "- Use `search_and_replace` with `old_text` = the broken last "
-                            "few lines and `new_text` = the corrected, complete version.\n"
-                            "- OR use `write_file` once more — but this time make sure "
-                            "the file ends with a complete `if __name__ == '__main__':` "
-                            "block and no open strings.\n"
-                            "**Do NOT read the file** — the broken tail is shown above.\n"
-                        )
-                    else:
-                        if error_line:
-                            lo = max(0, error_line - 20)
-                            hi = min(total_lines, error_line + 10)
-                        else:
-                            lo, hi = 0, min(60, total_lines)
-                        numbered = "\n".join(
-                            f"{lo + i + 1:4d} | {l}"
-                            for i, l in enumerate(file_lines[lo:hi])
-                        )
-                        context_snippet = (
-                            f"\n## Relevant Code (lines {lo+1}–{hi} of {total_lines})\n"
-                            f"```python\n{numbered}\n```\n"
-                            "Use `search_and_replace` to fix the broken lines above. "
-                            "**Do NOT read the file again** — the content is shown here.\n"
-                        )
-                except Exception:
-                    pass
-
-            return (
-                f"⚠️ [Verification Failed] Exit {code}\n"
-                f"Command: {verify_cmd}\n{smart_error}\n"
-                f"{truncation_hint or context_snippet}\n"
-                "# Debug Task\n"
-                "The file was written but execution failed. **You MUST fix the bug NOW.**\n\n"
-                "**Required steps:**\n"
-                "1. Read the error and the broken code shown above.\n"
-                "2. **Prefer `search_and_replace`** — only replace the broken lines, "
-                "not the whole file.\n"
-                "3. Only use `write_file` if more than half the file needs to change.\n"
-                "4. Do NOT call `read_file_chunk` — the relevant code is already above.\n"
-                "5. Do NOT call `finish_task` until verification passes (exit 0).\n"
-            )
-
-    # ------------------------------------------------------------------
-    # Main ReAct loop
-    # ------------------------------------------------------------------
-
-    async def execute_task(
+    def _init_task(
         self,
         task_goal: str,
-        task_idx: int,
-        allowlist: List[str],
-        prompt_md: str,
-        resume_messages: Optional[List[Dict[str, str]]] = None,
-        start_turn_index: int = 0,
-        resume_rl_trajectory: Optional[List[Dict[str, str]]] = None,
-    ) -> Tuple[bool, str]:
-        console.print(
-            f"\n[bold green]=== Starting Agent Task {task_idx + 1} ===[/bold green]"
-        )
-
-        # ── Restore or initialise message history ──────────────────────────────
+        resume_messages: Optional[List[Dict[str, str]]],
+        resume_rl_trajectory: Optional[List[Dict[str, str]]],
+    ) -> None:
+        """Initialize message history, working memory, tool registry, and tool router."""
+        # Message history
         if resume_messages:
             restored = [
                 {"role": str(m.get("role", "")), "content": str(m.get("content", ""))}
@@ -930,17 +799,17 @@ class UniversalAgent:
             self.messages = [{"role": "system", "content": self.system_message}]
             self._log_rl("system", self.system_message)
 
-        # ── Initialise working memory ──────────────────────────────────────────
+        # Working memory
         self.working_memory = WorkingMemory(
             session_dir=self.config.session_dir,
             goal=task_goal,
         )
         self.working_memory.update_memory({"control": {"status": "active", "stage": "planning"}})
-        # Wire working memory into config so ToolRouter's memory handlers find it.
         self.config.working_memory = self.working_memory
         console.print("[dim]🧠 Working memory initialised.[/dim]")
 
-        # ── Configure the global tool registry for this task ──────────────────
+        # Tool registry
+        _parallel = getattr(self.config, "parallel_thinking", False)
         configure_global_tool_registry(
             strategy=self.config.tool_strategy,
             profile="general",
@@ -951,181 +820,445 @@ class UniversalAgent:
             enable_code_tools=True,
             enable_mutation=True,
             enable_bash=True,
-            enable_parallel=getattr(self.config, "parallel_thinking", False),
+            enable_parallel=_parallel,
             enable_meta=True,
         )
+        _base = get_base_tools(
+            strategy=self.config.tool_strategy,
+            enable_parallel=_parallel,
+            domain=self.config.domain,
+        )
+        self.tools = compile_tools_for_provider(_base, self.config.provider, self.config.tool_strategy)
+        _tool_names = [t.get("name", t.get("function", {}).get("name", "?")) for t in self.tools]
+        console.print(f"[cyan]🔧 Active tools ({len(_tool_names)}): {', '.join(_tool_names)}[/cyan]")
+        if _parallel:
+            console.print("[cyan]🧠 Parallel thinking: ON (brainstorm_solutions enabled)[/cyan]")
 
-        # ── Create persistent ToolRouter (shared across all turns) ────────────
-        # This preserves DocumentToolManager state so a document loaded by
-        # get_document_overview stays available for read_document_section calls
-        # in later turns.
+        # Tool router + verification manager
         self._tool_router = ToolRouter(
             config=self.config,
             dynamic_tools_mapping=self.dynamic_tools_mapping,
         )
+        self._vm.reset()
 
-        MAX_REACT_TURNS = self.config.max_turns
+    def _save_turn_debug(self, turn_dir: Path, display_turn: int) -> None:
+        (turn_dir / "full_prompt_context.json").write_text(
+            json.dumps(self.messages, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        if self.messages:
+            (turn_dir / "latest_instruction.md").write_text(
+                self.messages[-1]["content"], encoding="utf-8"
+            )
+        console.print(f"\n[bold yellow]>>> ReAct Turn {display_turn} / {self.config.max_turns}[/bold yellow]")
+
+    def _save_action_log(self, turn_dir: Path, actions: list) -> None:
+        logs = []
+        for a in actions:
+            if hasattr(a, "name") and hasattr(a, "args"):
+                logs.append({"type": "Tool", "name": a.name, "args": a.args})
+            else:
+                logs.append({"type": a.__class__.__name__, "path": getattr(a, "path", "N/A")})
+        (turn_dir / "parsed_actions.json").write_text(
+            json.dumps(logs, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+    async def _run_llm_call(self, display_turn: int, allowlist: List[str]):
+        max_ctx = self.config.max_context
+        _raw_input = sum(estimate_tokens(m.get("content", "")) for m in self.messages)
+        _est_input = int(_raw_input * self._TOKEN_ESTIMATE_CORRECTION)
+        _effective_max_output = min(self.config.max_output, max(256, max_ctx - _est_input - 256))
+
+        async def _call():
+            return await complete_with_continuation_async(
+                client=self.config.client,
+                model=self.config.model,
+                messages=self.messages,
+                temperature=self.config.temperature,
+                max_output_tokens=_effective_max_output,
+                model_max_context=max_ctx,
+                provider=self.config.provider,
+                stream=True,
+                verbose=self.config.verbose,
+                session_dir=self.config.session_dir,
+                tools=self.tools,
+                tool_strategy=self.config.tool_strategy,
+                allowlist=allowlist,
+                dynamic_tools_registry=self.dynamic_tools_registry,
+                on_event=self.config.stream_callback,
+                backend=self.config.backend,
+                enable_thinking=self.config.enable_thinking,
+            )
+
+        if not self.config.verbose:
+            with console.status(
+                f"[yellow]Thinking… (Turn {display_turn}/{self.config.max_turns})", spinner="dots"
+            ):
+                return await _call()
+        return await _call()
+
+    def _append_feedback(
+        self,
+        content: str,
+        feedback: str,
+        display_turn: int,
+        turn_dir: Path,
+        filename: str = "user_feedback.md",
+    ) -> None:
+        """Append assistant content + user feedback to message history."""
+        fp = feedback
+        if self.config.enable_turn_limits:
+            fp = f"[Current Turn: {display_turn} / Max Turns: {self.config.max_turns}]\n{fp}"
+        self._log_rl("user", feedback)
+        self.messages.append({"role": "assistant", "content": content})
+        self.messages.append({"role": "user", "content": fp})
+        (turn_dir / filename).write_text(fp, encoding="utf-8")
+
+    async def _handle_finish_action(
+        self,
+        finish_action: ActionToolCall,
+        content: str,
+        task_goal: str,
+        display_turn: int,
+        turn_dir: Path,
+        task_idx: int,
+    ) -> Optional[Tuple[bool, str]]:
+        """
+        Returns (success, summary) if the task is done, or None to continue.
+        Also handles finish_task rejection (appends to messages directly).
+        """
+        out_files = (
+            self.working_memory.get_memory("artifacts").get("output_files", [])
+            if self.working_memory else []
+        )
+        confirmed = [f for f in out_files if Path(f).exists()]
+        mem_stage = (
+            self.working_memory.get_memory("control").get("stage", "")
+            if self.working_memory else ""
+        )
+        _WRITE_KW = ("write", "document", "report", "summary", "save", "output", "create", "generate")
+        found_kws = [kw for kw in _WRITE_KW if kw in task_goal.lower()]
+        needs_file = mem_stage == "writing" or bool(found_kws)
+
+        if needs_file and not confirmed:
+            console.print("[bold red]🚫 finish_task REJECTED — no output file found.[/bold red]")
+            rejection = PromptRegistry.finish_task_rejected(task_goal, found_kws)
+            self._append_feedback(content, rejection, display_turn, turn_dir, "finish_task_rejected.md")
+            return None  # continue loop
+
+        # Accepted
+        console.print("[bold green]🏁 Agent finished the task.[/bold green]")
+        for fpath in confirmed:
+            console.print(f"[bold blue]📄 Output: {fpath}[/bold blue]")
+            try:
+                from BatchAgent.minio_uploader import upload_file
+                url = upload_file(
+                    fpath,
+                    object_name=f"agent/{self.config.session_dir.name}/{Path(fpath).name}",
+                ) or ""
+                if url:
+                    console.print(f"[bold cyan]🌐 MinIO: {url}[/bold cyan]")
+            except Exception:
+                pass
+        if self.working_memory:
+            self.working_memory.update_memory({"control": {"status": "done", "stage": "done"}})
+            self.working_memory.save_memory()
+        self._save_trajectory_to_disk(task_idx, reward=1.0)
+        return True, finish_action.args.get("summary", "")
+
+    async def _stream_written_files(self, handler: Any) -> None:
+        """Stream file_written events to SSE clients."""
+        if not self.config.stream_callback:
+            return
+        file_records = list(getattr(handler, "written_file_records", []) or [])
+        if not file_records and handler.written_files:
+            for fpath in handler.written_files:
+                fname = Path(fpath).name
+                url = ""
+                inline = None
+                try:
+                    from BatchAgent.minio_uploader import upload_file
+                    url = upload_file(
+                        fpath,
+                        object_name=f"agent/{self.config.session_dir.name}/{fname}",
+                    ) or ""
+                except Exception:
+                    pass
+                try:
+                    ext = Path(fpath).suffix.lower()
+                    if ext in {".md", ".markdown", ".txt"} or (
+                        os.path.exists(fpath) and os.path.getsize(fpath) < 200 * 1024
+                    ):
+                        with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
+                            inline = _f.read()
+                except Exception:
+                    pass
+                file_records.append({
+                    "name": fname, "url": url, "local_path": fpath,
+                    "content": inline,
+                    "size": os.path.getsize(fpath) if os.path.exists(fpath) else 0,
+                })
+        for rec in file_records:
+            await self.config.stream_callback({
+                "type": "file_written",
+                "name": rec.get("name") or "",
+                "url": rec.get("url") or "",
+                "local_path": rec.get("local_path") or "",
+                "content": rec.get("content"),
+                "size": int(rec.get("size") or 0),
+            })
+
+    async def _handle_observation_tools(
+        self,
+        standard_actions: List[ActionToolCall],
+        turn_dir: Path,
+        display_turn: int,
+        allowlist: List[str],
+        ts: "_TaskState",
+    ) -> Tuple[List[str], bool]:
+        """
+        Execute observation tools, do loop detection, detect parallel-branches completion.
+        Returns (feedback_blocks, parallel_just_completed).
+        """
+        feedback_blocks: List[str] = []
+        parallel_just_completed = False
+
+        if not standard_actions:
+            return feedback_blocks, parallel_just_completed
+
+        # Loop detection
+        deduped, skipped_ok, skipped_err = ts.loop_detector.check_tools(standard_actions)
+        if skipped_err:
+            console.print(
+                f"[yellow]⚠️ Blocking retry of failed tools: {[n for n, _ in skipped_err]}[/yellow]"
+            )
+            for tool_name, err_summary in skipped_err:
+                feedback_blocks.append(PromptRegistry.tool_retry_blocked(tool_name, err_summary))
+        if skipped_ok:
+            console.print(f"[yellow]⚠️ Loop detected — skipping repeated: {skipped_ok}[/yellow]")
+            feedback_blocks.append(PromptRegistry.loop_detected(skipped_ok))
+        standard_actions = deduped
+
+        if not standard_actions:
+            return feedback_blocks, parallel_just_completed
+
+        # Update memory stage
+        if self.working_memory:
+            self.working_memory.update_memory({
+                "control": {
+                    "stage": "gathering",
+                    "current_step": f"T{display_turn}: {', '.join(a.name for a in standard_actions[:3])}",
+                }
+            })
+
+        concurrent_results, per_errors = await self._execute_tools_concurrently(
+            standard_actions, turn_dir, allowlist
+        )
+        ts.loop_detector.record_tools(standard_actions, per_errors)
+
+        # Auto-record in working memory
+        if self.working_memory:
+            per_results = concurrent_results.split("\n\n")
+            for idx, a in enumerate(standard_actions):
+                self.working_memory.record_action(
+                    f"T{display_turn}: {a.name}({_fmt_args(a.args)})"
+                )
+                if idx in per_errors:
+                    self.working_memory.record_failure(
+                        f"T{display_turn}: {a.name} → {per_errors[idx][:80]}"
+                    )
+                else:
+                    result_text = per_results[idx] if idx < len(per_results) else ""
+                    _auto_inject_result_to_memory(
+                        self.working_memory, a, result_text, display_turn
+                    )
+
+        feedback_blocks.append(f"### Tool Execution Results\n{concurrent_results}")
+
+        # Detect execute_parallel_branches completion → trigger write directive
+        parallel_names = {a.name for a in standard_actions}
+        if "execute_parallel_branches" in parallel_names:
+            parallel_just_completed = True
+
+        return feedback_blocks, parallel_just_completed
+
+    async def _handle_mutations(
+        self,
+        mutation_actions: List[Any],
+        standard_actions: List[ActionToolCall],
+        content: str,
+        allowlist: List[str],
+        turn_dir: Path,
+        display_turn: int,
+        task_idx: int,
+        ts: "_TaskState",
+    ) -> Tuple[List[str], Optional[Tuple[bool, str]]]:
+        """
+        Execute mutations, verify, detect PENDING markers, handle write-only repeat.
+        Returns (feedback_blocks, Optional[done_tuple]).
+        """
+        feedback_blocks: List[str] = []
+
+        if not mutation_actions:
+            return feedback_blocks, None
+
+        # Mutation dedup
+        deduped_mut, skipped_mut = ts.loop_detector.check_mutations(mutation_actions)
+        if skipped_mut:
+            feedback_blocks.append(PromptRegistry.mutation_dedup(self._vm.last_verify_failed))
+        mutation_actions = deduped_mut
+
+        if not mutation_actions:
+            return feedback_blocks, None
+
+        # Execute
+        handler = UniversalToolHandler(
+            config=self.config,
+            turn_dir=turn_dir,
+            allowlist=allowlist,
+            dynamic_tools_mapping=self.dynamic_tools_mapping,
+            dynamic_tools_registry=self.dynamic_tools_registry,
+        )
+        has_mutation, mutation_res = handler.execute(mutation_actions, content)
+        feedback_blocks.append(mutation_res)
+
+        # SSE streaming
+        await self._stream_written_files(handler)
+
+        if has_mutation:
+            written = list(getattr(handler, "written_files", []))
+            if self.working_memory and written:
+                for fpath in written:
+                    self.working_memory.record_artifact(fpath, is_output=True)
+                self.working_memory.update_memory({"control": {
+                    "stage": "writing",
+                    "current_step": f"T{display_turn}: writing {written[0]}",
+                }})
+            ts.loop_detector.record_mutations(mutation_actions)
+
+            # Verification
+            v_feedback, _v_passed = await self._vm.handle_verification_result(
+                content, mutation_actions, allowlist, turn_dir, display_turn
+            )
+            if v_feedback:
+                feedback_blocks.append(v_feedback)
+
+            # [PENDING:...] marker detection on written files
+            write_file_actions = [a for a in mutation_actions if isinstance(a, ActionWriteFile)]
+            for a in write_file_actions:
+                markers = _detect_pending_markers(str(a.path))
+                if not markers:
+                    # also try workspace-relative
+                    try:
+                        markers = _detect_pending_markers(
+                            str(self.config.workspace_dir / a.path)
+                        )
+                    except Exception:
+                        pass
+                if markers:
+                    feedback_blocks.append(PromptRegistry.pending_markers_report(markers))
+
+            # Write-only guidance + repeat detection
+            write_only = [a for a in mutation_actions if isinstance(a, ActionWriteFile)]
+            is_write_only = (
+                bool(write_only)
+                and len(write_only) == len(mutation_actions)
+                and not standard_actions
+            )
+            if is_write_only:
+                sig = tuple(sorted(str(a.path).strip().lower() for a in write_only))
+                no_verify = v_feedback and "No code execution" in v_feedback
+                if no_verify:
+                    feedback_blocks.append(PromptRegistry.write_only_guidance(str(write_only[0].path)))
+                if not _v_passed:
+                    ts.last_write_only_sig = None
+                    ts.write_only_repeat_count = 0
+                elif len(set(sig)) == 1:
+                    if sig == ts.last_write_only_sig:
+                        ts.write_only_repeat_count += 1
+                    else:
+                        ts.last_write_only_sig = sig
+                        ts.write_only_repeat_count = 1
+                    if ts.write_only_repeat_count >= 2:
+                        self._save_trajectory_to_disk(task_idx, reward=1.0)
+                        return feedback_blocks, (True, f"Completed task writing output file: {sig[0]}")
+                else:
+                    ts.last_write_only_sig = None
+                    ts.write_only_repeat_count = 0
+            else:
+                ts.last_write_only_sig = None
+                ts.write_only_repeat_count = 0
+
+        return feedback_blocks, None
+
+    # ------------------------------------------------------------------
+    # Main ReAct loop
+    # ------------------------------------------------------------------
+
+    async def execute_task(
+        self,
+        task_goal: str,
+        task_idx: int,
+        allowlist: List[str],
+        prompt_md: str,
+        resume_messages: Optional[List[Dict[str, str]]] = None,
+        start_turn_index: int = 0,
+        resume_rl_trajectory: Optional[List[Dict[str, str]]] = None,
+    ) -> Tuple[bool, str]:
+        console.print(f"\n[bold green]=== Starting Agent Task {task_idx + 1} ===[/bold green]")
+
+        # ── Init ────────────────────────────────────────────────────────────
+        self._init_task(task_goal, resume_messages, resume_rl_trajectory)
+
+        max_ctx = self.config.max_context
+        ts = _TaskState()
         final_result_text = "Task aborted or failed."
 
-        # ── Per-task state ─────────────────────────────────────────────────────
-        loop_detector = LoopDetector()
-        consecutive_json_parse_turns = 0
-        last_write_only_signature: Optional[tuple] = None
-        write_only_repeat_count = 0
-        _write_pressure_injected = False
-        max_ctx = self.config.max_context
-
-        for current_turn in range(MAX_REACT_TURNS):
+        for current_turn in range(self.config.max_turns):
             ctx_headroom = await self._prune_memory()
-
             absolute_turn = start_turn_index + current_turn
             display_turn = absolute_turn + 1
             turn_dir = self.config.session_dir / f"{task_idx * 100 + absolute_turn:04d}"
             turn_dir.mkdir(parents=True, exist_ok=True)
+            self._save_turn_debug(turn_dir, display_turn)
 
-            # Debug: save full prompt context for every turn
-            (turn_dir / "full_prompt_context.json").write_text(
-                json.dumps(self.messages, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            if self.messages:
-                (turn_dir / "latest_instruction.md").write_text(
-                    self.messages[-1]["content"], encoding="utf-8"
-                )
-
-            console.print(
-                f"\n[bold yellow]>>> ReAct Turn {display_turn} / {MAX_REACT_TURNS}[/bold yellow]"
-            )
-
-            # Notify SSE clients
             if self.config.stream_callback:
                 await self.config.stream_callback({
                     "type": "turn_start",
                     "turn": display_turn,
-                    "max_turns": MAX_REACT_TURNS,
+                    "max_turns": self.config.max_turns,
                 })
 
-            # First turn: append the task prompt
-            current_user_prompt = prompt_md if current_turn == 0 else ""
-            if self.config.enable_turn_limits:
-                current_user_prompt = (
-                    f"[Current Turn: {display_turn} / Max Turns: {MAX_REACT_TURNS}]\n"
-                    + current_user_prompt
-                )
-
             if current_turn == 0:
+                first_prompt = prompt_md
+                if self.config.enable_turn_limits:
+                    first_prompt = (
+                        f"[Current Turn: {display_turn} / Max Turns: {self.config.max_turns}]\n"
+                        + first_prompt
+                    )
                 self._log_rl("user", prompt_md)
-                self.messages.append({"role": "user", "content": current_user_prompt})
+                self.messages.append({"role": "user", "content": first_prompt})
                 (turn_dir / "user_prompt.md").write_text(prompt_md, encoding="utf-8")
 
-            # ── 1. LLM Generation ────────────────────────────────────────────────
-            async def _run_llm():
-                return await complete_with_continuation_async(
-                    client=self.config.client,
-                    model=self.config.model,
-                    messages=self.messages,
-                    temperature=self.config.temperature,
-                    max_output_tokens=self.config.max_output,
-                    model_max_context=self.config.max_context,
-                    provider=self.config.provider,
-                    stream=True,
-                    verbose=self.config.verbose,
-                    session_dir=self.config.session_dir,
-                    tools=self.tools,
-                    tool_strategy=self.config.tool_strategy,
-                    allowlist=allowlist,
-                    dynamic_tools_registry=self.dynamic_tools_registry,
-                    on_event=self.config.stream_callback,
-                    backend=self.config.backend,
-                    enable_thinking=self.config.enable_thinking,
-                )
-
-            if not self.config.verbose:
-                with console.status(
-                    f"[yellow]Thinking… (Turn {display_turn}/{MAX_REACT_TURNS})",
-                    spinner="dots",
-                ):
-                    content, actions = await _run_llm()
-            else:
-                content, actions = await _run_llm()
-
+            # ── LLM call ────────────────────────────────────────────────────
+            content, actions = await self._run_llm_call(display_turn, allowlist)
             (turn_dir / "response.md").write_text(content, encoding="utf-8")
             self._log_rl("assistant", content)
             final_result_text = content
+            self._save_action_log(turn_dir, actions)
 
-            # Debug: structured action log
-            action_logs = []
-            for a in actions:
-                if hasattr(a, "name") and hasattr(a, "args"):
-                    action_logs.append({"type": "Tool", "name": a.name, "args": a.args})
-                else:
-                    action_logs.append({"type": a.__class__.__name__, "path": getattr(a, "path", "N/A")})
-            (turn_dir / "parsed_actions.json").write_text(
-                json.dumps(action_logs, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-
-            # ── 2. Check for task completion ─────────────────────────────────────
+            # ── finish_task ──────────────────────────────────────────────────
             finish_action = next(
                 (a for a in actions if getattr(a, "name", "") == "finish_task"), None
             )
             if finish_action:
-                out_files = (
-                    self.working_memory.get_memory("artifacts").get("output_files", [])
-                    if self.working_memory else []
+                result = await self._handle_finish_action(
+                    finish_action, content, task_goal, display_turn, turn_dir, task_idx
                 )
-                confirmed = [f for f in out_files if Path(f).exists()]
-                mem_stage = (
-                    self.working_memory.get_memory("control").get("stage", "")
-                    if self.working_memory else ""
-                )
-                _WRITE_KW = ("write", "document", "report", "summary", "save",
-                             "output", "create", "generate")
-                needs_file = (
-                    mem_stage == "writing"
-                    or any(kw in task_goal.lower() for kw in _WRITE_KW)
-                )
-                if needs_file and not confirmed:
-                    console.print(
-                        "[bold red]🚫 finish_task REJECTED — task requires an output file "
-                        "but none found on disk.[/bold red]"
-                    )
-                    rejection = (
-                        "❌ **finish_task REJECTED**: Your task requires writing an output file "
-                        f"(goal contains: {[kw for kw in _WRITE_KW if kw in task_goal.lower()]}), "
-                        "but no output file was found on disk.\n\n"
-                        "Write the file first using `write_file`, then call `finish_task`.\n"
-                        "Use information already gathered — do NOT read more sections."
-                    )
-                    self.messages.append({"role": "assistant", "content": content})
-                    fp = rejection
-                    if self.config.enable_turn_limits:
-                        fp = f"[Current Turn: {display_turn} / Max Turns: {MAX_REACT_TURNS}]\n{fp}"
-                    self._log_rl("user", rejection)
-                    self.messages.append({"role": "user", "content": fp})
-                    (turn_dir / "finish_task_rejected.md").write_text(fp, encoding="utf-8")
-                    continue
+                if result is not None:
+                    return result
+                continue
 
-                console.print("[bold green]🏁 Agent finished the task.[/bold green]")
-                for fpath in confirmed:
-                    console.print(f"[bold blue]📄 Output: {fpath}[/bold blue]")
-                    try:
-                        from BatchAgent.minio_uploader import upload_file
-                        url = upload_file(
-                            fpath,
-                            object_name=f"agent/{self.config.session_dir.name}/{Path(fpath).name}",
-                        ) or ""
-                        if url:
-                            console.print(f"[bold cyan]🌐 MinIO: {url}[/bold cyan]")
-                    except Exception:
-                        pass
-                if self.working_memory:
-                    self.working_memory.update_memory({"control": {"status": "done", "stage": "done"}})
-                    self.working_memory.save_memory()
-                self._save_trajectory_to_disk(task_idx, reward=1.0)
-                return True, finish_action.args.get("summary", final_result_text)
-
-            # ── 3. Detect repeated JSON parse failures → strategy fallback ───────
+            # ── JSON parse failures → strategy switch ───────────────────────
             json_parse_errors = [
                 a for a in actions
                 if isinstance(a, ActionToolCall)
@@ -1133,61 +1266,30 @@ class UniversalAgent:
                 and "write_file" in str(getattr(a, "args", {}).get("error", "")).lower()
             ]
             if json_parse_errors:
-                consecutive_json_parse_turns += 1
-                if (
-                    self.config.tool_strategy == "native_all"
-                    and consecutive_json_parse_turns >= 2
-                ):
+                ts.consecutive_json_parse_turns += 1
+                if self.config.tool_strategy == "native_all" and ts.consecutive_json_parse_turns >= 2:
                     self.config.tool_strategy = "hybrid"
                     self._rebuild_tools_and_prompt("hybrid", self.config.domain)
-                    parse_fb = (
-                        "System switched strategy native_all → hybrid after repeated "
-                        "write_file JSON parse failures. Use native JSON for observations "
-                        "and JSON tools for file mutations."
+                    self._append_feedback(
+                        content,
+                        PromptRegistry.json_parse_strategy_switch(),
+                        display_turn, turn_dir, "strategy_switch_feedback.md",
                     )
-                    self.messages.append({"role": "assistant", "content": content})
-                    fp = parse_fb
-                    if self.config.enable_turn_limits:
-                        fp = f"[Current Turn: {display_turn} / Max Turns: {MAX_REACT_TURNS}]\n{fp}"
-                    self._log_rl("user", parse_fb)
-                    self.messages.append({"role": "user", "content": fp})
-                    (turn_dir / "strategy_switch_feedback.md").write_text(fp, encoding="utf-8")
                     continue
             else:
-                consecutive_json_parse_turns = 0
+                ts.consecutive_json_parse_turns = 0
 
-            # ── 4. No actions — format warning ───────────────────────────────────
+            # ── No actions → format reminder ─────────────────────────────────
             if not actions:
                 console.print("[yellow]No actions detected. Injecting format reminder.[/yellow]")
-                if self.config.tool_strategy == "native_all":
-                    fb = (
-                        "⚠️ System Warning: No valid tool calls detected.\n"
-                        "Use native JSON function calling (e.g. `web_search`, `write_file`). "
-                        "Do NOT put JSON in plain-text code blocks."
-                    )
-                elif self.config.tool_strategy == "text_only":
-                    fb = (
-                        "⚠️ System Warning: No valid XML tool calls detected.\n"
-                        "Use `<tool_call><web_search><query>…</query></web_search></tool_call>` "
-                        "or the XML write_file format."
-                    )
-                else:
-                    fb = (
-                        "⚠️ System Warning: No valid tool calls or file modifications detected.\n"
-                        "Use native JSON tools for searching/reading and `write_file` / "
-                        "`search_and_replace` for file mutations. "
-                        "Call `finish_task` if done."
-                    )
-                self.messages.append({"role": "assistant", "content": content})
-                fp = fb
-                if self.config.enable_turn_limits:
-                    fp = f"[Current Turn: {display_turn} / Max Turns: {MAX_REACT_TURNS}]\n{fp}"
-                self._log_rl("user", fb)
-                self.messages.append({"role": "user", "content": fp})
-                (turn_dir / "user_feedback.md").write_text(fp, encoding="utf-8")
+                self._append_feedback(
+                    content,
+                    PromptRegistry.no_action_warning(self.config.tool_strategy),
+                    display_turn, turn_dir,
+                )
                 continue
 
-            # ── 5. Segregate actions ─────────────────────────────────────────────
+            # ── Segregate ────────────────────────────────────────────────────
             info_actions = [a for a in actions if isinstance(a, ActionToolCall)]
             mutation_actions = [
                 a for a in actions
@@ -1195,15 +1297,11 @@ class UniversalAgent:
             ]
             feedback_blocks: List[str] = []
             if json_parse_errors:
-                feedback_blocks.append(
-                    "Tool JSON parsing failed for at least one call. "
-                    "If writing files, use the JSON write_file/search_and_replace tool."
-                )
+                feedback_blocks.append(PromptRegistry.json_parse_soft_warning())
 
-            # ── 6. Domain hot-swap ───────────────────────────────────────────────
+            # ── Domain hot-swap ──────────────────────────────────────────────
             load_action = next(
-                (a for a in info_actions if getattr(a, "name", "") == "load_domain_tools"),
-                None,
+                (a for a in info_actions if getattr(a, "name", "") == "load_domain_tools"), None
             )
             if load_action:
                 new_domain = load_action.args.get("domain", "")
@@ -1213,365 +1311,130 @@ class UniversalAgent:
                 if new_domain in DOMAIN_REGISTRY:
                     self.config.domain = new_domain
                     self._rebuild_tools_and_prompt(self.config.tool_strategy, new_domain)
-                    tool_names = [t["name"] for t in DOMAIN_REGISTRY[new_domain]]
-                    load_fb = (
-                        f"✅ Loaded domain plugin '{new_domain}'.\n"
-                        f"New tools: {', '.join(tool_names)}. Use them to complete the task."
+                    fb = PromptRegistry.domain_loaded(
+                        new_domain, [t["name"] for t in DOMAIN_REGISTRY[new_domain]]
                     )
                 else:
-                    load_fb = f"❌ Unknown domain plugin: '{new_domain}'."
-                self.messages.append({"role": "assistant", "content": content})
-                fp = load_fb
-                if self.config.enable_turn_limits:
-                    fp = f"[Current Turn: {display_turn} / Max Turns: {MAX_REACT_TURNS}]\n{fp}"
-                self._log_rl("user", load_fb)
-                self.messages.append({"role": "user", "content": fp})
-                (turn_dir / "load_feedback.md").write_text(fp, encoding="utf-8")
+                    fb = PromptRegistry.domain_unknown(new_domain)
+                self._append_feedback(content, fb, display_turn, turn_dir, "load_feedback.md")
                 continue
 
-            # ── 7. Parallel brainstorm ───────────────────────────────────────────
+            # ── Brainstorm ───────────────────────────────────────────────────
             bs_action = next(
-                (a for a in info_actions if getattr(a, "name", "") == "brainstorm_solutions"),
-                None,
+                (a for a in info_actions if getattr(a, "name", "") == "brainstorm_solutions"), None
             )
             if bs_action and getattr(self.config, "parallel_thinking", False):
                 bs_fb = await self._execute_batch_brainstorm(bs_action, allowlist)
-                self.messages.append({"role": "assistant", "content": content})
-                fp = bs_fb
-                if self.config.enable_turn_limits:
-                    fp = f"[Current Turn: {display_turn} / Max Turns: {MAX_REACT_TURNS}]\n{fp}"
-                self._log_rl("user", bs_fb)
-                self.messages.append({"role": "user", "content": fp})
-                (turn_dir / "bs_feedback.md").write_text(fp, encoding="utf-8")
+                self._append_feedback(content, bs_fb, display_turn, turn_dir, "bs_feedback.md")
                 continue
 
-            # ── 8. Custom tool registration ──────────────────────────────────────
+            # ── Custom tool registration ─────────────────────────────────────
             reg_action = next(
-                (a for a in info_actions if getattr(a, "name", "") == "register_custom_tool"),
-                None,
+                (a for a in info_actions if getattr(a, "name", "") == "register_custom_tool"), None
             )
             if reg_action:
-                args = reg_action.args
-                t_name = args.get("tool_name", "custom_tool")
+                t_name = reg_action.args.get("tool_name", "custom_tool")
                 console.print(
                     f"\n[bold green]🛠️ Registering custom tool: [white]{t_name}[/white][/bold green]"
                 )
                 new_schema = {
                     "name": t_name,
-                    "description": args.get("description", ""),
-                    "properties": args.get("schema_properties", {}),
-                    "required": args.get("required_args", []),
+                    "description": reg_action.args.get("description", ""),
+                    "properties": reg_action.args.get("schema_properties", {}),
+                    "required": reg_action.args.get("required_args", []),
                 }
                 self.dynamic_tools_schema.append(new_schema)
-                self.dynamic_tools_mapping[t_name] = args.get("script_path", "")
+                self.dynamic_tools_mapping[t_name] = reg_action.args.get("script_path", "")
                 self.dynamic_tools_registry[t_name] = new_schema
                 self._rebuild_tools_and_prompt(self.config.tool_strategy, self.config.domain)
-                reg_fb = (
-                    f"✅ Custom tool `{t_name}` registered and available immediately. "
-                    "Call it like any native tool."
+                self._append_feedback(
+                    content,
+                    PromptRegistry.custom_tool_registered(t_name),
+                    display_turn, turn_dir, "custom_tool_feedback.md",
                 )
-                self.messages.append({"role": "assistant", "content": content})
-                fp = reg_fb
-                if self.config.enable_turn_limits:
-                    fp = f"[Current Turn: {display_turn} / Max Turns: {MAX_REACT_TURNS}]\n{fp}"
-                self._log_rl("user", reg_fb)
-                self.messages.append({"role": "user", "content": fp})
-                (turn_dir / "custom_tool_feedback.md").write_text(fp, encoding="utf-8")
                 continue
 
-            # ── 9. Execute standard observation tools (concurrently) ─────────────
+            # ── Observation tools ────────────────────────────────────────────
             _SKIP_NAMES = {
                 "brainstorm_solutions", "finish_task", "load_domain_tools",
                 "register_custom_tool", "json_parse_error",
             }
             standard_actions = [a for a in info_actions if a.name not in _SKIP_NAMES]
+            obs_blocks, parallel_done = await self._handle_observation_tools(
+                standard_actions, turn_dir, display_turn, allowlist, ts
+            )
+            feedback_blocks.extend(obs_blocks)
+            if parallel_done or ts.parallel_complete_pending:
+                feedback_blocks.append(PromptRegistry.parallel_branches_complete())
+                ts.parallel_complete_pending = False
 
-            # Loop-detection: deduplicate repeated identical calls
-            if standard_actions:
-                deduped, skipped_ok, skipped_err = loop_detector.check_tools(standard_actions)
-                if skipped_err:
-                    console.print(
-                        f"[yellow]⚠️ Blocking retry of failed tools: "
-                        f"{[n for n, _ in skipped_err]}[/yellow]"
-                    )
-                    for tool_name, err_summary in skipped_err:
-                        feedback_blocks.append(
-                            f"⚠️ **Tool unavailable**: `{tool_name}` previously failed: "
-                            f'"{err_summary}". Do NOT retry — proceed with what you have.'
-                        )
-                if skipped_ok:
-                    console.print(
-                        f"[yellow]⚠️ Loop detected — skipping repeated: {skipped_ok}[/yellow]"
-                    )
-                    feedback_blocks.append(
-                        f"⚠️ **Loop detected**: You already called {skipped_ok} with identical "
-                        "arguments. Results already provided. Synthesize what you know — "
-                        "call `write_file` or `finish_task`."
-                    )
-                standard_actions = deduped
+            # ── Mutations ────────────────────────────────────────────────────
+            mut_blocks, done_tuple = await self._handle_mutations(
+                mutation_actions, standard_actions, content, allowlist,
+                turn_dir, display_turn, task_idx, ts,
+            )
+            feedback_blocks.extend(mut_blocks)
+            if done_tuple is not None:
+                return done_tuple
 
-            if standard_actions:
-                # Auto-update memory stage before executing tools
-                if self.working_memory:
-                    self.working_memory.update_memory({
-                        "control": {
-                            "stage": "gathering",
-                            "current_step": f"T{display_turn}: {', '.join(a.name for a in standard_actions[:3])}",
-                        }
-                    })
-
-                concurrent_results, per_errors = await self._execute_tools_concurrently(
-                    standard_actions, turn_dir, allowlist
-                )
-                loop_detector.record_tools(standard_actions, per_errors)
-
-                # Auto-record tool calls + errors in working memory, and
-                # auto-inject key results so get_memory() shows useful content.
-                if self.working_memory:
-                    per_results = concurrent_results.split("\n\n")
-                    for idx, a in enumerate(standard_actions):
-                        self.working_memory.record_action(
-                            f"T{display_turn}: {a.name}({_fmt_args(a.args)})"
-                        )
-                        if idx in per_errors:
-                            self.working_memory.record_failure(
-                                f"T{display_turn}: {a.name} → {per_errors[idx][:80]}"
-                            )
-                        else:
-                            # Persist key tool results into knowledge so the model
-                            # sees them when it calls get_memory().
-                            result_text = per_results[idx] if idx < len(per_results) else ""
-                            _auto_inject_result_to_memory(
-                                self.working_memory, a, result_text, display_turn
-                            )
-
-                feedback_blocks.append(f"### Tool Execution Results\n{concurrent_results}")
-
-            # ── 10. Execute mutations ────────────────────────────────────────────
-            if mutation_actions:
-                deduped_mut, skipped_mut = loop_detector.check_mutations(mutation_actions)
-                if skipped_mut:
-                    feedback_blocks.append(
-                        "⚠️ Repeated identical file mutation skipped. "
-                        "The same write/edit was already applied. "
-                        "Call `finish_task` if the goal is completed."
-                    )
-                mutation_actions = deduped_mut
-
-            if mutation_actions:
-                handler = UniversalToolHandler(
-                    config=self.config,
-                    turn_dir=turn_dir,
-                    allowlist=allowlist,
-                    dynamic_tools_mapping=self.dynamic_tools_mapping,
-                    dynamic_tools_registry=self.dynamic_tools_registry,
-                )
-                has_mutation, mutation_res = handler.execute(mutation_actions, content)
-                feedback_blocks.append(mutation_res)
-
-                # Stream file_written events to SSE clients
-                if self.config.stream_callback:
-                    file_records = list(getattr(handler, "written_file_records", []) or [])
-                    if not file_records and handler.written_files:
-                        for fpath in handler.written_files:
-                            fname = Path(fpath).name
-                            url = ""
-                            inline = None
-                            try:
-                                from BatchAgent.minio_uploader import upload_file
-                                url = upload_file(
-                                    fpath,
-                                    object_name=f"agent/{self.config.session_dir.name}/{fname}",
-                                ) or ""
-                            except Exception:
-                                pass
-                            try:
-                                ext = Path(fpath).suffix.lower()
-                                if ext in {".md", ".markdown", ".txt"} or (
-                                    os.path.exists(fpath)
-                                    and os.path.getsize(fpath) < 200 * 1024
-                                ):
-                                    with open(fpath, "r", encoding="utf-8", errors="replace") as _f:
-                                        inline = _f.read()
-                            except Exception:
-                                pass
-                            file_records.append({
-                                "name": fname, "url": url, "local_path": fpath,
-                                "content": inline,
-                                "size": os.path.getsize(fpath) if os.path.exists(fpath) else 0,
-                            })
-                    for rec in file_records:
-                        await self.config.stream_callback({
-                            "type": "file_written",
-                            "name": rec.get("name") or "",
-                            "url": rec.get("url") or "",
-                            "local_path": rec.get("local_path") or "",
-                            "content": rec.get("content"),
-                            "size": int(rec.get("size") or 0),
-                        })
-
-                if has_mutation:
-                    written = list(getattr(handler, "written_files", []))
-                    if self.working_memory and written:
-                        for fpath in written:
-                            self.working_memory.record_artifact(fpath, is_output=True)
-                        self.working_memory.update_memory({
-                            "control": {
-                                "stage": "writing",
-                                "current_step": f"T{display_turn}: writing {written[0]}",
-                            }
-                        })
-                    loop_detector.record_mutations(mutation_actions)
-
-                    v_feedback = self._verify_mutations(
-                        content, mutation_actions, allowlist, turn_dir
-                    )
-                    if v_feedback:
-                        feedback_blocks.append(v_feedback)
-
-                    # Write-only turn → guide the agent toward finishing
-                    write_only = [a for a in mutation_actions if isinstance(a, ActionWriteFile)]
-                    is_write_only = (
-                        bool(write_only)
-                        and len(write_only) == len(mutation_actions)
-                        and not standard_actions
-                    )
-                    if is_write_only:
-                        sig = tuple(sorted(str(a.path).strip().lower() for a in write_only))
-                        no_verify = v_feedback and "No code execution" in v_feedback
-                        if no_verify:
-                            written_file = str(write_only[0].path) if write_only else ""
-                            feedback_blocks.append(
-                                f"\n✅ **File written**: `{written_file}`\n\n"
-                                "**What to do next — choose exactly one:**\n"
-                                "1. **Output complete** → call `finish_task` NOW.\n"
-                                "2. **Placeholders remain** (`[TODO]`, `# PLACEHOLDER`, etc.) → "
-                                "read the next source batch, then `search_and_replace` each marker.\n"
-                                "3. **More source content unread** → `update_memory` what you wrote, "
-                                "then continue the read→write→update cycle.\n\n"
-                                "⚠️ Do NOT read more unless you have a specific placeholder to fill."
-                            )
-                        # Detect verification outcome from the feedback string.
-                        # Only count repeated writes when verification is absent
-                        # (non-executable files) — never when it explicitly failed.
-                        verify_failed = v_feedback and (
-                            "Verification Failed" in v_feedback
-                            or "Exit 1" in v_feedback
-                            or "Exit 2" in v_feedback
-                            or "SyntaxError" in v_feedback
-                            or "Traceback" in v_feedback
-                            or "Error" in v_feedback
-                        )
-
-                        if verify_failed:
-                            # Verification is actively failing → reset counter so the
-                            # agent keeps trying to fix the code, never exits early.
-                            last_write_only_signature = None
-                            write_only_repeat_count = 0
-                        elif len(set(sig)) == 1:
-                            if sig == last_write_only_signature:
-                                write_only_repeat_count += 1
-                            else:
-                                last_write_only_signature = sig
-                                write_only_repeat_count = 1
-                            if write_only_repeat_count >= 2:
-                                summary = f"Completed task writing output file: {sig[0]}"
-                                self._save_trajectory_to_disk(task_idx, reward=1.0)
-                                return True, summary
-                        else:
-                            last_write_only_signature = None
-                            write_only_repeat_count = 0
-                    else:
-                        last_write_only_signature = None
-                        write_only_repeat_count = 0
-
-            # ── 11. Periodic memory compaction ───────────────────────────────────
+            # ── Memory compaction ────────────────────────────────────────────
             if self.working_memory and current_turn > 0 and current_turn % 5 == 0:
                 self.working_memory.compact_memory()
                 console.print("[dim]🧠 Working memory compacted.[/dim]")
 
-            # ── 12. Build feedback message ────────────────────────────────────────
+            # ── Build combined feedback ──────────────────────────────────────
             combined_feedback = "\n\n".join(feedback_blocks)
-
             if not mutation_actions and standard_actions:
-                cur_out = (
-                    self.working_memory.get_memory("artifacts").get("output_files", [])
-                    if self.working_memory else []
-                )
-                if cur_out:
-                    combined_feedback += (
-                        f"\nResults above from your read. "
-                        f"Output file exists: `{cur_out[0]}`. "
-                        "If complete, call `finish_task` now. "
-                        "Only continue reading if you have a specific placeholder to fill."
-                    )
-                else:
-                    combined_feedback += "\nAnalyze the results and continue."
-
-            if not combined_feedback.strip():
-                combined_feedback = (
-                    "No new actions were executed. "
-                    "If the output file is already correct, call `finish_task` now."
-                )
-
-            # ── 13. Write-pressure injection (context nearing 60%) ───────────────
-            _ctx_pct = 100 - int(ctx_headroom * 100 / max_ctx)
-            if ctx_headroom < max_ctx * 0.40 and not _write_pressure_injected:
-                _write_pressure_injected = True
                 out_files = (
                     self.working_memory.get_memory("artifacts").get("output_files", [])
                     if self.working_memory else []
                 )
-                if not out_files:
-                    combined_feedback += (
-                        f"\n\n📋 **LONG-TASK STRATEGY ({_ctx_pct}% context used — switch now)**\n\n"
-                        "You have read enough. **Stop reading. Create the output file NOW.**\n\n"
-                        "**Cycle: Read batch → Write/update → Track → Repeat**\n"
-                        "1. `write_file` with what you know; use `[PENDING: <section>]` markers.\n"
-                        "2. Read next batch → `search_and_replace` the marker.\n"
-                        "3. `update_memory` progress after each fill.\n"
-                        "4. Repeat until no markers remain.\n"
-                        "5. `finish_task` — do not keep reading once complete.\n\n"
-                        "⚡ **Act now**: call `write_file` to create the initial output."
-                    )
-                else:
-                    combined_feedback += (
-                        f"\n\n📋 **CONTINUE LONG-TASK CYCLE ({_ctx_pct}% context used)**\n"
-                        f"Output file: `{out_files[0]}`.\n"
-                        "- Markers remain → read next batch, `search_and_replace` each one.\n"
-                        "- Output complete → `finish_task` NOW.\n"
-                        "Check `progress.completed_steps` in memory for what is already done."
-                    )
+                combined_feedback += PromptRegistry.read_only_guidance(
+                    out_files[0] if out_files else None
+                )
+            if not combined_feedback.strip():
+                combined_feedback = PromptRegistry.empty_turn_fallback()
+
+            # ── Write-pressure ───────────────────────────────────────────────
+            _ctx_pct = 100 - int(ctx_headroom * 100 / max_ctx)
+            if ctx_headroom < max_ctx * 0.40 and not ts.write_pressure_injected:
+                ts.write_pressure_injected = True
+                out_files = (
+                    self.working_memory.get_memory("artifacts").get("output_files", [])
+                    if self.working_memory else []
+                )
+                combined_feedback += PromptRegistry.write_pressure(
+                    _ctx_pct, out_files[0] if out_files else None
+                )
                 console.print(
                     f"[bold yellow]⚠ Write-pressure injected ({_ctx_pct}% context used).[/bold yellow]"
                 )
 
-            # ── 14. Prepend memory snapshot ──────────────────────────────────────
+            # ── Memory snapshot + append ─────────────────────────────────────
             if self.working_memory:
                 self.working_memory.save_memory()
                 (turn_dir / "working_memory_snapshot.json").write_text(
                     json.dumps(self.working_memory.get_memory(), indent=2, ensure_ascii=False),
                     encoding="utf-8",
                 )
-                mem_snap = self.working_memory.to_context_string()
-                combined_feedback = f"[Working Memory Snapshot]\n{mem_snap}\n\n" + combined_feedback
-
-            # ── 15. Append feedback to message history ────────────────────────────
-            if combined_feedback:
-                (turn_dir / "tool_execution_results.md").write_text(
-                    combined_feedback, encoding="utf-8"
+                combined_feedback = (
+                    f"[Working Memory Snapshot]\n{self.working_memory.to_context_string()}\n\n"
+                    + combined_feedback
                 )
 
-            self.messages.append({"role": "assistant", "content": content})
-            feedback_prompt = combined_feedback
+            (turn_dir / "tool_execution_results.md").write_text(
+                combined_feedback, encoding="utf-8"
+            )
+            fp = combined_feedback
             if self.config.enable_turn_limits:
-                feedback_prompt = (
-                    f"[Current Turn: {display_turn} / Max Turns: {MAX_REACT_TURNS}]\n"
-                    + feedback_prompt
+                fp = (
+                    f"[Current Turn: {display_turn} / Max Turns: {self.config.max_turns}]\n"
+                    + fp
                 )
             self._log_rl("user", combined_feedback)
-            self.messages.append({"role": "user", "content": feedback_prompt})
-            (turn_dir / "user_feedback.md").write_text(feedback_prompt, encoding="utf-8")
+            self.messages.append({"role": "assistant", "content": content})
+            self.messages.append({"role": "user", "content": fp})
+            (turn_dir / "user_feedback.md").write_text(fp, encoding="utf-8")
 
         # ── Max turns exceeded ───────────────────────────────────────────────────
         console.print("[bold red]Max ReAct turns exceeded. Task aborted.[/bold red]")
@@ -1623,7 +1486,7 @@ async def main_async() -> None:
 
     # Provider / model
     parser.add_argument("--tool-strategy", choices=["native_all", "hybrid", "text_only"],
-                        default="hybrid")
+                        default="native_all")
     parser.add_argument("--provider", default="openai", choices=["openai", "anthropic"])
     parser.add_argument("--model",
                         default=os.environ.get("VLLM_MODEL", "qwen3.5-9b"))
@@ -1668,7 +1531,7 @@ async def main_async() -> None:
     parser.add_argument("--enable-turn-limits", action="store_true")
     parser.add_argument("--max-turns", type=int, default=15)
     parser.add_argument("--memory-strategy", choices=["sliding_window", "summarize"],
-                        default="sliding_window")
+                        default="summarize")
     parser.add_argument("--backend", choices=["vllm", "llama.cpp", "openai", "anthropic"],
                         default="vllm")
 
