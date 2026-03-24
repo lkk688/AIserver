@@ -259,6 +259,34 @@ class GitHubRemote:
                     target.write_text(await f_resp.text(), encoding="utf-8")
         return True, "OK"
 
+
+# ============================================================================
+# GitHub URL Discovery: auto-enumerate sub-folder skill URLs
+# ============================================================================
+async def discover_skill_urls(github: "GitHubRemote", broad_url: str) -> List[str]:
+    """
+    Given a broad GitHub repo URL (e.g. https://github.com/Org/repo), list all
+    immediate sub-directory URLs — each treated as one skill task.
+    Returns a list of GitHub tree URLs for each sub-folder.
+    """
+    import re as _re
+    listing = await github.list_remote_repo(broad_url)
+    if listing.startswith("Error"):
+        logger.warning(f"[Discover] Failed to list {broad_url}: {listing}")
+        return []
+
+    skill_urls: List[str] = []
+    for line in listing.splitlines():
+        if not line.startswith("[DIR"):
+            continue
+        m = _re.search(r"URL:\s*(https://github\.com/[^\)]+)", line)
+        if m:
+            skill_urls.append(m.group(1).strip())
+
+    logger.info(f"[Discover] Found {len(skill_urls)} sub-folder skill(s) in {broad_url}")
+    return skill_urls
+
+
 # ============================================================================
 # 1. Embedding Generator (OpenAI-compatible /v1/embeddings)
 # ============================================================================
@@ -997,6 +1025,376 @@ Start by listing repository contents.
 
     return distilled_package
 
+
+# ============================================================================
+# 5b. UniversalAgent-based Distiller and Summarizer
+# ============================================================================
+
+def _build_universal_agent(
+    client: Any,
+    model: str,
+    provider: str,
+    session_dir: Path,
+    workspace_dir: Path,
+    agent_dir: Path,
+    tool_strategy: str = "hybrid",
+    serper_api_key: str = "",
+    tavily_api_key: str = "",
+    embedding_base_url: str = "http://localhost:8081/v1",
+    embedding_api_key: str = "EMPTY",
+    embedding_model: str = "text-embeddings-inference",
+    max_turns: int = 15,
+    verbose: bool = False,
+) -> Tuple[Any, Any, Any]:  # (agent, config, system_prompt)
+    """
+    Build a UniversalAgent with appropriate config.
+    Returns (agent, config, system_prompt).
+    Imports are done locally to allow standalone script invocation.
+    """
+    try:
+        from BatchAgent.agent_main_v2 import AgentConfig, UniversalAgent
+        from BatchAgent.tools.tools_registry import compile_tools_for_provider, get_base_tools
+        from BatchAgent.tools.tool_registry_runtime import configure_global_tool_registry
+        from BatchAgent.prompt_registry_v2 import PromptRegistry
+    except ModuleNotFoundError:
+        from agent_main_v2 import AgentConfig, UniversalAgent
+        from tools.tools_registry import compile_tools_for_provider, get_base_tools
+        from tools.tool_registry_runtime import configure_global_tool_registry
+        from prompt_registry_v2 import PromptRegistry
+
+    config = AgentConfig(
+        client=client,
+        model=model,
+        provider=provider,
+        temperature=0.05,
+        backend="vllm",
+        max_context=32768,
+        max_output=4096,
+        session_dir=session_dir,
+        workspace_dir=workspace_dir,
+        agent_dir=agent_dir,
+        tool_strategy=tool_strategy,
+        parallel_thinking=False,
+        domain="software_eng",
+        serper_api_key=serper_api_key,
+        tavily_api_key=tavily_api_key,
+        embedding_base_url=embedding_base_url,
+        embedding_api_key=embedding_api_key,
+        embedding_model=embedding_model,
+        require_approval=False,
+        verbose=verbose,
+        max_turns=max_turns,
+        memory_strategy="sliding_window",
+    )
+
+    configure_global_tool_registry(
+        strategy=tool_strategy,
+        profile="general",
+        domain="software_eng",
+        enable_memory=True,
+        enable_web=True,
+        enable_document=False,
+        enable_code_tools=True,
+        enable_mutation=True,
+        enable_bash=True,
+        enable_parallel=False,
+        enable_meta=True,
+    )
+    base_tools = get_base_tools(
+        strategy=tool_strategy,
+        enable_parallel=False,
+        domain="software_eng",
+    )
+    compiled_tools = compile_tools_for_provider(base_tools, provider, tool_strategy)
+    system_prompt = PromptRegistry.get_system_prompt(
+        strategy=tool_strategy,
+        base_tools_list=base_tools,
+        domain="software_eng",
+        location="",
+        current_time="",
+    )
+    agent = UniversalAgent(config, system_prompt, compiled_tools)
+    return agent, config, system_prompt
+
+
+async def run_distill_agent_v2(
+    client: Any,
+    model: str,
+    provider: str,
+    skill_url: str,
+    github: "GitHubRemote",
+    output_dir: Path,
+    task_idx: int = 0,
+    tool_strategy: str = "hybrid",
+    serper_api_key: str = "",
+    tavily_api_key: str = "",
+    embedding_base_url: str = "http://localhost:8081/v1",
+    embedding_api_key: str = "EMPTY",
+    embedding_model: str = "text-embeddings-inference",
+    max_turns: int = 15,
+    verbose: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """
+    Use UniversalAgent to distill a GitHub skill repository.
+
+    The agent is asked to:
+      1. Read files from the GitHub repo
+      2. Write distilled Python code to output_dir/
+      3. Write output_dir/skill_meta.json with metadata
+      4. Call finish_task when done
+
+    After the agent completes we reconstruct the distilled_package dict from disk.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pre-list the repo so we can include it in the task prompt
+    try:
+        repo_listing = await github.list_remote_repo(skill_url)
+    except Exception as exc:
+        logger.warning(f"[DistillV2] Could not list repo {skill_url}: {exc}")
+        repo_listing = "(repo listing unavailable)"
+
+    session_dir = output_dir / "agent_session"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    agent_dir = output_dir / ".agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+
+    agent, config, _ = _build_universal_agent(
+        client=client,
+        model=model,
+        provider=provider,
+        session_dir=session_dir,
+        workspace_dir=output_dir,
+        agent_dir=agent_dir,
+        tool_strategy=tool_strategy,
+        serper_api_key=serper_api_key,
+        tavily_api_key=tavily_api_key,
+        embedding_base_url=embedding_base_url,
+        embedding_api_key=embedding_api_key,
+        embedding_model=embedding_model,
+        max_turns=max_turns,
+        verbose=verbose,
+    )
+
+    task_goal = f"Distill the GitHub skill at: {skill_url}"
+    prompt_md = f"""You are an elite AI Skill Distiller. Your job is to read a remote GitHub skill repository, extract functional Python code, and save it locally.
+
+**Target Skill URL:** {skill_url}
+
+**Repository Contents (pre-fetched):**
+```
+{repo_listing}
+```
+
+**Instructions:**
+1. Read the README.md and/or SKILL.md to understand the skill's purpose and interface.
+2. Read each relevant Python (.py) file using `read_url` with raw.githubusercontent.com URLs.
+3. Write the distilled Python files to: `{output_dir}/` (preserve multi-file structure if needed).
+   - The entrypoint script MUST read JSON arguments from `sys.argv[1]` and print the result as JSON to stdout.
+   - Do NOT include code that runs destructive OS commands or evaluates arbitrary strings.
+4. Write a `skill_meta.json` file at `{output_dir}/skill_meta.json` with this exact structure:
+```json
+{{
+  "skill_name": "<snake_case_name>",
+  "summary": "<one paragraph: what this skill does, inputs, outputs>",
+  "entrypoint": "<main_script.py>",
+  "env_setup_bash": "pip install <dep1> <dep2>",
+  "test_payload_json": "<valid JSON string for testing>"
+}}
+```
+5. Call `finish_task` with the skill_name once all files are written.
+
+**Raw URL format:** `https://raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>`
+""".strip()
+
+    try:
+        success, final_text = await agent.execute_task(
+            task_goal=task_goal,
+            task_idx=task_idx,
+            allowlist=[str(output_dir)],
+            prompt_md=prompt_md,
+        )
+    except Exception as exc:
+        logger.exception(f"[DistillV2] Agent execution error for {skill_url}: {exc}")
+        return None
+
+    if not success:
+        logger.warning(f"[DistillV2] Agent did not succeed for {skill_url}: {final_text[:200]}")
+
+    # Reconstruct distilled_package from disk
+    meta_path = output_dir / "skill_meta.json"
+    if not meta_path.exists():
+        logger.warning(f"[DistillV2] skill_meta.json not found in {output_dir}")
+        return None
+
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning(f"[DistillV2] Failed to parse skill_meta.json: {exc}")
+        return None
+
+    skill_name = meta.get("skill_name", "unknown_skill")
+    entrypoint = meta.get("entrypoint", "")
+
+    # Collect all written Python files
+    files: Dict[str, str] = {}
+    for py_file in sorted(output_dir.glob("*.py")):
+        try:
+            files[py_file.name] = py_file.read_text(encoding="utf-8")
+        except Exception:
+            pass
+    # Also recurse one level into sub-packages
+    for sub_dir in output_dir.iterdir():
+        if sub_dir.is_dir() and sub_dir.name not in ("agent_session", ".agent", "venv"):
+            for py_file in sorted(sub_dir.glob("*.py")):
+                rel = f"{sub_dir.name}/{py_file.name}"
+                try:
+                    files[rel] = py_file.read_text(encoding="utf-8")
+                except Exception:
+                    pass
+
+    if not files:
+        logger.warning(f"[DistillV2] No Python files found in {output_dir}")
+        return None
+
+    if entrypoint and entrypoint not in files:
+        logger.warning(f"[DistillV2] entrypoint '{entrypoint}' not found in written files; using first .py file")
+        entrypoint = next(iter(files))
+
+    distilled_package: Dict[str, Any] = {
+        "skill_name": skill_name,
+        "summary": meta.get("summary", ""),
+        "entrypoint": entrypoint,
+        "env_setup_bash": meta.get("env_setup_bash", ""),
+        "test_payload_json": meta.get("test_payload_json", "{}"),
+        "files": files,
+        "source_url": skill_url,
+    }
+
+    # AST security scan
+    is_safe, violations = ast_scan_minipackage(files)
+    if not is_safe:
+        logger.warning(f"[DistillV2] AST security scan failed for {skill_name}: {violations}")
+        return None
+
+    logger.info(f"[DistillV2] Successfully distilled '{skill_name}' ({len(files)} files)")
+    return distilled_package
+
+
+async def run_summarize_agent(
+    client: Any,
+    model: str,
+    provider: str,
+    skill_url: str,
+    github: "GitHubRemote",
+    output_dir: Path,
+    task_idx: int = 0,
+    tool_strategy: str = "hybrid",
+    serper_api_key: str = "",
+    tavily_api_key: str = "",
+    embedding_base_url: str = "http://localhost:8081/v1",
+    embedding_api_key: str = "EMPTY",
+    embedding_model: str = "text-embeddings-inference",
+    max_turns: int = 10,
+    verbose: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """
+    Use UniversalAgent to summarize a GitHub skill (no code writing, no sandbox).
+
+    The agent reads README/SKILL.md and key Python files, then writes
+    output_dir/skill_summary.json with a structured summary including a link
+    to the original source.  Returns the summary dict or None on failure.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        repo_listing = await github.list_remote_repo(skill_url)
+    except Exception as exc:
+        logger.warning(f"[SummarizeAgent] Could not list repo {skill_url}: {exc}")
+        repo_listing = "(repo listing unavailable)"
+
+    session_dir = output_dir / "agent_session"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    agent_dir = output_dir / ".agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+
+    agent, config, _ = _build_universal_agent(
+        client=client,
+        model=model,
+        provider=provider,
+        session_dir=session_dir,
+        workspace_dir=output_dir,
+        agent_dir=agent_dir,
+        tool_strategy=tool_strategy,
+        serper_api_key=serper_api_key,
+        tavily_api_key=tavily_api_key,
+        embedding_base_url=embedding_base_url,
+        embedding_api_key=embedding_api_key,
+        embedding_model=embedding_model,
+        max_turns=max_turns,
+        verbose=verbose,
+    )
+
+    task_goal = f"Summarize the GitHub skill at: {skill_url}"
+    prompt_md = f"""You are a Skill Librarian. Your job is to read and understand a remote GitHub skill repository and produce a structured summary — NO code writing required.
+
+**Target Skill URL:** {skill_url}
+
+**Repository Contents (pre-fetched):**
+```
+{repo_listing}
+```
+
+**Instructions:**
+1. Use `read_url` with raw.githubusercontent.com URLs to read README.md, SKILL.md, and the main Python entrypoint.
+2. Understand what the skill does: its purpose, inputs, outputs, and dependencies.
+3. Write a `skill_summary.json` file at `{output_dir}/skill_summary.json` with this exact structure:
+```json
+{{
+  "skill_name": "<snake_case_name>",
+  "summary": "<detailed paragraph describing what the skill does, key inputs, outputs, use cases>",
+  "capabilities": ["<cap1>", "<cap2>", "<cap3>"],
+  "dependencies": ["<dep1>", "<dep2>"],
+  "source_url": "{skill_url}",
+  "files_in_repo": ["<file1.py>", "<file2.py>", "README.md"]
+}}
+```
+4. Call `finish_task` with the skill_name once skill_summary.json is written.
+
+**DO NOT write or modify any Python code files.** Only read and summarize.
+""".strip()
+
+    try:
+        success, final_text = await agent.execute_task(
+            task_goal=task_goal,
+            task_idx=task_idx,
+            allowlist=[str(output_dir)],
+            prompt_md=prompt_md,
+        )
+    except Exception as exc:
+        logger.exception(f"[SummarizeAgent] Agent execution error for {skill_url}: {exc}")
+        return None
+
+    if not success:
+        logger.warning(f"[SummarizeAgent] Agent did not succeed for {skill_url}: {final_text[:200]}")
+
+    summary_path = output_dir / "skill_summary.json"
+    if not summary_path.exists():
+        logger.warning(f"[SummarizeAgent] skill_summary.json not found in {output_dir}")
+        return None
+
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning(f"[SummarizeAgent] Failed to parse skill_summary.json: {exc}")
+        return None
+
+    # Ensure source_url is set
+    summary.setdefault("source_url", skill_url)
+    logger.info(f"[SummarizeAgent] Successfully summarized '{summary.get('skill_name', '?')}' from {skill_url}")
+    return summary
+
+
 # ============================================================================
 # 6. Test Module
 # ============================================================================
@@ -1127,39 +1525,115 @@ async def idle_skill_discovery_loop(
     discovery_queue: List[str],
     base_url: str,
     api_key: str,
+    provider: str = "openai",
+    tool_strategy: str = "hybrid",
     embedding_base_url: Optional[str] = None,
     embedding_api_key: Optional[str] = None,
     embedding_model: Optional[str] = None,
     export_sft: bool = False,
-    check_interval_s: int = 10
+    check_interval_s: int = 10,
+    mode: str = "distill-code",
+    serper_api_key: str = "",
+    tavily_api_key: str = "",
+    verbose: bool = False,
 ):
     """
-    Background silent discovery loop. Distills, verifies, and semantically indexes GitHub Repos.
+    Background silent discovery loop. Processes each skill URL according to `mode`.
+
+    mode="distill-code"   — full pipeline: read → distill code → venv verify → index
+    mode="summarize-only" — lightweight: read README/SKILL.md → build summary index
     """
-    logger.info("[IdleDaemon] Started background learning daemon...")
-    
-    for url in discovery_queue:
+    logger.info(f"[IdleDaemon] Started background learning daemon (mode={mode})...")
+
+    _emb_base = embedding_base_url or os.environ.get("EMBEDDING_BASE_URL", "http://localhost:8081/v1")
+    _emb_key  = embedding_api_key  or os.environ.get("EMBEDDING_API_KEY", "EMPTY")
+    _emb_model= embedding_model    or os.environ.get("EMBEDDING_MODEL", "text-embeddings-inference")
+
+    for task_idx, url in enumerate(discovery_queue):
         while not await is_system_idle(mode="vllm", base_url=base_url):
             logger.debug("[IdleDaemon] System busy, sleeping...")
             await asyncio.sleep(check_interval_s)
 
-        logger.info(f"[IdleDaemon] System idle. Starting distillation for {url}")
-        
-        # Step 1: Extract & AST Filter
-        distilled_package = await run_distiller_agent(client, model, url, github)
+        logger.info(f"[IdleDaemon] System idle. Processing ({mode}): {url}")
+
+        # Derive a safe directory name from the URL's last path component
+        skill_slug = url.rstrip("/").rsplit("/", 1)[-1] or f"skill_{task_idx}"
+        task_output_dir = (SKILL_SANDBOX_DIR / f"{skill_slug}_{int(time.time())}").resolve()
+
+        # ------------------------------------------------------------------ #
+        # MODE: summarize-only                                                #
+        # ------------------------------------------------------------------ #
+        if mode == "summarize-only":
+            summary = await run_summarize_agent(
+                client=client,
+                model=model,
+                provider=provider,
+                skill_url=url,
+                github=github,
+                output_dir=task_output_dir,
+                task_idx=task_idx,
+                tool_strategy=tool_strategy,
+                serper_api_key=serper_api_key,
+                tavily_api_key=tavily_api_key,
+                embedding_base_url=_emb_base,
+                embedding_api_key=_emb_key,
+                embedding_model=_emb_model,
+                verbose=verbose,
+            )
+            if not summary:
+                logger.warning(f"[IdleDaemon] Summarization failed/aborted for {url}")
+                await asyncio.sleep(check_interval_s)
+                continue
+
+            # Index the summary (no entrypoint/files — this is a reference entry)
+            summary_package = {
+                "skill_name": summary.get("skill_name", skill_slug),
+                "summary": summary.get("summary", ""),
+                "source_url": summary.get("source_url", url),
+                "entrypoint": None,
+                "files": None,
+                "artifact_dir": str(task_output_dir),
+                "source_snapshot_dir": None,
+                "generated_dir": None,
+            }
+            await index_distilled_skill(summary_package, _emb_base, _emb_key, _emb_model)
+            logger.info(f"[IdleDaemon] Summarized and indexed '{summary_package['skill_name']}'")
+            await asyncio.sleep(check_interval_s)
+            continue
+
+        # ------------------------------------------------------------------ #
+        # MODE: distill-code                                                  #
+        # ------------------------------------------------------------------ #
+        distilled_package = await run_distill_agent_v2(
+            client=client,
+            model=model,
+            provider=provider,
+            skill_url=url,
+            github=github,
+            output_dir=task_output_dir,
+            task_idx=task_idx,
+            tool_strategy=tool_strategy,
+            serper_api_key=serper_api_key,
+            tavily_api_key=tavily_api_key,
+            embedding_base_url=_emb_base,
+            embedding_api_key=_emb_key,
+            embedding_model=_emb_model,
+            verbose=verbose,
+        )
         if not distilled_package:
             logger.warning(f"[IdleDaemon] Distillation failed/aborted for {url}")
+            await asyncio.sleep(check_interval_s)
             continue
-            
+
         # Step 2: Venv Sandbox Verification
         logger.info(f"[IdleDaemon] Verifying '{distilled_package['skill_name']}' in Sandbox...")
         v_ok, v_msg = await verify_in_venv_sandbox(distilled_package)
-        
+
         if not v_ok:
-            # Here you could implement "Self-Healing": feed v_msg back to the QA Agent to fix the code
             logger.warning(f"[IdleDaemon] Sandbox verification failed for {url}: {v_msg}")
+            await asyncio.sleep(check_interval_s)
             continue
-            
+
         logger.info(f"[IdleDaemon] Sandbox verification passed: {v_msg}")
 
         artifact_dir = (SKILL_SANDBOX_DIR / distilled_package["skill_name"]).resolve()
@@ -1189,12 +1663,7 @@ async def idle_skill_discovery_loop(
         distilled_package["source_snapshot_dir"] = str(source_snapshot_dir)
         distilled_package["generated_dir"] = str(generated_dir)
 
-        await index_distilled_skill(
-            distilled_package,
-            embedding_base_url or os.environ.get("EMBEDDING_BASE_URL"),
-            embedding_api_key or os.environ.get("EMBEDDING_API_KEY"),
-            embedding_model or os.environ.get("EMBEDDING_MODEL"),
-        )
+        await index_distilled_skill(distilled_package, _emb_base, _emb_key, _emb_model)
 
         if export_sft:
             index_data = {}
@@ -1210,7 +1679,7 @@ async def idle_skill_discovery_loop(
             sft_examples = generate_sft_examples_from_skill(skill_card, index_data=index_data)
             export_stats = export_sft_outputs(skill_card, sft_examples)
             logger.info(f"[IdleDaemon] SFT export complete for {distilled_package['skill_name']}: {export_stats}")
-        
+
         logger.info(f"[IdleDaemon] Successfully processed and indexed {url}")
         await asyncio.sleep(check_interval_s)
 
@@ -1255,37 +1724,85 @@ async def inject_jit_skills(
 # ============================================================================
 async def main():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-    
-    parser = argparse.ArgumentParser(description="Skill Distiller Background Agent Tester")
+
+    parser = argparse.ArgumentParser(description="Skill Distiller Pipeline with UniversalAgent")
     parser.add_argument("--model", default=os.environ.get("VLLM_MODEL", "qwen-27b"))
     parser.add_argument("--base-url", default=os.environ.get("VLLM_BASE_URL", "https://b8bwvh7j-8000.usw3.devtunnels.ms/v1"))
     parser.add_argument("--api-key", default=os.environ.get("VLLM_API_KEY", "myhpcvllmqwen"))
-    # 修改默认值，删掉后面的路径
-    parser.add_argument("--embedding-base-url", default=os.environ.get("EMBEDDING_BASE_URL", "http://100.81.148.35:8003"))
+    parser.add_argument("--provider", default=os.environ.get("VLLM_PROVIDER", "openai"),
+                        choices=["openai", "anthropic"])
+    parser.add_argument("--tool-strategy", default="hybrid",
+                        choices=["native_all", "hybrid", "text_only"])
+    parser.add_argument("--embedding-base-url", default=os.environ.get("EMBEDDING_BASE_URL", "http://localhost:8081/v1"))
     parser.add_argument("--embedding-api-key", default=os.environ.get("EMBEDDING_API_KEY", "EMPTY"))
-    parser.add_argument("--embedding-model", default=os.environ.get("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5"))
-    parser.add_argument("--run-real-idle", action="store_true")
-    parser.add_argument("--run-tests", action="store_true")
-    parser.add_argument("--export-sft", action="store_true", help="Export SFT JSONL after successful distillation")
+    parser.add_argument("--embedding-model", default=os.environ.get("EMBEDDING_MODEL", "text-embeddings-inference"))
+    parser.add_argument("--serper-key", default=os.environ.get("SERPER_API_KEY", ""))
+    parser.add_argument("--tavily-key", default=os.environ.get("TAVILY_API_KEY", ""))
+    parser.add_argument("--run-real-idle", action="store_true",
+                        help="Run the background idle discovery loop")
+    parser.add_argument("--run-tests", action="store_true",
+                        help="Run built-in pipeline unit tests")
+    parser.add_argument("--export-sft", action="store_true",
+                        help="Export SFT JSONL after successful distillation (distill-code mode only)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Enable verbose agent output")
     parser.add_argument(
-        "--discovery-urls", # Pluralized for clarity
-        nargs='+',          # Accepts one or more arguments
-        help="List of URLs to extract, separated by spaces",
-        default=[]
+        "--mode",
+        choices=["summarize-only", "distill-code"],
+        default="distill-code",
+        help=(
+            "summarize-only: read README/SKILL.md and build a summary index with links to "
+            "the original GitHub code (no local code writing or sandbox).\n"
+            "distill-code: full pipeline — read code, write distilled files locally, "
+            "venv sandbox verify, then index (default)."
+        ),
+    )
+    parser.add_argument(
+        "--github-url",
+        default="",
+        help=(
+            "Broad GitHub repo URL (e.g. https://github.com/K-Dense-AI/claude-scientific-skills). "
+            "All immediate sub-folders are auto-discovered as individual skill tasks. "
+            "Takes precedence over --discovery-urls when provided."
+        ),
+    )
+    parser.add_argument(
+        "--discovery-urls",
+        nargs="+",
+        help="One or more explicit skill sub-folder URLs (used when --github-url is not set)",
+        default=[],
     )
     args = parser.parse_args()
 
     if args.run_real_idle:
         from openai import AsyncOpenAI
+        import httpx as _httpx
         github = GitHubRemote(token=os.environ.get("GITHUB_TOKEN"))
 
-        real_client = AsyncOpenAI(
-            base_url=args.base_url,
-            api_key=args.api_key,
-        )
-        discovery_queue = args.discovery_urls or [
-            "https://github.com/K-Dense-AI/claude-scientific-skills/tree/main/scientific-skills/geopandas"
-        ]
+        if args.provider == "anthropic":
+            from anthropic import AsyncAnthropic
+            real_client = AsyncAnthropic(api_key=args.api_key)
+        else:
+            real_client = AsyncOpenAI(
+                base_url=args.base_url,
+                api_key=args.api_key,
+                http_client=_httpx.AsyncClient(timeout=1200.0),
+            )
+
+        # Auto-discover sub-folder URLs when --github-url is given
+        if args.github_url:
+            logger.info(f"[Main] Auto-discovering skill URLs from: {args.github_url}")
+            discovery_queue = await discover_skill_urls(github, args.github_url)
+            if not discovery_queue:
+                logger.warning("[Main] No sub-folder URLs discovered; falling back to --discovery-urls")
+                discovery_queue = args.discovery_urls
+        else:
+            discovery_queue = args.discovery_urls or [
+                "https://github.com/K-Dense-AI/claude-scientific-skills/tree/main/scientific-skills/geopandas"
+            ]
+
+        logger.info(f"[Main] mode={args.mode} | {len(discovery_queue)} skill(s) queued")
+
         await idle_skill_discovery_loop(
             client=real_client,
             model=args.model,
@@ -1293,10 +1810,16 @@ async def main():
             discovery_queue=discovery_queue,
             base_url=args.base_url,
             api_key=args.api_key,
+            provider=args.provider,
+            tool_strategy=args.tool_strategy,
             embedding_base_url=args.embedding_base_url,
             embedding_api_key=args.embedding_api_key,
             embedding_model=args.embedding_model,
             export_sft=args.export_sft,
+            mode=args.mode,
+            serper_api_key=args.serper_key,
+            tavily_api_key=args.tavily_key,
+            verbose=args.verbose,
         )
         return
 
@@ -1375,4 +1898,19 @@ if __name__ == "__main__":
 
 """
 python BatchAgent/skill_distiller_pipeline.py --export-sft --run-real-idle --discovery-urls https://github.com/K-Dense-AI/claude-scientific-skills/tree/main/scientific-skills/geopandas https://github.com/K-Dense-AI/claude-scientific-skills/tree/main/scientific-skills/dask
+
+
+# Summarize all skills from a broad repo
+python BatchAgent/skill_distiller_pipeline.py --run-real-idle \
+  --mode summarize-only \
+  --github-url https://github.com/K-Dense-AI/claude-scientific-skills
+
+# Full distillation of specific skills
+python BatchAgent/skill_distiller_pipeline.py --run-real-idle \
+  --mode distill-code \
+  --export-sft \
+  --discovery-urls \
+    https://github.com/K-Dense-AI/claude-scientific-skills/tree/main/scientific-skills/geopandas \
+    https://github.com/K-Dense-AI/claude-scientific-skills/tree/main/scientific-skills/dask
+
 """

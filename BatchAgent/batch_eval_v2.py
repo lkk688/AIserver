@@ -2,18 +2,29 @@
 """
 batch_eval_v2.py — Batch evaluation harness for UniversalAgent v2.
 
-Runs ML coding tasks (CodeAgent/ml_tasks.json) through agent_main_v2,
-tracks success rate, turns-to-completion, and timing, then generates
-publication-quality figures.
+Runs ML coding tasks through agent_main_v2, tracks success rate,
+turns-to-completion, and timing, then generates publication-quality figures.
+
+Directory layout (all under --output-dir):
+    {output_dir}/
+      tasks/{task_id}/        ← workspace + task.py + per-task artefacts
+      eval_results.json       ← incremental per-task results
+      summary.json            ← final success-rate summary
+      figures/                ← aggregate benchmark plots
+
+Session logs are stored separately under --session-log-dir
+(default: {output_dir}/.agent/sessions/{task_id}/{timestamp}/).
 
 Usage:
     cd /Developer/AIserver
-    python3 BatchAgent/batch_eval_v2.py                                 # run all tasks
+    python3 BatchAgent/batch_eval_v2.py
     python3 BatchAgent/batch_eval_v2.py --task-id linreg_lvl1_raw_tensors
     python3 BatchAgent/batch_eval_v2.py --start-from 5 --max-tasks 10
     python3 BatchAgent/batch_eval_v2.py --redo-failed
-    python3 BatchAgent/batch_eval_v2.py --plot-only                     # re-plot only
+    python3 BatchAgent/batch_eval_v2.py --plot-only
     python3 BatchAgent/batch_eval_v2.py --tool-strategy native_all
+    python3 BatchAgent/batch_eval_v2.py \\
+        --tasks-json CodeAgent/ml_tasks.json CodeAgent/python_tasks.json
 """
 
 from __future__ import annotations
@@ -34,15 +45,25 @@ from typing import Any, Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from BatchAgent.agent_services_fastapi_v2 import AgentService
+from BatchAgent.mini_batch_agent_libs import now_stamp
 
 
 # =============================================================================
 # 1. Task loading and goal construction
 # =============================================================================
 
-def load_tasks(tasks_json: Path) -> Tuple[List[dict], dict]:
-    data = json.loads(tasks_json.read_text())
-    return data["tasks"], data.get("interface_protocols", {})
+def load_tasks(tasks_jsons: List[Path]) -> Tuple[List[dict], dict]:
+    """Load and merge tasks from one or more JSON files; deduplicate by task ID."""
+    merged_tasks: Dict[str, dict] = {}   # task_id → task dict (last-writer wins)
+    merged_protocols: dict = {}
+
+    for path in tasks_jsons:
+        data = json.loads(path.read_text())
+        for task in data.get("tasks", []):
+            merged_tasks[task["id"]] = task
+        merged_protocols.update(data.get("interface_protocols", {}))
+
+    return list(merged_tasks.values()), merged_protocols
 
 
 def build_goal(task: dict, protocol: dict) -> str:
@@ -111,24 +132,28 @@ async def run_single_task(
     task: dict,
     protocol: dict,
     args: argparse.Namespace,
+    output_dir: Path,
+    session_log_dir: Path,
 ) -> dict:
     """
     Run one ML task through UniversalAgent v2 and return a result dict with:
       - success (agent + verification)
-      - n_turns (ReAct rounds used)
-      - duration_sec
-      - task_file_exists
-      - verification_passed
+      - n_turns, duration_sec, task_file_exists, verification_passed
+      - session_log (path to session log directory)
       - error snippet
     """
     task_id = task["id"]
-    task_dir = (Path(args.output_dir) / "tasks" / task_id).resolve()
+    task_dir = (output_dir / "tasks" / task_id).resolve()
     task_file = task_dir / "task.py"
 
     # Fresh workspace for each run
     if task_dir.exists():
         shutil.rmtree(task_dir)
     task_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pre-compute a stamped session dir so we know the path before the run
+    sess_dir = (session_log_dir / task_id / now_stamp()).resolve()
+    sess_dir.mkdir(parents=True, exist_ok=True)
 
     result: dict = {
         "task_id": task_id,
@@ -144,7 +169,7 @@ async def run_single_task(
         "agent_success": False,
         "error": None,
         "output_snippet": "",
-        "session_dir": None,
+        "session_log": str(sess_dir),
     }
 
     goal = build_goal(task, protocol)
@@ -160,13 +185,15 @@ async def run_single_task(
         backend=args.backend,
         enable_thinking=True,
         temperature=0.1,
-        enable_memory=False,   # pure coding task — no persistent memory needed
+        enable_memory=False,    # pure coding task — no persistent memory needed
         enable_document=False,
         enable_web=True,
         enable_mutation=True,
         enable_code_tools=True,
         enable_bash=True,
         enable_meta=False,
+        enable_parallel=args.parallel_thinking,
+        memory_strategy=args.memory_strategy,
     )
 
     t0 = time.time()
@@ -174,17 +201,19 @@ async def run_single_task(
         print(f"\n{'='*68}")
         print(f"  Task : {task_id}")
         print(f"  Level: {task['level']}  |  Series: {task['series']}")
+        print(f"  Session log: {sess_dir}")
         print(f"{'='*68}\n")
 
         agent_success, session_dir, workspace_dir, final_result = await service.run(
             goal=goal,
             allowlist=[str(task_file)],
             continue_workspace_dir=str(task_dir),
+            continue_session_dir=str(sess_dir),
         )
 
         result["duration_sec"] = round(time.time() - t0, 1)
         result["agent_success"] = agent_success
-        result["session_dir"] = str(session_dir)
+        result["session_log"] = str(session_dir)
         result["n_turns"] = _count_turns(session_dir)
         result["task_file_exists"] = task_file.exists()
         result["output_snippet"] = str(final_result)[-500:]
@@ -196,7 +225,7 @@ async def run_single_task(
             result["output_snippet"] = snippet
             if verified:
                 result["status"] = "success"
-                # Keep only task.py, clean intermediates
+                # Keep only task.py + session log ref; clean build intermediates
                 for item in task_dir.iterdir():
                     if item.name not in ("task.py", ".agent"):
                         try:
@@ -225,13 +254,20 @@ async def run_single_task(
 # 3. Results persistence
 # =============================================================================
 
-def save_results(results: List[dict], path: Path, model: str) -> None:
-    summary = {
+def _safe_mean(vals: List[float]) -> float:
+    return round(sum(vals) / len(vals), 2) if vals else 0.0
+
+
+def _build_summary(results: List[dict], model: str) -> dict:
+    return {
         "total": len(results),
         "success": sum(1 for r in results if r["status"] == "success"),
         "failed": sum(1 for r in results if r["status"] != "success"),
         "timestamp": datetime.now().isoformat(),
         "model": model,
+        "success_rate_pct": round(
+            sum(1 for r in results if r["status"] == "success") / max(len(results), 1) * 100, 1
+        ),
         "avg_turns_success": _safe_mean(
             [r["n_turns"] for r in results if r["status"] == "success"]
         ),
@@ -239,13 +275,52 @@ def save_results(results: List[dict], path: Path, model: str) -> None:
             [r["n_turns"] for r in results if r["status"] != "success"]
         ),
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"summary": summary, "tasks": results}, indent=2), encoding="utf-8")
-    print(f"\n  Results saved → {path}")
 
 
-def _safe_mean(vals: List[float]) -> float:
-    return round(sum(vals) / len(vals), 2) if vals else 0.0
+def save_results(results: List[dict], status_file: Path, model: str) -> None:
+    summary = _build_summary(results, model)
+    status_file.parent.mkdir(parents=True, exist_ok=True)
+    status_file.write_text(
+        json.dumps({"summary": summary, "tasks": results}, indent=2), encoding="utf-8"
+    )
+    print(f"\n  Results saved → {status_file}")
+
+
+def save_summary_json(results: List[dict], summary_file: Path, model: str) -> None:
+    """Write standalone summary.json with per-series/level breakdown."""
+    summary = _build_summary(results, model)
+
+    # Per-level breakdown
+    levels = sorted(set(r["level"] for r in results))
+    summary["by_level"] = {
+        str(lv): {
+            "total": sum(1 for r in results if r["level"] == lv),
+            "success": sum(1 for r in results if r["level"] == lv and r["status"] == "success"),
+            "success_rate_pct": round(
+                sum(1 for r in results if r["level"] == lv and r["status"] == "success")
+                / max(sum(1 for r in results if r["level"] == lv), 1) * 100, 1
+            ),
+        }
+        for lv in levels
+    }
+
+    # Per-series breakdown
+    series_list = sorted(set(r["series"] for r in results))
+    summary["by_series"] = {
+        s: {
+            "total": sum(1 for r in results if r["series"] == s),
+            "success": sum(1 for r in results if r["series"] == s and r["status"] == "success"),
+            "success_rate_pct": round(
+                sum(1 for r in results if r["series"] == s and r["status"] == "success")
+                / max(sum(1 for r in results if r["series"] == s), 1) * 100, 1
+            ),
+        }
+        for s in series_list
+    }
+
+    summary_file.parent.mkdir(parents=True, exist_ok=True)
+    summary_file.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"  Summary JSON saved → {summary_file}")
 
 
 # =============================================================================
@@ -408,7 +483,6 @@ def generate_figures(results_path: Path, out_dir: Path) -> None:
         rates.append(_success_rate(subset))
         counts.append(len(subset))
 
-    # Sort by success rate descending
     order = sorted(range(len(series_list)), key=lambda i: rates[i], reverse=False)
     sorted_series = [series_list[i] for i in order]
     sorted_rates  = [rates[i] for i in order]
@@ -476,7 +550,6 @@ def generate_figures(results_path: Path, out_dir: Path) -> None:
             patch.set_facecolor(color)
             patch.set_alpha(0.65)
 
-        # Jitter overlay
         for i, d in enumerate(box_data, 1):
             jitter = np.random.uniform(-0.15, 0.15, len(d))
             ax3.scatter(np.full(len(d), i) + jitter, d,
@@ -502,7 +575,6 @@ def generate_figures(results_path: Path, out_dir: Path) -> None:
         ax4.scatter(r["n_turns"], r["duration_sec"] / 60,
                     color=color, marker=marker, s=45, alpha=0.72, zorder=3)
 
-    # Annotate level centroids
     for lv in levels:
         sub = [r for r in tasks if r["level"] == lv]
         if sub:
@@ -540,24 +612,42 @@ def generate_figures(results_path: Path, out_dir: Path) -> None:
 
 async def main_async() -> None:
     parser = argparse.ArgumentParser(
-        description="Batch evaluation for UniversalAgent v2 on ML tasks"
+        description="Batch evaluation for UniversalAgent v2 on ML tasks",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--tasks-json", default="CodeAgent/ml_tasks.json")
-    parser.add_argument("--output-dir", default="eval_output")
-    parser.add_argument("--status-file", default="eval_output/eval_results.json")
-    parser.add_argument("--figures-dir", default="eval_output/figures")
 
-    parser.add_argument("--task-id", default=None,
-                        help="Run a single task by ID")
+    # ── I/O layout ────────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--tasks-json", nargs="+", default=["CodeAgent/ml_tasks.json"],
+        metavar="PATH",
+        help="One or more task JSON files; tasks are merged and deduplicated by ID",
+    )
+    parser.add_argument(
+        "--output-dir", default="eval_output",
+        help=(
+            "Root output directory. Derived paths: "
+            "tasks/{id}/ (workspace), eval_results.json, summary.json, figures/"
+        ),
+    )
+    parser.add_argument(
+        "--session-log-dir", default="",
+        help=(
+            "Root for agent session logs ({dir}/{task_id}/{timestamp}/). "
+            "Defaults to {output-dir}/.agent/sessions/ when empty."
+        ),
+    )
+
+    # ── Task selection ────────────────────────────────────────────────────────
+    parser.add_argument("--task-id", default=None, help="Run a single task by ID")
     parser.add_argument("--start-from", type=int, default=0,
                         help="Skip first N tasks (0-indexed)")
     parser.add_argument("--max-tasks", type=int, default=None)
     parser.add_argument("--redo-failed", action="store_true",
-                        help="Re-run tasks that previously failed")
+                        help="Re-run tasks that previously failed; cleans their task dirs first")
     parser.add_argument("--plot-only", action="store_true",
                         help="Skip running — regenerate figures from existing results")
 
-    # Agent options
+    # ── Agent / model options ─────────────────────────────────────────────────
     parser.add_argument("--base-url",
                         default=os.environ.get("VLLM_BASE_URL", "http://100.110.236.127:8000/v1"))
     parser.add_argument("--api-key",
@@ -565,17 +655,31 @@ async def main_async() -> None:
     parser.add_argument("--model",
                         default=os.environ.get("VLLM_MODEL", "qwen3.5-9b"))
     parser.add_argument("--tool-strategy",
-                        choices=["native_all", "hybrid", "text_only"],
-                        default="hybrid")
+                        choices=["native_all", "hybrid", "text_only"], default="hybrid")
     parser.add_argument("--backend",
-                        choices=["vllm", "llama.cpp", "openai", "anthropic"],
-                        default="vllm")
+                        choices=["vllm", "llama.cpp", "openai", "anthropic"], default="vllm")
     parser.add_argument("--max-turns", type=int, default=20)
+    parser.add_argument("--parallel-thinking", action="store_true",
+                        help="Enable parallel/brainstorm thinking (same as agent_main_v2)")
+    parser.add_argument("--sandbox", default=None,
+                        help="Docker container name for sandboxed execution (same as agent_main_v2)")
+    parser.add_argument("--memory-strategy",
+                        choices=["sliding_window", "summarize"], default="sliding_window",
+                        help="Context compression strategy (same as agent_main_v2)")
     parser.add_argument("--verbose", "-v", action="store_true")
 
     args = parser.parse_args()
-    status_file = Path(args.status_file)
-    figures_dir = Path(args.figures_dir)
+
+    # ── Derive all paths from --output-dir ────────────────────────────────────
+    output_dir   = Path(args.output_dir).resolve()
+    status_file  = output_dir / "eval_results.json"
+    figures_dir  = output_dir / "figures"
+    summary_file = output_dir / "summary.json"
+    session_log_dir = (
+        Path(args.session_log_dir).resolve()
+        if args.session_log_dir
+        else output_dir / ".agent" / "sessions"
+    )
 
     # ── Plot-only mode ────────────────────────────────────────────────────────
     if args.plot_only:
@@ -586,12 +690,15 @@ async def main_async() -> None:
         generate_figures(status_file, figures_dir)
         return
 
-    # ── Load tasks ────────────────────────────────────────────────────────────
-    tasks_json = Path(args.tasks_json)
-    if not tasks_json.exists():
-        print(f"Error: {tasks_json} not found.")
+    # ── Load and merge tasks ──────────────────────────────────────────────────
+    tasks_jsons = [Path(p) for p in args.tasks_json]
+    missing = [p for p in tasks_jsons if not p.exists()]
+    if missing:
+        print(f"Error: task file(s) not found: {', '.join(str(p) for p in missing)}")
         sys.exit(1)
-    all_tasks, protocols = load_tasks(tasks_json)
+
+    all_tasks, protocols = load_tasks(tasks_jsons)
+    print(f"  Loaded {len(all_tasks)} unique task(s) from {len(tasks_jsons)} file(s).")
 
     # ── Load existing results (for resume / redo) ─────────────────────────────
     results: List[dict] = []
@@ -606,15 +713,14 @@ async def main_async() -> None:
     if args.task_id:
         tasks = [t for t in all_tasks if t["id"] == args.task_id]
         if not tasks:
-            print(f"Error: task '{args.task_id}' not found in {tasks_json}")
+            print(f"Error: task '{args.task_id}' not found in the provided JSON(s)")
             sys.exit(1)
-        # Remove any existing result for this task so we re-run cleanly
         results = [r for r in results if r["task_id"] != args.task_id]
 
     elif args.redo_failed:
-        target_ids = {r["task_id"] for r in results if r["status"] != "success"}
-        # Also include tasks that never ran
         existing_ids = {r["task_id"] for r in results}
+        target_ids = {r["task_id"] for r in results if r["status"] != "success"}
+        # Include tasks that never ran
         for t in all_tasks:
             if t["id"] not in existing_ids:
                 target_ids.add(t["id"])
@@ -623,6 +729,12 @@ async def main_async() -> None:
             sys.exit(0)
         tasks = [t for t in all_tasks if t["id"] in target_ids]
         results = [r for r in results if r["task_id"] not in target_ids]
+        # Pre-clean task dirs so state is clearly reset before the loop starts
+        for t in tasks:
+            task_dir = output_dir / "tasks" / t["id"]
+            if task_dir.exists():
+                print(f"  [redo] Cleaning {task_dir}")
+                shutil.rmtree(task_dir)
         print(f"  Redo mode: {len(tasks)} task(s) to re-run")
 
     else:
@@ -635,10 +747,14 @@ async def main_async() -> None:
 
     print(f"\n{'#'*68}")
     print(f"  Batch Eval v2 — {len(tasks)} task(s)")
-    print(f"  Model     : {args.model}")
-    print(f"  Strategy  : {args.tool_strategy}")
-    print(f"  Max turns : {args.max_turns}")
-    print(f"  Output    : {args.output_dir}")
+    print(f"  Model          : {args.model}")
+    print(f"  Strategy       : {args.tool_strategy}")
+    print(f"  Max turns      : {args.max_turns}")
+    print(f"  Memory strategy: {args.memory_strategy}")
+    print(f"  Parallel think : {args.parallel_thinking}")
+    print(f"  Sandbox        : {args.sandbox or 'none'}")
+    print(f"  Output dir     : {output_dir}")
+    print(f"  Session logs   : {session_log_dir}")
     print(f"{'#'*68}")
 
     # ── Run tasks ─────────────────────────────────────────────────────────────
@@ -646,7 +762,11 @@ async def main_async() -> None:
         proto_id = task.get("interface_protocol", "pytorch_task_v1")
         protocol = protocols.get(proto_id, {})
         print(f"\n[{i+1}/{len(tasks)}] {task['id']}")
-        result = await run_single_task(task, protocol, args)
+        result = await run_single_task(
+            task, protocol, args,
+            output_dir=output_dir,
+            session_log_dir=session_log_dir,
+        )
         results.append(result)
         save_results(results, status_file, args.model)   # incremental save
 
@@ -668,6 +788,9 @@ async def main_async() -> None:
         print(f"  {icon} {r['task_id']:<40} {r['status']:<18} "
               f"{r['n_turns']:>5} {r['duration_sec']:>6.1f}s")
 
+    # Save standalone summary JSON
+    save_summary_json(results, summary_file, args.model)
+
     # ── Generate figures ──────────────────────────────────────────────────────
     print("\nGenerating figures...")
     generate_figures(status_file, figures_dir)
@@ -688,36 +811,49 @@ if __name__ == "__main__":
 # Run all tasks (resume-safe — skips already-done tasks):
 python3 BatchAgent/batch_eval_v2.py
 
-# Run a single task with verbose output:
+# Run a single task:
 python3 BatchAgent/batch_eval_v2.py --task-id linreg_lvl1_raw_tensors --verbose
-python3 BatchAgent/batch_eval_v2.py --task-id logreg_lvl4_calibration_thresholding --verbose
 
-python3 BatchAgent/batch_eval_v2.py --tasks-json "CodeAgent/python_tasks.json" --verbose
-
-
-# Retry all failed tasks:
+# Retry all failed tasks (cleans their task dirs first):
 python3 BatchAgent/batch_eval_v2.py --redo-failed
 
-# Run first 10 tasks with native tool calling:
-python3 BatchAgent/batch_eval_v2.py --max-tasks 10 --tool-strategy native_all
+# Run first 10 tasks:
+python3 BatchAgent/batch_eval_v2.py --max-tasks 10
+
+# Multiple task JSON files (merged + deduplicated by task ID):
+python3 BatchAgent/batch_eval_v2.py \\
+    --tasks-json CodeAgent/ml_tasks.json CodeAgent/python_tasks.json
+
+# Custom output dir (status, figures, summary all derived from it):
+python3 BatchAgent/batch_eval_v2.py --output-dir /data/runs/qwen32b
+
+# Separate session log storage:
+python3 BatchAgent/batch_eval_v2.py \\
+    --output-dir eval_output \\
+    --session-log-dir /data/session_logs
+
+# Enable parallel thinking + summarize memory:
+python3 BatchAgent/batch_eval_v2.py --tasks-json CodeAgent/python_tasks.json --parallel-thinking --memory-strategy summarize --verbose
+  Before: BATCH COMPLETE
+  Success rate : 13/21 (61.9%)
+  Avg turns    : 9.8 (successful tasks)
+
 
 # Compare a different model:
-python3 BatchAgent/batch_eval_v2.py \
-    --model qwen3.5-32b \
-    --status-file eval_output/eval_results_32b.json \
-    --figures-dir eval_output/figures_32b
+python3 BatchAgent/batch_eval_v2.py \\
+    --model qwen3.5-32b \\
+    --output-dir eval_output_32b
+
+# Sandboxed execution:
+python3 BatchAgent/batch_eval_v2.py --sandbox my_docker_container
 
 # Re-plot from saved results (no agent calls):
 python3 BatchAgent/batch_eval_v2.py --plot-only
 
-# Custom vLLM endpoint:
-python3 BatchAgent/batch_eval_v2.py \
-    --base-url http://192.168.1.10:8000/v1 \
-    --api-key mykey \
-    --model qwen3-coder-7b
-
-
-python3 BatchAgent/batch_eval_v2.py --tool-strategy native_all --verbose
-
-python3 BatchAgent/batch_eval_v2.py --model qwen-35b --base-url http://127.0.0.1:8000/v1 --api-key "myhpcvllmqwen101" --tool-strategy native_all --verbose
+# Custom vLLM endpoint with native tool calling:
+python3 BatchAgent/batch_eval_v2.py \\
+    --base-url http://192.168.1.10:8000/v1 \\
+    --api-key mykey \\
+    --model qwen3-coder-7b \\
+    --tool-strategy native_all
 """

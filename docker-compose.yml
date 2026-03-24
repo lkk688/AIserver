@@ -1,17 +1,19 @@
 services:
   vllm-qwen3:
-    build:
-      context: ./vllm-custom
+    image: vllm/vllm-openai:v0.18.0
+    # build:
+    #   context: ./vllm-custom
     profiles: ["qwen", "llm", "all"]
     container_name: vllm-qwen3
     env_file:
       - .env
       - vllm_config.env
     environment:
+      - NVIDIA_VISIBLE_DEVICES=0
       - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
       - CUDA_LAUNCH_BLOCKING=1
       - FLASHINFER_DISABLE_VERSION_CHECK=1
-      - VLLM_USE_V1=0
+      # - VLLM_USE_V1=0
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     ports:
@@ -41,7 +43,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids: ["0"]
               capabilities: [gpu]
 
   vllm-olmocr:
@@ -53,6 +55,7 @@ services:
       - .env
       - olmocr_config.env
     environment:
+      - NVIDIA_VISIBLE_DEVICES=1
       - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
       - CUDA_LAUNCH_BLOCKING=1
       - FLASHINFER_DISABLE_VERSION_CHECK=1
@@ -88,7 +91,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids: ["1"]
               capabilities: [gpu]
 
 
@@ -98,6 +101,7 @@ services:
     container_name: embedding-tei
     environment:
       - HF_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - NVIDIA_VISIBLE_DEVICES=1
     volumes:
       - ~/.cache/huggingface:/data
     ports:
@@ -117,7 +121,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids: ["1"]
               capabilities: [gpu]
 
   litellm:

@@ -487,54 +487,228 @@ def _is_binary(file_path: Path) -> bool:
         return True
 
 
-def search_code(query: str, root_dir: str = ".") -> str:
-    results = []
-    root = Path(root_dir).resolve()
+_SEARCH_CONTEXT_LINES = 3        # surrounding lines shown in full-context mode
+_SEARCH_COMPACT_MATCHES = 8      # switch to compact when total matches exceed this
+_SEARCH_COMPACT_GROUPS = 5       # or when total context windows (groups) exceed this
+_SEARCH_MAX_MATCHES = 100        # hard cap on total matches returned
+_SEARCH_SKIP_DIRS = {"__pycache__", "node_modules", "site-packages", "venv", "env", ".venv"}
 
+
+def _walk_source_files(root: Path):
+    """Yield all readable, non-binary, <1 MB files under root, skipping hidden/junk dirs."""
     for root_path_str, dirs, files in os.walk(root):
-        dirs[:] = [
-            d for d in dirs
-            if not d.startswith(".")
-            and d not in ("__pycache__", "node_modules", "site-packages", "venv", "env", ".venv")
-        ]
-
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in _SEARCH_SKIP_DIRS]
         root_path = Path(root_path_str)
         for file in files:
             if file.startswith("."):
                 continue
-
             path = root_path / file
-
             try:
                 if path.stat().st_size > 1024 * 1024:
                     continue
             except Exception:
-                pass
-
+                continue
             if _is_binary(path):
                 continue
+            yield path
 
-            try:
-                with path.open("r", encoding="utf-8", errors="ignore") as f:
-                    for i, line in enumerate(f, start=1):
-                        if query in line:
-                            rel_path = path.relative_to(root)
-                            results.append(f"{rel_path}:{i}: {line.rstrip()}")
-                            if len(results) >= 50:
-                                break
-            except Exception:
-                pass
 
-            if len(results) >= 50:
-                break
+def _build_ast_scopes(path: Path) -> list[tuple[int, int, str]]:
+    """
+    For Python files: return (start_line, end_line, label) for every function/class.
+    Uses an iterative walk to avoid recursion-limit issues.
+    Returns [] for non-.py files or parse errors.
+    """
+    if path.suffix != ".py":
+        return []
+    try:
+        source = path.read_text(encoding="utf-8", errors="ignore")
+        tree = ast.parse(source, filename=str(path))
+    except Exception:
+        return []
 
-        if len(results) >= 50:
-            results.append("Warning: Too many matches (>50). Showing first 50. Please refine your search.")
+    scopes: list[tuple[int, int, str]] = []
+    # stack items: (ast_node, qualified_name_prefix)
+    stack: list[tuple[ast.AST, str]] = [(tree, "")]
+    while stack:
+        node, prefix = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            qname = f"{prefix}{node.name}" if prefix else node.name
+            end = getattr(node, "end_lineno", node.lineno)
+            scopes.append((node.lineno, end, f"def {qname}"))
+            for child in ast.iter_child_nodes(node):
+                stack.append((child, f"{node.name}."))
+        elif isinstance(node, ast.ClassDef):
+            qname = f"{prefix}{node.name}" if prefix else node.name
+            end = getattr(node, "end_lineno", node.lineno)
+            scopes.append((node.lineno, end, f"class {qname}"))
+            for child in ast.iter_child_nodes(node):
+                stack.append((child, f"{node.name}."))
+        else:
+            for child in ast.iter_child_nodes(node):
+                stack.append((child, prefix))
+    return scopes
+
+
+def _scope_at_line(scopes: list[tuple[int, int, str]], line_no: int) -> str:
+    """Return the innermost scope label containing line_no, or 'module level'."""
+    best: str | None = None
+    best_size = float("inf")
+    for start, end, name in scopes:
+        if start <= line_no <= end:
+            size = end - start
+            if size < best_size:
+                best_size = size
+                best = name
+    return best if best is not None else "module level"
+
+
+def _merge_context_windows(
+    match_lines: list[int], total_lines: int, ctx: int
+) -> list[tuple[int, int]]:
+    """Merge overlapping ±ctx windows around each match into sorted non-overlapping spans."""
+    windows: list[tuple[int, int]] = []
+    for ln in sorted(match_lines):
+        lo = max(1, ln - ctx)
+        hi = min(total_lines, ln + ctx)
+        if windows and lo <= windows[-1][1] + 1:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], hi))
+        else:
+            windows.append((lo, hi))
+    return windows
+
+
+def _format_file_exact_matches(
+    path: Path,
+    root: Path,
+    match_nos: list[int],
+    file_lines: list[str],
+    scopes: list[tuple[int, int, str]],
+    compact: bool,
+    ctx: int = _SEARCH_CONTEXT_LINES,
+) -> list[str]:
+    """Format matching lines for one file in either compact or full-context style."""
+    rel = str(path.relative_to(root))
+    n = len(match_nos)
+    label = f"{'es' if n != 1 else ''}"
+    output: list[str] = [f"\n=== {rel} ({n} match{label}) ==="]
+
+    if compact:
+        for ln in match_nos:
+            scope = _scope_at_line(scopes, ln)
+            output.append(f"  {ln}: {file_lines[ln - 1].rstrip()}  [in: {scope}]")
+        return output
+
+    # Full-context mode: show ±ctx lines, merge overlapping windows
+    total = len(file_lines)
+    pad = len(str(total))
+    match_set = set(match_nos)
+    windows = _merge_context_windows(match_nos, total, ctx)
+
+    prev_scope: str | None = None
+    for wi, (lo, hi) in enumerate(windows):
+        if wi > 0:
+            output.append("  --")
+        # Scope banner for the first match inside this window
+        first_match = next(ln for ln in match_nos if lo <= ln <= hi)
+        scope = _scope_at_line(scopes, first_match)
+        if scope != prev_scope:
+            output.append(f"  [in: {scope}]")
+            prev_scope = scope
+        for ln in range(lo, hi + 1):
+            sep = ":" if ln in match_set else "-"
+            output.append(f"  {ln:{pad}}{sep} {file_lines[ln - 1].rstrip()}")
+
+    return output
+
+
+def _search_code_for_keyword(keyword: str, root: Path, limit: int = 30) -> list[str]:
+    """Return up to `limit` compact matching lines for a single keyword (used by fallback)."""
+    results: list[str] = []
+    for path in _walk_source_files(root):
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as f:
+                for i, line in enumerate(f, start=1):
+                    if keyword in line:
+                        results.append(f"{path.relative_to(root)}:{i}: {line.rstrip()}")
+                        if len(results) >= limit:
+                            return results
+        except Exception:
+            pass
+    return results
+
+
+def search_code(query: str, root_dir: str = ".") -> str:
+    root = Path(root_dir).resolve()
+
+    # ── Phase 1: collect exact matches per file ────────────────────────────
+    file_results: list[tuple[Path, list[int], list[str]]] = []
+    total_matches = 0
+    truncated = False
+
+    for path in _walk_source_files(root):
+        try:
+            file_lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            continue
+        match_nos = [i + 1 for i, line in enumerate(file_lines) if query in line]
+        if not match_nos:
+            continue
+        # Per-file cap: never show more than _SEARCH_MAX_MATCHES total
+        remaining = _SEARCH_MAX_MATCHES - total_matches
+        if remaining <= 0:
+            truncated = True
             break
+        if len(match_nos) > remaining:
+            match_nos = match_nos[:remaining]
+            truncated = True
+        file_results.append((path, match_nos, file_lines))
+        total_matches += len(match_nos)
 
-    if not results:
-        return "No matches found."
-    return "\n".join(results)
+    # ── No exact match → keyword fallback ─────────────────────────────────
+    if not file_results:
+        keywords = [kw for kw in query.split() if kw]
+        if len(keywords) <= 1:
+            return "No matches found."
+        sections = [f'No exact matches found for "{query}". Showing per-keyword results:\n']
+        any_hit = False
+        for kw in keywords:
+            kw_results = _search_code_for_keyword(kw, root, limit=30)
+            if kw_results:
+                any_hit = True
+                cap = len(kw_results) >= 30
+                sections.append(
+                    f'--- keyword: "{kw}" ({len(kw_results)}{"+" if cap else ""} matches) ---'
+                )
+                sections.extend(kw_results)
+                if cap:
+                    sections.append(f'  (first 30 shown for "{kw}"; refine query to see more)')
+            else:
+                sections.append(f'--- keyword: "{kw}" (0 matches) ---')
+        return "\n".join(sections) if any_hit else "No matches found."
+
+    # ── Phase 2: decide compact vs full-context ────────────────────────────
+    total_groups = sum(
+        len(_merge_context_windows(mnos, len(lines), _SEARCH_CONTEXT_LINES))
+        for _, mnos, lines in file_results
+    )
+    compact = total_matches > _SEARCH_COMPACT_MATCHES or total_groups > _SEARCH_COMPACT_GROUPS
+
+    # ── Phase 3: render ────────────────────────────────────────────────────
+    view = "compact" if compact else "full context"
+    file_count = len(file_results)
+    header = f'Found {total_matches} match(es) in {file_count} file(s) [{view}]:'
+    if truncated:
+        header += f'  [truncated at {_SEARCH_MAX_MATCHES} matches — refine your query]'
+    sections = [header]
+
+    for path, match_nos, file_lines in file_results:
+        scopes = _build_ast_scopes(path)
+        sections.extend(
+            _format_file_exact_matches(path, root, match_nos, file_lines, scopes, compact)
+        )
+
+    return "\n".join(sections)
 
 
 def find_file(filename_pattern: str, root_dir: str = ".") -> str:
