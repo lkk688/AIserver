@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import List, Optional
 
 from ..embedding_client import EmbeddingClient
@@ -7,6 +8,8 @@ from ..models import SearchRecord
 from ..reranker import BaseReranker
 from ..store.base import SearchStore
 from ..utils import build_embedding_text, dedupe_preserve_order, utc_now
+
+logger = logging.getLogger(__name__)
 
 
 class HybridSearcher:

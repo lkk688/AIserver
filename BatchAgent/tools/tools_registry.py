@@ -107,8 +107,13 @@ OBSERVATION_TOOLS = [
     },
     {
         "name": "read_url",
-        "description": "Fetch and read the full text content of a specific webpage URL.",
-        "properties": {"url": {"type": "string"}},
+        "description": "Fetch and read a webpage, file, or GitHub URL. For missing URLs it returns nearby reachable links. For GitHub folders it returns a paged folder listing. Use offset to continue and name_contains to narrow by filename or folder name.",
+        "properties": {
+            "url": {"type": "string"},
+            "offset": {"type": "integer", "minimum": 0},
+            "limit": {"type": "integer", "minimum": 1},
+            "name_contains": {"type": "string"},
+        },
         "required": ["url"]
     },
     {

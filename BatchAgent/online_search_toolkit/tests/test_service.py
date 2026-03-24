@@ -254,6 +254,35 @@ class TestOnlineSearchService:
                 mock_read.assert_called_once()
             assert result.title == "Test Page"
 
+    def test_read_url_returns_record_when_persist_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = self._make_service(tmpdir)
+
+            real_record = SearchRecord(
+                id="persist_fail_page",
+                record_type="web_page",
+                source_type="url_fetch",
+                title="Persist Fail Page",
+                summary="Page summary",
+                url="https://example.com/persist-fail",
+                source="httpx",
+                domain="general",
+                language="en",
+                category="general",
+                fetched_at=utc_now(),
+                content="Page content",
+                metadata={},
+            )
+
+            with patch.object(service.url_reader, "read_url", return_value=real_record) as mock_read:
+                with patch.object(service, "_persist_records", side_effect=RuntimeError("embedding offline")) as mock_persist:
+                    result = service.read_url("https://example.com/persist-fail", force_refresh=True)
+
+            mock_read.assert_called_once()
+            mock_persist.assert_called_once()
+            assert result.title == "Persist Fail Page"
+            assert result.content == "Page content"
+
 
 # =====================================================================
 # File Store Tests

@@ -216,6 +216,15 @@ _AUTO_CACHE_TOOLS = {
 _AUTO_CACHE_MAX_CHARS = 1200  # truncate long results before storing
 
 
+def _stable_summary_label(prefix: str, raw_value: Any, *, suffix: str = "") -> str:
+    raw = str(raw_value or "").strip() or "unknown"
+    compact = re.sub(r"\s+", " ", raw)
+    compact = compact if len(compact) <= 48 else compact[:45] + "..."
+    digest = sha1_text(raw)[:10]
+    tail = f":{suffix}" if suffix else ""
+    return f"{prefix}:{compact}#{digest}{tail}"
+
+
 def _auto_inject_result_to_memory(
     working_memory: Any,
     action: Any,
@@ -243,17 +252,36 @@ def _auto_inject_result_to_memory(
     args = getattr(action, "args", {}) or {}
     label = tool_name
     if tool_name == "get_document_overview":
-        label = f"doc_overview:{args.get('filepath', 'doc')}"
+        label = _stable_summary_label("doc_overview", args.get("filepath", "doc"))
     elif tool_name == "read_document_section":
-        label = f"doc_sec:{args.get('section_id') or args.get('page', 'unknown')}"
+        label = _stable_summary_label(
+            "doc_sec",
+            args.get("section_id") or args.get("page", "unknown"),
+        )
     elif tool_name == "search_document":
-        q = str(args.get("query", ""))[:30]
-        label = f"doc_search:{q}"
+        label = _stable_summary_label("doc_search", args.get("query", ""))
     elif tool_name in ("web_search", "read_url"):
-        q = str(args.get("query") or args.get("url", ""))[:30]
-        label = f"web:{q}"
+        page_suffix = ""
+        if tool_name == "read_url":
+            page_suffix = ",".join(
+                part for part in [
+                    f"o={args.get('offset', 0)}",
+                    f"l={args.get('limit', 8)}",
+                    f"f={str(args.get('name_contains', '')).strip()}",
+                ]
+                if part and not part.endswith("=")
+            )
+        label = _stable_summary_label(
+            "web",
+            args.get("query") or args.get("url", ""),
+            suffix=page_suffix,
+        )
     elif tool_name == "read_file_chunk":
-        label = f"file:{args.get('filepath', '')}@{args.get('start_line', '')}"
+        label = _stable_summary_label(
+            "file",
+            args.get("filepath", ""),
+            suffix=f"line={args.get('start_line', '')}",
+        )
 
     try:
         working_memory.update_memory({

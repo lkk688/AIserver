@@ -207,6 +207,10 @@ class TestCleanHtmlText:
         assert clean_html_text("") == ""
         assert clean_html_text(None) == ""  # type: ignore
 
+    def test_url_passthrough(self):
+        url = "https://raw.githubusercontent.com/example/repo/main/file.md"
+        assert clean_html_text(url) == url
+
 
 class TestTrimSummary:
     def test_short_text(self):

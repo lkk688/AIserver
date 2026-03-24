@@ -35,3 +35,4 @@ BatchAgent/document_agent/.ia_phase1_data
 eval_output/tasks/
 eval_output/
 eval_output0322
+search_cache

@@ -330,7 +330,14 @@ class OnlineSearchService:
         )
 
         if persist:
-            self._persist_records([record])
+            try:
+                self._persist_records([record])
+            except Exception as exc:
+                logger.warning(
+                    "read_url persistence skipped for %s due to persistence/enrichment failure: %s",
+                    normalized_url,
+                    exc,
+                )
 
         return record
 

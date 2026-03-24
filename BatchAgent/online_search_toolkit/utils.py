@@ -19,6 +19,9 @@ def utc_now() -> datetime:
 def clean_html_text(raw: str) -> str:
     if not raw:
         return ""
+    raw = raw.strip()
+    if raw.startswith(("http://", "https://")) and "<" not in raw and ">" not in raw:
+        return re.sub(r"\s+", " ", html.unescape(raw)).strip()
     text = BeautifulSoup(raw, "html.parser").get_text(" ", strip=True)
     text = html.unescape(text)
     return re.sub(r"\s+", " ", text).strip()

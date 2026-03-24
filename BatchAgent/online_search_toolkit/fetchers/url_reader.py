@@ -446,7 +446,7 @@ class URLReader:
             content = f"URL read failed: {exc}\n{traceback.format_exc(limit=2)}"
             return self._make_record(
                 url=url,
-                title=url,
+                title="",
                 summary=str(exc),
                 content=content,
                 record_type="web_page",

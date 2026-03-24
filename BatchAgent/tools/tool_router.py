@@ -271,7 +271,12 @@ class ToolRouter:
             return ""
 
     def _handle_read_url(self, args: Dict[str, Any]) -> str:
-        return fetch_and_parse_url(args.get("url", ""))
+        return fetch_and_parse_url(
+            args.get("url", ""),
+            offset=args.get("offset", 0),
+            limit=args.get("limit", 8),
+            name_contains=args.get("name_contains", ""),
+        )
 
     def _handle_search_code(self, args: Dict[str, Any]) -> str:
         return search_code(args.get("query", ""))

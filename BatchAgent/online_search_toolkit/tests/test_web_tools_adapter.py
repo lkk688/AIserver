@@ -443,6 +443,135 @@ class TestFetchAndParseUrl:
         assert "[URL Read Error]" in output
         assert "https://crash.example.com" in output
 
+    def test_github_folder_returns_listing_without_reading_page(self):
+        import BatchAgent.tools.web_tools as wt
+
+        mock_svc = _patch_service()
+        listing = (
+            "# GitHub Folder Listing\n"
+            "**Requested URL:** https://github.com/org/repo/tree/main/skills\n\n"
+            "- README.md: https://github.com/org/repo/blob/main/skills/README.md (file)"
+        )
+
+        with patch.object(wt, "_get_service", return_value=mock_svc):
+            with patch.object(wt, "_render_github_listing", return_value=listing):
+                output = wt.fetch_and_parse_url("https://github.com/org/repo/tree/main/skills")
+
+        assert output == listing
+        mock_svc.read_url.assert_not_called()
+
+    def test_github_folder_listing_supports_offset_and_name_filter(self):
+        import BatchAgent.tools.web_tools as wt
+
+        mock_svc = _patch_service()
+        entries = [
+            ("alpha", "https://github.com/org/repo/tree/main/skills/alpha", "dir"),
+            ("beta", "https://github.com/org/repo/tree/main/skills/beta", "dir"),
+            ("gamma", "https://github.com/org/repo/tree/main/skills/gamma", "dir"),
+        ]
+
+        with patch.object(wt, "_get_service", return_value=mock_svc):
+            with patch.object(wt, "_fetch_github_contents", return_value=(200, [])):
+                with patch.object(wt, "_github_entries_from_payload", return_value=entries):
+                    output = wt.fetch_and_parse_url(
+                        "https://github.com/org/repo/tree/main/skills",
+                        offset=1,
+                        limit=1,
+                        name_contains="a",
+                    )
+
+        assert "**Filter:** name contains `a`" in output
+        assert "**Showing:** 2-2 of 3 entries" in output
+        assert "beta" in output
+        assert "alpha" not in output
+        assert "offset=2" in output
+        mock_svc.read_url.assert_not_called()
+
+    def test_github_folder_listing_clamps_large_offset(self):
+        import BatchAgent.tools.web_tools as wt
+
+        mock_svc = _patch_service()
+        entries = [
+            ("alpha", "https://github.com/org/repo/tree/main/skills/alpha", "dir"),
+            ("beta", "https://github.com/org/repo/tree/main/skills/beta", "dir"),
+        ]
+
+        with patch.object(wt, "_get_service", return_value=mock_svc):
+            with patch.object(wt, "_fetch_github_contents", return_value=(200, [])):
+                with patch.object(wt, "_github_entries_from_payload", return_value=entries):
+                    output = wt.fetch_and_parse_url(
+                        "https://github.com/org/repo/tree/main/skills",
+                        offset=99,
+                        limit=1,
+                    )
+
+        assert "Requested offset was beyond the available range" in output
+        assert "**Showing:** 2-2 of 2 entries" in output
+        assert "beta" in output
+        mock_svc.read_url.assert_not_called()
+
+    def test_github_blob_reads_raw_url(self):
+        import BatchAgent.tools.web_tools as wt
+
+        record = _make_record(
+            title="README.md",
+            url="https://raw.githubusercontent.com/org/repo/main/README.md",
+            content="Project overview",
+        )
+        mock_svc = _patch_service(mock_read_record=record)
+
+        with patch.object(wt, "_get_service", return_value=mock_svc):
+            output = wt.fetch_and_parse_url("https://github.com/org/repo/blob/main/README.md")
+
+        assert "Project overview" in output
+        mock_svc.read_url.assert_called_once_with("https://raw.githubusercontent.com/org/repo/main/README.md")
+
+    def test_not_found_returns_parent_suggestions(self):
+        import BatchAgent.tools.web_tools as wt
+
+        missing = _make_record(
+            title="",
+            url="https://example.com/a/b/missing",
+            summary="Client error '404 Not Found'",
+            content="URL read failed: 404",
+        )
+        missing.metadata["error"] = True
+        mock_svc = _patch_service(mock_read_record=missing)
+
+        with patch.object(wt, "_get_service", return_value=mock_svc):
+            with patch.object(
+                wt,
+                "_find_available_parent_urls",
+                return_value=[("b", "https://example.com/a/b", "parent")],
+            ):
+                output = wt.fetch_and_parse_url("https://example.com/a/b/missing")
+
+        assert "# URL Not Found" in output
+        assert "https://example.com/a/b" in output
+
+    def test_missing_github_file_returns_sitemap(self):
+        import BatchAgent.tools.web_tools as wt
+
+        missing = _make_record(
+            title="",
+            url="https://raw.githubusercontent.com/org/repo/main/missing.md",
+            summary="Client error '404 Not Found'",
+            content="URL read failed: 404",
+        )
+        missing.metadata["error"] = True
+        mock_svc = _patch_service(mock_read_record=missing)
+
+        with patch.object(wt, "_get_service", return_value=mock_svc):
+            with patch.object(
+                wt,
+                "_github_sitemap_for_missing_url",
+                return_value="# GitHub Sitemap\n**Requested URL:** https://github.com/org/repo/blob/main/missing.md",
+            ):
+                output = wt.fetch_and_parse_url("https://github.com/org/repo/blob/main/missing.md")
+
+        assert "# GitHub Sitemap" in output
+        assert "Requested URL" in output
+
 
 # =====================================================================
 # TestDomainResolution

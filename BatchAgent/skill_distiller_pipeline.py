@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import random
+import re
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 import aiohttp
@@ -261,33 +262,6 @@ class GitHubRemote:
 
 
 # ============================================================================
-# GitHub URL Discovery: auto-enumerate sub-folder skill URLs
-# ============================================================================
-async def discover_skill_urls(github: "GitHubRemote", broad_url: str) -> List[str]:
-    """
-    Given a broad GitHub repo URL (e.g. https://github.com/Org/repo), list all
-    immediate sub-directory URLs — each treated as one skill task.
-    Returns a list of GitHub tree URLs for each sub-folder.
-    """
-    import re as _re
-    listing = await github.list_remote_repo(broad_url)
-    if listing.startswith("Error"):
-        logger.warning(f"[Discover] Failed to list {broad_url}: {listing}")
-        return []
-
-    skill_urls: List[str] = []
-    for line in listing.splitlines():
-        if not line.startswith("[DIR"):
-            continue
-        m = _re.search(r"URL:\s*(https://github\.com/[^\)]+)", line)
-        if m:
-            skill_urls.append(m.group(1).strip())
-
-    logger.info(f"[Discover] Found {len(skill_urls)} sub-folder skill(s) in {broad_url}")
-    return skill_urls
-
-
-# ============================================================================
 # 1. Embedding Generator (OpenAI-compatible /v1/embeddings)
 # ============================================================================
 async def generate_embedding(
@@ -344,7 +318,8 @@ async def index_distilled_skill(
     skill_package: Dict[str, Any], 
     base_url: Optional[str] = None, 
     api_key: Optional[str] = None,
-    model: Optional[str] = None
+    model: Optional[str] = None,
+    skip_embedding: bool = False,
 ) -> None:
     """
     Generates an embedding for the skill based on its summary, and saves it
@@ -363,9 +338,12 @@ async def index_distilled_skill(
     
     # Create a rich semantic string to embed
     semantic_text = f"Tool Name: {skill_name}. Description: {summary}"
-    logger.info(f"[SemanticIndex] Generating embedding for skill: {skill_name}")
-    
-    embedding = await generate_embedding(semantic_text, base_url, api_key, model)
+    embedding = None
+    if skip_embedding:
+        logger.info(f"[SemanticIndex] Skipping embedding generation for skill: {skill_name}")
+    else:
+        logger.info(f"[SemanticIndex] Generating embedding for skill: {skill_name}")
+        embedding = await generate_embedding(semantic_text, base_url, api_key, model)
     
     # Save the skill data alongside its vector
     index_data[skill_name] = {
@@ -1281,6 +1259,64 @@ async def run_distill_agent_v2(
     return distilled_package
 
 
+def _validate_skill_summary_payload(
+    summary: Any,
+    *,
+    skill_url: str,
+    repo_listing: str,
+) -> Tuple[bool, str]:
+    if not isinstance(summary, dict):
+        return False, "skill_summary.json must contain a JSON object"
+
+    required_keys = {
+        "skill_name": str,
+        "summary": str,
+        "capabilities": list,
+        "dependencies": list,
+        "source_url": str,
+        "files_in_repo": list,
+    }
+    for key, expected_type in required_keys.items():
+        if key not in summary:
+            return False, f"missing required field: {key}"
+        if not isinstance(summary[key], expected_type):
+            return False, f"field {key} must be of type {expected_type.__name__}"
+
+    skill_name = summary["skill_name"].strip()
+    if not skill_name or not re.fullmatch(r"[a-z0-9_]+", skill_name):
+        return False, "skill_name must be non-empty snake_case"
+
+    detail = summary["summary"].strip()
+    if len(detail) < 120:
+        return False, "summary is too short; expected a detailed paragraph"
+
+    capabilities = [str(item).strip() for item in summary["capabilities"] if str(item).strip()]
+    if len(capabilities) < 3:
+        return False, "capabilities must contain at least 3 non-empty items"
+
+    dependencies = [str(item).strip() for item in summary["dependencies"] if str(item).strip()]
+    files_in_repo = [str(item).strip() for item in summary["files_in_repo"] if str(item).strip()]
+    if not files_in_repo:
+        return False, "files_in_repo must contain at least 1 file path"
+
+    if summary["source_url"].strip() != skill_url:
+        return False, "source_url must exactly match the requested skill_url"
+
+    saw_skill_md = "SKILL.md" in repo_listing
+    if saw_skill_md and not any(path.endswith("SKILL.md") for path in files_in_repo):
+        return False, "repo listing contains SKILL.md but files_in_repo does not include any inspected SKILL.md"
+
+    if not any(path.endswith((".md", ".py", ".yaml", ".yml", ".json")) for path in files_in_repo):
+        return False, "files_in_repo must include at least one concrete repository file"
+
+    summary["skill_name"] = skill_name
+    summary["summary"] = detail
+    summary["capabilities"] = capabilities
+    summary["dependencies"] = dependencies
+    summary["files_in_repo"] = files_in_repo
+    return True, ""
+
+
 async def run_summarize_agent(
     client: Any,
     model: str,
@@ -1301,7 +1337,7 @@ async def run_summarize_agent(
     """
     Use UniversalAgent to summarize a GitHub skill (no code writing, no sandbox).
 
-    The agent reads README/SKILL.md and key Python files, then writes
+    The agent reads GitHub URLs, README/SKILL.md, and key Python files, then writes
     output_dir/skill_summary.json with a structured summary including a link
     to the original source.  Returns the summary dict or None on failure.
     """
@@ -1346,9 +1382,12 @@ async def run_summarize_agent(
 ```
 
 **Instructions:**
-1. Use `read_url` with raw.githubusercontent.com URLs to read README.md, SKILL.md, and the main Python entrypoint.
-2. Understand what the skill does: its purpose, inputs, outputs, and dependencies.
-3. Write a `skill_summary.json` file at `{output_dir}/skill_summary.json` with this exact structure:
+1. Use `read_url` directly on GitHub URLs, README.md, SKILL.md, folders, and the main Python entrypoint. The tool can list GitHub folders and suggest nearby links when a URL is missing. If a GitHub folder listing is long, continue with the same URL plus `offset`, or narrow it with `name_contains`.
+2. A folder containing `SKILL.md` counts as one skill. If the repository is a skill collection, inspect the root README plus at least 2 different skill folders that contain `SKILL.md` when available.
+3. Understand what the target skill or skill collection does: purpose, inputs, outputs, usage flow, and dependencies.
+4. `files_in_repo` must list the real repository files you actually inspected, and it must include every `SKILL.md` file you relied on.
+5. The JSON must be valid JSON without markdown fences. `summary` must be a detailed paragraph of at least 120 characters. `capabilities` must contain at least 3 concrete items.
+6. Write a `skill_summary.json` file at `{output_dir}/skill_summary.json` with this exact structure:
 ```json
 {{
   "skill_name": "<snake_case_name>",
@@ -1359,9 +1398,13 @@ async def run_summarize_agent(
   "files_in_repo": ["<file1.py>", "<file2.py>", "README.md"]
 }}
 ```
-4. Call `finish_task` with the skill_name once skill_summary.json is written.
+7. Call `finish_task` with the skill_name once skill_summary.json is written.
 
-**DO NOT write or modify any Python code files.** Only read and summarize.
+**Hard requirements before finishing:**
+- Do not guess. Read the repository evidence first.
+- If repo listing shows `SKILL.md`, you must inspect at least one matching `SKILL.md`.
+- Do not write or modify any Python code files.
+- Only produce the JSON summary file.
 """.strip()
 
     try:
@@ -1389,8 +1432,18 @@ async def run_summarize_agent(
         logger.warning(f"[SummarizeAgent] Failed to parse skill_summary.json: {exc}")
         return None
 
-    # Ensure source_url is set
-    summary.setdefault("source_url", skill_url)
+    summary["source_url"] = skill_url
+    is_valid, validation_error = _validate_skill_summary_payload(
+        summary,
+        skill_url=skill_url,
+        repo_listing=repo_listing,
+    )
+    if not is_valid:
+        logger.warning(
+            f"[SummarizeAgent] Invalid skill_summary.json for {skill_url}: {validation_error}"
+        )
+        return None
+
     logger.info(f"[SummarizeAgent] Successfully summarized '{summary.get('skill_name', '?')}' from {skill_url}")
     return summary
 
@@ -1548,6 +1601,18 @@ async def idle_skill_discovery_loop(
     _emb_base = embedding_base_url or os.environ.get("EMBEDDING_BASE_URL", "http://localhost:8081/v1")
     _emb_key  = embedding_api_key  or os.environ.get("EMBEDDING_API_KEY", "EMPTY")
     _emb_model= embedding_model    or os.environ.get("EMBEDDING_MODEL", "text-embeddings-inference")
+    summarize_embeddings_enabled = True
+
+    if mode == "summarize-only":
+        reachable, embedding_msg = await check_embedding_endpoint(_emb_base)
+        if reachable:
+            logger.info(f"[IdleDaemon] Embedding endpoint available for summarize-only indexing: {embedding_msg}")
+        else:
+            summarize_embeddings_enabled = False
+            logger.warning(
+                "[IdleDaemon] Embedding endpoint unavailable for summarize-only mode; "
+                f"summaries will still run and be indexed without embeddings. {embedding_msg}"
+            )
 
     for task_idx, url in enumerate(discovery_queue):
         while not await is_system_idle(mode="vllm", base_url=base_url):
@@ -1575,9 +1640,9 @@ async def idle_skill_discovery_loop(
                 tool_strategy=tool_strategy,
                 serper_api_key=serper_api_key,
                 tavily_api_key=tavily_api_key,
-                embedding_base_url=_emb_base,
-                embedding_api_key=_emb_key,
-                embedding_model=_emb_model,
+                embedding_base_url=_emb_base if summarize_embeddings_enabled else "",
+                embedding_api_key=_emb_key if summarize_embeddings_enabled else "",
+                embedding_model=_emb_model if summarize_embeddings_enabled else "",
                 verbose=verbose,
             )
             if not summary:
@@ -1596,7 +1661,13 @@ async def idle_skill_discovery_loop(
                 "source_snapshot_dir": None,
                 "generated_dir": None,
             }
-            await index_distilled_skill(summary_package, _emb_base, _emb_key, _emb_model)
+            await index_distilled_skill(
+                summary_package,
+                _emb_base,
+                _emb_key,
+                _emb_model,
+                skip_embedding=not summarize_embeddings_enabled,
+            )
             logger.info(f"[IdleDaemon] Summarized and indexed '{summary_package['skill_name']}'")
             await asyncio.sleep(check_interval_s)
             continue
@@ -1726,9 +1797,9 @@ async def main():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
     parser = argparse.ArgumentParser(description="Skill Distiller Pipeline with UniversalAgent")
-    parser.add_argument("--model", default=os.environ.get("VLLM_MODEL", "qwen-27b"))
-    parser.add_argument("--base-url", default=os.environ.get("VLLM_BASE_URL", "https://b8bwvh7j-8000.usw3.devtunnels.ms/v1"))
-    parser.add_argument("--api-key", default=os.environ.get("VLLM_API_KEY", "myhpcvllmqwen"))
+    parser.add_argument("--model", default=os.environ.get("VLLM_MODEL", "qwen3.5-9b"))
+    parser.add_argument("--base-url", default=os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000/v1"))
+    parser.add_argument("--api-key", default=os.environ.get("VLLM_API_KEY", "EMPTY")) #myhpcvllmqwen
     parser.add_argument("--provider", default=os.environ.get("VLLM_PROVIDER", "openai"),
                         choices=["openai", "anthropic"])
     parser.add_argument("--tool-strategy", default="hybrid",
@@ -1762,8 +1833,8 @@ async def main():
         default="",
         help=(
             "Broad GitHub repo URL (e.g. https://github.com/K-Dense-AI/claude-scientific-skills). "
-            "All immediate sub-folders are auto-discovered as individual skill tasks. "
-            "Takes precedence over --discovery-urls when provided."
+            "Queued directly as a discovery target. The agent navigates the repo using read_url "
+            "folder listings and fallback suggestions. Takes precedence over --discovery-urls when provided."
         ),
     )
     parser.add_argument(
@@ -1789,13 +1860,17 @@ async def main():
                 http_client=_httpx.AsyncClient(timeout=1200.0),
             )
 
-        # Auto-discover sub-folder URLs when --github-url is given
+        parsed_base_url = urlparse(args.base_url)
+        if parsed_base_url.hostname in {"127.0.0.1", "localhost", "0.0.0.0"} and parsed_base_url.port is None:
+            logger.warning(
+                "[Main] --base-url has no explicit port: %s. Local vLLM usually listens on "
+                "http://127.0.0.1:8000/v1, and idle detection may wait forever if the port is omitted.",
+                args.base_url,
+            )
+
         if args.github_url:
-            logger.info(f"[Main] Auto-discovering skill URLs from: {args.github_url}")
-            discovery_queue = await discover_skill_urls(github, args.github_url)
-            if not discovery_queue:
-                logger.warning("[Main] No sub-folder URLs discovered; falling back to --discovery-urls")
-                discovery_queue = args.discovery_urls
+            logger.info(f"[Main] Queueing GitHub discovery target: {args.github_url}")
+            discovery_queue = [args.github_url]
         else:
             discovery_queue = args.discovery_urls or [
                 "https://github.com/K-Dense-AI/claude-scientific-skills/tree/main/scientific-skills/geopandas"
