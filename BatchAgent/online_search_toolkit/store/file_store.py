@@ -75,8 +75,12 @@ class FileSearchStore(SearchStore):
         for item in items:
             if language and item.language != language:
                 continue
-            if domain and item.domain != domain:
-                continue
+            if domain:
+                if domain in ("academic", "medical", "research"):
+                    if item.domain not in ("academic", "medical", "research"):
+                        continue
+                elif item.domain != domain:
+                    continue
             if category and item.category != category:
                 continue
             if record_types and item.record_type not in record_types:
@@ -124,7 +128,7 @@ class FileSearchStore(SearchStore):
         recent_hours: Optional[int] = None,
         record_types: Optional[List[str]] = None,
     ) -> List[SearchRecord]:
-        tokens = [t.lower() for t in query.split() if t.strip()]
+        q_lower = query.lower()
         items = self._filter(
             self._read_records(),
             language=language,
@@ -144,10 +148,9 @@ class FileSearchStore(SearchStore):
                 item.category,
                 item.domain,
             ]).lower()
-            score = sum(1 for token in tokens if token in blob)
-            if score > 0:
+            if q_lower in blob or (item.query and item.query.lower() == q_lower):
                 scored.append((
-                    score,
+                    1,
                     1 if item.is_breaking else 0,
                     item.published_at or item.fetched_at or utc_now(),
                     item,
@@ -180,6 +183,8 @@ class FileSearchStore(SearchStore):
             if not item.embedding:
                 continue
             score = cosine_similarity(query_embedding, item.embedding)
+            if score < 0.65:
+                continue
             scored.append((
                 score,
                 1 if item.is_breaking else 0,

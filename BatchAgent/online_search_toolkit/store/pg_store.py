@@ -154,8 +154,11 @@ class PostgresSearchStore(SearchStore):
             filters.append("language = %(language)s")
             params["language"] = language
         if domain:
-            filters.append("domain = %(domain)s")
-            params["domain"] = domain
+            if domain in ("academic", "medical", "research"):
+                filters.append("domain IN ('academic', 'medical', 'research')")
+            else:
+                filters.append("domain = %(domain)s")
+                params["domain"] = domain
         if category:
             filters.append("category = %(category)s")
             params["category"] = category
@@ -188,16 +191,19 @@ class PostgresSearchStore(SearchStore):
         record_types: Optional[List[str]] = None,
     ) -> List[SearchRecord]:
         filters = [
-            "(title ILIKE %(q)s OR summary ILIKE %(q)s OR content ILIKE %(q)s OR source ILIKE %(q)s)"
+            "(title ILIKE %(q)s OR summary ILIKE %(q)s OR content ILIKE %(q)s OR source ILIKE %(q)s OR query ILIKE %(q_exact)s)"
         ]
-        params = {"q": f"%{query}%", "limit": limit}
+        params = {"q": f"%{query}%", "q_exact": query, "limit": limit}
 
         if language:
             filters.append("language = %(language)s")
             params["language"] = language
         if domain:
-            filters.append("domain = %(domain)s")
-            params["domain"] = domain
+            if domain in ("academic", "medical", "research"):
+                filters.append("domain IN ('academic', 'medical', 'research')")
+            else:
+                filters.append("domain = %(domain)s")
+                params["domain"] = domain
         if category:
             filters.append("category = %(category)s")
             params["category"] = category
@@ -231,15 +237,18 @@ class PostgresSearchStore(SearchStore):
         recent_hours: Optional[int] = None,
         record_types: Optional[List[str]] = None,
     ) -> List[SearchRecord]:
-        filters = ["embedding IS NOT NULL"]
+        filters = ["embedding IS NOT NULL", "embedding <=> %(embedding)s < 0.35"]
         params = {"embedding": query_embedding, "limit": limit}
 
         if language:
             filters.append("language = %(language)s")
             params["language"] = language
         if domain:
-            filters.append("domain = %(domain)s")
-            params["domain"] = domain
+            if domain in ("academic", "medical", "research"):
+                filters.append("domain IN ('academic', 'medical', 'research')")
+            else:
+                filters.append("domain = %(domain)s")
+                params["domain"] = domain
         if category:
             filters.append("category = %(category)s")
             params["category"] = category

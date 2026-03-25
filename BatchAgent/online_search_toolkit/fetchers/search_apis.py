@@ -83,7 +83,8 @@ class SearchAPIFetcher:
         req.add_header("X-API-KEY", self.serper_api_key)
         req.add_header("Content-Type", "application/json")
 
-        payload = json.dumps({"q": final_query, "num": limit}).encode("utf-8")
+        fetch_limit = max(limit, 20)
+        payload = json.dumps({"q": final_query, "num": fetch_limit}).encode("utf-8")
 
         try:
             with urllib.request.urlopen(req, data=payload, timeout=20) as response:
@@ -119,7 +120,7 @@ class SearchAPIFetcher:
                 )
             )
 
-        for item in data.get("organic", [])[:limit]:
+        for item in data.get("organic", []):
             out.append(
                 self._make_record(
                     title=item.get("title", ""),
@@ -233,7 +234,8 @@ class SearchAPIFetcher:
         req.add_header("X-API-KEY", self.serper_api_key)
         req.add_header("Content-Type", "application/json")
 
-        payload = json.dumps({"q": query, "num": limit}).encode("utf-8")
+        fetch_limit = max(limit, 20)
+        payload = json.dumps({"q": query, "num": fetch_limit}).encode("utf-8")
 
         try:
             with urllib.request.urlopen(req, data=payload, timeout=20) as response:
@@ -242,7 +244,7 @@ class SearchAPIFetcher:
             return []
 
         out: List[SearchRecord] = []
-        for item in data.get("videos", [])[:limit]:
+        for item in data.get("videos", []):
             url = item.get("link", "")
             if not url:
                 continue

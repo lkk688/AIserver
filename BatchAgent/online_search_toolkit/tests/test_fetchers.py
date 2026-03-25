@@ -515,6 +515,7 @@ class TestURLReader:
     # Case 2: Empty / thin HTML triggers Playwright fallback
     # Exercises: content length < _PLAYWRIGHT_THRESHOLD → fallback branch
     # ------------------------------------------------------------------
+    @patch("BatchAgent.online_search_toolkit.fetchers.url_reader._PLAYWRIGHT_AVAILABLE", True)
     @patch("BatchAgent.online_search_toolkit.fetchers.url_reader._fetch_via_playwright")
     @patch("BatchAgent.online_search_toolkit.fetchers.url_reader.httpx.Client")
     def test_read_thin_html_triggers_playwright(self, mock_client_cls, mock_playwright):

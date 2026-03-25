@@ -124,19 +124,22 @@ def build_crawler_read_fn(
     if config is not None:
         try:
             from .fetchers.web_crawler import CrawlerFetcher
-            fetcher = CrawlerFetcher(
-                max_pages=1,
-                max_depth=0,
-                headless=config.crawler.headless,
-                polite_delay_ms=config.crawler.polite_delay_ms,
-                timeout_ms=config.crawler.timeout_ms,
-                max_summary_chars=config.max_summary_chars,
-            )
+            _fetcher = None
 
             def _crawler_read(url: str) -> Dict[str, str]:
-                return fetcher.read_single_page(url)
+                nonlocal _fetcher
+                if _fetcher is None:
+                    _fetcher = CrawlerFetcher(
+                        max_pages=1,
+                        max_depth=0,
+                        headless=config.crawler.headless,
+                        polite_delay_ms=config.crawler.polite_delay_ms,
+                        timeout_ms=config.crawler.timeout_ms,
+                        max_summary_chars=config.max_summary_chars,
+                    )
+                    logger.info("Playwright CrawlerFetcher initialized for crawler_read_fn")
+                return _fetcher.read_single_page(url)
 
-            logger.info("Playwright CrawlerFetcher initialized for crawler_read_fn")
             return _crawler_read
         except ImportError:
             logger.debug("Playwright not available; crawler_read_fn disabled")

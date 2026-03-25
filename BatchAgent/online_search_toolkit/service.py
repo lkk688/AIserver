@@ -205,11 +205,15 @@ class OnlineSearchService:
                 category=request.category,
             )
             if cached:
+                sources = {}
+                for item in cached:
+                    sources[item.source] = sources.get(item.source, 0) + 1
                 return SearchResult(
                     query=request.query,
                     domain=request.domain,
                     count=len(cached),
                     items=cached,
+                    metadata={"cached_count": len(cached), "sources_count": sources},
                 )
 
         plan = self.build_search_plan(request)
@@ -224,15 +228,19 @@ class OnlineSearchService:
             category=request.category,
         )
 
-        # If keyword/semantic cache returns nothing but we have fresh results,
-        # return the fresh results directly so they are never silently dropped.
         final_items = refreshed if refreshed else fetched[:request.limit]
+        fetched_ids = {x.id for x in fetched}
+        cached_count = sum(1 for x in final_items if x.id not in fetched_ids)
+        sources = {}
+        for item in final_items:
+            sources[item.source] = sources.get(item.source, 0) + 1
 
         return SearchResult(
             query=request.query,
             domain=request.domain,
             count=len(final_items),
             items=final_items,
+            metadata={"cached_count": cached_count, "sources_count": sources},
         )
 
     def search_news(

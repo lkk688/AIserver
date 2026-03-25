@@ -10,6 +10,25 @@ import time
 from .bootstrap import create_online_search_service
 from .config import SearchConfig
 from .scheduler import OnlineSearchScheduler
+from typing import Any
+
+
+def print_result(result: Any) -> None:
+    data = result.model_dump(mode="json")
+
+    def truncate_embeddings(obj):
+        if isinstance(obj, dict):
+            for k, v in list(obj.items()):
+                if k == "embedding" and isinstance(v, list):
+                    obj[k] = f"[Embedding vector of size {len(v)}]"
+                else:
+                    truncate_embeddings(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                truncate_embeddings(item)
+
+    truncate_embeddings(data)
+    print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -76,7 +95,7 @@ def main() -> int:
             category=args.category,
             enable_youtube=args.enable_youtube,
         )
-        print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        print_result(result)
         return 0
 
     if args.command == "news":
@@ -86,7 +105,7 @@ def main() -> int:
             language=args.language,
             category=args.category,
         )
-        print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        print_result(result)
         return 0
 
     if args.command == "academic":
@@ -96,7 +115,7 @@ def main() -> int:
             language="en",
             category=args.category,
         )
-        print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        print_result(result)
         return 0
 
     if args.command == "medical":
@@ -106,7 +125,7 @@ def main() -> int:
             language="en",
             category=args.category,
         )
-        print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        print_result(result)
         return 0
 
     if args.command == "read_url":
@@ -118,7 +137,7 @@ def main() -> int:
             force_refresh=args.force_refresh,
             use_crawler=args.use_crawler,
         )
-        print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2))
+        print_result(result)
         return 0
 
     if args.command == "scheduler":

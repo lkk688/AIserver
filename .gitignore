@@ -36,3 +36,6 @@ eval_output/tasks/
 eval_output/
 eval_output0322
 search_cache
+cache
+BatchAgent/cache
+BatchAgent/cache/search/*.json

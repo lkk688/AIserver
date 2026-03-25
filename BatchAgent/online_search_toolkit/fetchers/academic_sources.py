@@ -122,30 +122,34 @@ class AcademicSourceFetcher:
 
     def search_medlineplus(self, query: str, limit: int = 8) -> List[SearchRecord]:
         try:
-            url = f"https://medlineplus.gov/search/?query={quote_plus(query)}"
+            url = f"https://wsearch.nlm.nih.gov/ws/query?db=healthTopics&term={quote_plus(query)}&retmax={limit}"
             response = requests.get(url, timeout=self.timeout_seconds)
             response.raise_for_status()
 
-            soup = BeautifulSoup(response.text, "html.parser")
+            root = ET.fromstring(response.text)
             records: List[SearchRecord] = []
 
-            for a in soup.select("a")[: limit * 5]:
-                href = a.get("href") or ""
-                title = clean_html_text(a.get_text(" ", strip=True))
-                if not href or not title:
-                    continue
-                if "medlineplus.gov" not in href and not href.startswith("/"):
-                    continue
+            for doc in root.findall(".//document")[:limit]:
+                doc_url = doc.get("url", "")
+                title = ""
+                summary = ""
+                for content in doc.findall("content"):
+                    name = content.get("name")
+                    if name == "title":
+                        title = content.text or ""
+                    elif name == "FullSummary":
+                        summary = clean_html_text(content.text or "")
+                    elif name == "snippet" and not summary:
+                        summary = clean_html_text(content.text or "")
 
-                full_url = href if href.startswith("http") else f"https://medlineplus.gov{href}"
-                parent_text = clean_html_text(a.parent.get_text(" ", strip=True)) if a.parent else ""
-                summary = trim_summary(parent_text, self.max_summary_chars)
+                if not doc_url or not title:
+                    continue
 
                 records.append(
                     self._make_record(
                         title=title,
                         summary=summary,
-                        url=full_url,
+                        url=doc_url,
                         source="MedlinePlus",
                         source_type="medlineplus",
                         record_type="medical_article",
@@ -155,8 +159,7 @@ class AcademicSourceFetcher:
                     )
                 )
 
-            dedup = {r.id: r for r in records}
-            return list(dedup.values())[:limit]
+            return records
         except Exception as exc:
             logger.warning("MedlinePlus search failed: %s", exc)
             return []
@@ -168,7 +171,11 @@ class AcademicSourceFetcher:
     def search_nimh(self, query: str, limit: int = 8) -> List[SearchRecord]:
         try:
             url = f"https://www.nimh.nih.gov/search?query={quote_plus(query)}"
-            response = requests.get(url, timeout=self.timeout_seconds)
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            }
+            response = requests.get(url, headers=headers, timeout=self.timeout_seconds)
             response.raise_for_status()
 
             soup = BeautifulSoup(response.text, "html.parser")
@@ -222,6 +229,9 @@ class AcademicSourceFetcher:
                 "fields": "title,abstract,url,year,authors,externalIds,citationCount",
             }
             response = requests.get(api_url, params=params, timeout=self.timeout_seconds)
+            if response.status_code == 429:
+                logger.debug("Semantic Scholar rate limited (429 HTTP Error). Skipping.")
+                return []
             response.raise_for_status()
             data = response.json()
 
