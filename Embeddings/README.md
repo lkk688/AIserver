@@ -14,14 +14,18 @@ This version adds:
 - `docker-compose.yml` — example deployment with both models mounted
 
 ## 1) Export the embedding model
+Install:
+```bash
+(py312) lkk@rtx5090:/Developer/AIserver/Embeddings$ pip install sentence-transformers[onnx-gpu]
+```
 
 Example for BGE-M3:
 
 ```bash
 python3 export_embedding_model.py \
   --model-id BAAI/bge-m3 \
-  --output-dir /models/bge-m3 \
-  --pooling mean \
+  --output-dir ../output/bge-m3 \
+  --pooling cls \
   --normalize \
   --max-length 8192
 ```
@@ -31,8 +35,8 @@ Example for Qwen embedding:
 ```bash
 python3 export_embedding_model.py \
   --model-id Qwen/Qwen3-Embedding-0.6B \
-  --output-dir /models/qwen3-embedding-0.6b \
-  --pooling mean \
+  --output-dir ../output/qwen3-embedding-0.6b \
+  --pooling last_token \
   --normalize \
   --max-length 32768
 ```
@@ -44,7 +48,7 @@ Example for a Qwen reranker:
 ```bash
 python3 export_reranker_model.py \
   --model-id Qwen/Qwen3-Reranker-0.6B \
-  --output-dir /models/qwen3-reranker-0.6b \
+  --output-dir ../output/qwen3-reranker-0.6b \
   --max-length 512
 ```
 
