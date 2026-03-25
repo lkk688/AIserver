@@ -107,12 +107,22 @@ class OnlineSearchService:
         elif request.domain in ("academic", "medical", "research"):
             plan.use_pubmed = request.use_academic_sources or request.use_medical_sources
             plan.use_medlineplus = request.use_medical_sources
-            plan.use_nimh = request.domain == "medical"
+            plan.use_nimh = False  # consistently 403; disabled
             plan.use_crawler = True
             plan.use_news_rss = False
             plan.use_news_api = False
             plan.use_wikimedia = True
             plan.recent_hours = self.config.general_cache_hours
+            # For medical queries prefer PubMed/MedlinePlus/CDC/WHO; arXiv/SS are CS-heavy
+            if request.domain == "medical":
+                plan.use_arxiv = False
+                plan.use_semantic_scholar = False
+                plan.use_cdc = False  # CDC search page is JS-rendered; no usable API
+                plan.use_who = False  # iris.who.int requires auth (403); WHO docs via Europe PMC
+                plan.use_europe_pmc = True
+            else:
+                plan.use_arxiv = True
+                plan.use_semantic_scholar = True
 
         else:
             plan.use_serper = True
@@ -172,7 +182,13 @@ class OnlineSearchService:
                         use_pubmed=plan.use_pubmed,
                         use_medlineplus=plan.use_medlineplus,
                         use_nimh=plan.use_nimh,
+                        use_cdc=plan.use_cdc,
+                        use_who=plan.use_who,
+                        use_europe_pmc=plan.use_europe_pmc,
                         use_crawler=plan.use_crawler,
+                        use_semantic_scholar=plan.use_semantic_scholar,
+                        use_arxiv=plan.use_arxiv,
+                        target_domain=request.domain,
                     )
                 )
             except Exception:

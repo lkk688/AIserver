@@ -107,6 +107,11 @@ class SearchPlan(BaseModel):
     use_pubmed: bool = False
     use_medlineplus: bool = False
     use_nimh: bool = False
+    use_cdc: bool = False
+    use_who: bool = False
+    use_europe_pmc: bool = False
+    use_semantic_scholar: bool = True
+    use_arxiv: bool = True
 
     use_crawler: bool = False
 

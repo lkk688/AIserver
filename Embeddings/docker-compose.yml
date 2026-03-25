@@ -1,0 +1,27 @@
+services:
+  embeddings:
+    image: onnx-embeddings-rerank-p100:latest
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      EMBED_MODEL_DIR: /models/embedding
+      EMBED_SERVICE_CONFIG: /models/embedding/service_config.json
+      RERANK_MODEL_DIR: /models/reranker
+      RERANK_SERVICE_CONFIG: /models/reranker/service_config.json
+      API_KEYS: change-me-please
+      ORT_GPU_MEM_LIMIT_GB: "14"
+      EMBED_MAX_BATCH_TEXTS: "32"
+      EMBED_BATCH_TIMEOUT_MS: "8"
+      RERANK_MAX_BATCH_PAIRS: "32"
+      RERANK_BATCH_TIMEOUT_MS: "8"
+    volumes:
+      - /absolute/path/to/embedding-model:/models/embedding:ro
+      - /absolute/path/to/reranker-model:/models/reranker:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

@@ -1,0 +1,8 @@
+{
+  "model_id": "Qwen/Qwen3-Reranker-0.6B",
+  "task": "rerank",
+  "max_length": 512,
+  "normalize_scores": false,
+  "query_prefix": "",
+  "document_prefix": ""
+}

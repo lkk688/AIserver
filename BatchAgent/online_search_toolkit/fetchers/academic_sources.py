@@ -67,7 +67,7 @@ class AcademicSourceFetcher:
     # PubMed
     # ------------------------------------------------------------------
 
-    def search_pubmed(self, query: str, limit: int = 8) -> List[SearchRecord]:
+    def search_pubmed(self, query: str, limit: int = 8, target_domain: str = "medical") -> List[SearchRecord]:
         try:
             esearch_url = (
                 "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
@@ -105,7 +105,7 @@ class AcademicSourceFetcher:
                         source="PubMed",
                         source_type="pubmed",
                         record_type="academic_paper",
-                        domain="academic",
+                        domain=target_domain,
                         category="medical_research",
                         query=query,
                         metadata={"pmid": pmid},
@@ -122,7 +122,12 @@ class AcademicSourceFetcher:
 
     def search_medlineplus(self, query: str, limit: int = 8) -> List[SearchRecord]:
         try:
-            url = f"https://wsearch.nlm.nih.gov/ws/query?db=healthTopics&term={quote_plus(query)}&retmax={limit}"
+            # MedlinePlus healthTopics DB works best with short queries (≤4 words);
+            # drop org-name prefixes (AAP, CDC, WHO, NIH) and take leading keywords.
+            _stop = {"aap", "cdc", "who", "nih", "fda", "usda", "acsm", "aha"}
+            words = [w for w in query.split() if w.lower() not in _stop]
+            short_query = " ".join(words[:4])
+            url = f"https://wsearch.nlm.nih.gov/ws/query?db=healthTopics&term={quote_plus(short_query)}&retmax={limit}"
             response = requests.get(url, timeout=self.timeout_seconds)
             response.raise_for_status()
 
@@ -365,6 +370,204 @@ class AcademicSourceFetcher:
             return []
 
     # ------------------------------------------------------------------
+    # Europe PMC  (free API, covers PubMed + PMC + WHO guidelines + preprints)
+    # ------------------------------------------------------------------
+
+    def search_europe_pmc(self, query: str, limit: int = 8, target_domain: str = "medical") -> List[SearchRecord]:
+        """Search Europe PMC REST API (free, no key). Covers PubMed, PMC, WHO docs."""
+        try:
+            params = {
+                "query": query,
+                "format": "json",
+                "resulttype": "lite",
+                "pageSize": min(limit, 25),
+            }
+            response = requests.get(
+                "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+                params=params,
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            records: List[SearchRecord] = []
+            for item in data.get("resultList", {}).get("result", [])[:limit]:
+                title = item.get("title", "")
+                if not title:
+                    continue
+                pmid = item.get("pmid", "")
+                pmcid = item.get("pmcid", "")
+                doi = item.get("doi", "")
+                abstract = item.get("abstractText") or ""
+                authors = item.get("authorString", "")
+                year = str(item.get("pubYear", ""))
+                journal = item.get("journalTitle", "")
+                source_code = item.get("source", "")
+                citations = item.get("citedByCount", 0)
+
+                if pmid:
+                    url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+                elif pmcid:
+                    url = f"https://europepmc.org/article/PMC/{pmcid.replace('PMC', '')}"
+                elif doi:
+                    url = f"https://doi.org/{doi}"
+                else:
+                    continue
+
+                summary_parts = [p for p in [authors[:120], year, journal, abstract] if p]
+
+                records.append(
+                    self._make_record(
+                        title=title,
+                        summary=". ".join(summary_parts),
+                        url=url,
+                        source="Europe PMC",
+                        source_type="search_api",
+                        record_type="academic_paper",
+                        domain=target_domain,
+                        category="medical_research",
+                        query=query,
+                        metadata={
+                            "pmid": pmid,
+                            "pmcid": pmcid,
+                            "doi": doi,
+                            "pub_year": year,
+                            "epmc_source": source_code,
+                            "citation_count": citations,
+                        },
+                    )
+                )
+            return records[:limit]
+        except Exception as exc:
+            logger.warning("Europe PMC search failed: %s", exc)
+            return []
+
+    # ------------------------------------------------------------------
+    # CDC (Centers for Disease Control and Prevention) — HTML search page
+    # ------------------------------------------------------------------
+
+    def search_cdc(self, query: str, limit: int = 8) -> List[SearchRecord]:
+        """Search CDC via their main HTML search page (search.cdc.gov/search/)."""
+        try:
+            url = f"https://search.cdc.gov/search/?query={quote_plus(query)}&affiliate=cdc-main"
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+            response = requests.get(url, headers=headers, timeout=self.timeout_seconds)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            records: List[SearchRecord] = []
+
+            # CDC search results use various selectors across redesigns — try all
+            result_blocks = (
+                soup.select("li.content_item")
+                or soup.select("li.search-result-item")
+                or soup.select("div.result")
+                or soup.select("li[data-module='search-result']")
+            )
+
+            for block in result_blocks[: limit * 3]:
+                a = block.find("a", href=True)
+                if not a:
+                    continue
+                title = clean_html_text(a.get_text(" ", strip=True))
+                href = a["href"]
+                full_url = href if href.startswith("http") else f"https://www.cdc.gov{href}"
+                if "cdc.gov" not in full_url:
+                    continue
+                desc_el = block.find("p") or block.find(class_=re.compile(r"desc|snippet|summary"))
+                description = clean_html_text(desc_el.get_text(" ", strip=True)) if desc_el else ""
+                if not title:
+                    continue
+                records.append(
+                    self._make_record(
+                        title=title,
+                        summary=description,
+                        url=full_url,
+                        source="CDC",
+                        source_type="search_api",
+                        record_type="medical_article",
+                        domain="medical",
+                        category="health_guidelines",
+                        query=query,
+                    )
+                )
+
+            dedup = {r.id: r for r in records}
+            return list(dedup.values())[:limit]
+        except Exception as exc:
+            logger.warning("CDC search failed: %s", exc)
+            return []
+
+    # ------------------------------------------------------------------
+    # WHO (World Health Organization) — publications search API
+    # ------------------------------------------------------------------
+
+    def search_who(self, query: str, limit: int = 8) -> List[SearchRecord]:
+        """Search WHO publications via their IRIS/publications search."""
+        try:
+            # WHO IRIS (Institutional Repository for Information Sharing) — free REST API
+            params = {
+                "query": query,
+                "rows": min(limit, 20),
+                "wt": "json",
+            }
+            response = requests.get(
+                "https://iris.who.int/rest/search",
+                params=params,
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            records: List[SearchRecord] = []
+            docs = data.get("response", {}).get("docs", [])
+            for doc in docs[:limit]:
+                title = doc.get("dc.title", [""])[0] if isinstance(doc.get("dc.title"), list) else doc.get("dc.title", "")
+                if not title:
+                    continue
+                handle = doc.get("handle", "")
+                item_url = f"https://iris.who.int/handle/{handle}" if handle else ""
+                if not item_url:
+                    continue
+                desc_raw = doc.get("dc.description", doc.get("dc.description.abstract", ""))
+                if isinstance(desc_raw, list):
+                    desc_raw = " ".join(desc_raw)
+                summary = clean_html_text(str(desc_raw))
+                date = doc.get("dc.date.issued", [""])[0] if isinstance(doc.get("dc.date.issued"), list) else ""
+                authors_raw = doc.get("dc.contributor.author", [])
+                if isinstance(authors_raw, list):
+                    authors_str = ", ".join(authors_raw[:5])
+                else:
+                    authors_str = str(authors_raw)
+
+                records.append(
+                    self._make_record(
+                        title=title,
+                        summary=f"{authors_str}. {date}. {summary}".strip(". "),
+                        url=item_url,
+                        source="WHO",
+                        source_type="search_api",
+                        record_type="medical_article",
+                        domain="medical",
+                        category="health_guidelines",
+                        query=query,
+                        metadata={"handle": handle, "date": date},
+                    )
+                )
+
+            return records[:limit]
+        except Exception as exc:
+            logger.warning("WHO search failed: %s", exc)
+            return []
+
+    # ------------------------------------------------------------------
     # Crawler
     # ------------------------------------------------------------------
 
@@ -408,14 +611,20 @@ class AcademicSourceFetcher:
         use_pubmed: bool = True,
         use_medlineplus: bool = True,
         use_nimh: bool = False,
+        use_cdc: bool = False,
+        use_who: bool = False,
+        use_europe_pmc: bool = False,
         use_crawler: bool = False,
         use_semantic_scholar: bool = True,
         use_arxiv: bool = True,
+        target_domain: str = "academic",
     ) -> List[SearchRecord]:
         results: List[SearchRecord] = []
 
         if use_pubmed:
-            results.extend(self.search_pubmed(query, limit))
+            results.extend(self.search_pubmed(query, limit, target_domain=target_domain))
+        if use_europe_pmc:
+            results.extend(self.search_europe_pmc(query, limit, target_domain=target_domain))
         if use_semantic_scholar:
             results.extend(self.search_semantic_scholar(query, limit))
         if use_arxiv:
@@ -424,6 +633,10 @@ class AcademicSourceFetcher:
             results.extend(self.search_medlineplus(query, limit))
         if use_nimh:
             results.extend(self.search_nimh(query, limit))
+        if use_cdc:
+            results.extend(self.search_cdc(query, limit))
+        if use_who:
+            results.extend(self.search_who(query, limit))
         if use_crawler:
             results.extend(self.search_crawler(query, limit, domain="medical" if use_nimh else "academic"))
 

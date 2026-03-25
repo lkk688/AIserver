@@ -1,13 +1,30 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from ..config import SearchConfig
 from ..models import SearchRecord
 from ..utils import cosine_similarity, normalize_url, utc_now
 from .base import SearchStore
+
+# Map each domain to its cache file name
+_DOMAIN_FILE: Dict[str, str] = {
+    "news":        "news.json",
+    "academic":    "academic.json",
+    "research":    "academic.json",
+    "medical":     "medical.json",
+    "general":     "general.json",
+    "programming": "general.json",
+    "finance":     "general.json",
+}
+_ALL_FILES = ["news.json", "academic.json", "medical.json", "general.json"]
+
+
+def _domain_file(domain: str) -> str:
+    return _DOMAIN_FILE.get(domain, "general.json")
 
 
 class FileSearchStore(SearchStore):
@@ -16,50 +33,104 @@ class FileSearchStore(SearchStore):
         self.base_dir: Path = config.store.file_cache_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
-        self.records_path = self.base_dir / "records.json"
         self.daily_dir = self.base_dir / "daily"
         self.daily_dir.mkdir(parents=True, exist_ok=True)
 
-    def initialize(self) -> None:
-        if not self.records_path.exists():
-            self._write_payload([])
+        # Legacy single-file path — only used for migration
+        self._legacy_path = self.base_dir / "records.json"
 
-    def _read_records(self) -> List[SearchRecord]:
-        if not self.records_path.exists():
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _path(self, filename: str) -> Path:
+        return self.base_dir / filename
+
+    def _read_file(self, filename: str) -> List[SearchRecord]:
+        p = self._path(filename)
+        if not p.exists():
             return []
-        payload = json.loads(self.records_path.read_text(encoding="utf-8"))
-        return [SearchRecord.model_validate(item) for item in payload.get("records", [])]
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+            return [SearchRecord.model_validate(item) for item in payload.get("records", [])]
+        except Exception:
+            return []
 
-    def _write_payload(self, records: List[SearchRecord]) -> None:
+    def _write_file(self, filename: str, records: List[SearchRecord]) -> None:
+        records_sorted = sorted(
+            records,
+            key=lambda x: (1 if x.is_breaking else 0, x.published_at or x.fetched_at or utc_now()),
+            reverse=True,
+        )
         payload = {
             "updated_at": utc_now().isoformat(),
-            "records": [r.model_dump(mode="json") for r in records],
+            "category": filename.replace(".json", ""),
+            "records": [r.model_dump(mode="json") for r in records_sorted],
         }
-        self.records_path.write_text(
+        self._path(filename).write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
-    def upsert_records(self, records: List[SearchRecord]) -> None:
-        current = {r.id: r for r in self._read_records()}
-        for record in records:
-            current[record.id] = record
+    def _read_domain(self, domain: Optional[str]) -> List[SearchRecord]:
+        """Read records for a specific domain (single file) or all files."""
+        if domain:
+            return self._read_file(_domain_file(domain))
+        # Read all category files
+        seen: Dict[str, SearchRecord] = {}
+        for fname in _ALL_FILES:
+            for r in self._read_file(fname):
+                seen[r.id] = r
+        return list(seen.values())
 
-        merged = list(current.values())
-        merged.sort(
-            key=lambda x: (
-                1 if x.is_breaking else 0,
-                x.published_at or x.fetched_at or utc_now(),
-            ),
-            reverse=True,
-        )
-        self._write_payload(merged)
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def initialize(self) -> None:
+        """Create empty category files and migrate legacy records.json if present."""
+        for fname in _ALL_FILES:
+            p = self._path(fname)
+            if not p.exists():
+                self._write_file(fname, [])
+
+        # One-time migration from old single records.json
+        if self._legacy_path.exists():
+            try:
+                payload = json.loads(self._legacy_path.read_text(encoding="utf-8"))
+                old = [SearchRecord.model_validate(item) for item in payload.get("records", [])]
+                if old:
+                    self.upsert_records(old)
+                    self._legacy_path.rename(self._legacy_path.with_suffix(".json.migrated"))
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Write
+    # ------------------------------------------------------------------
+
+    def upsert_records(self, records: List[SearchRecord]) -> None:
+        # Group incoming records by target file
+        by_file: Dict[str, List[SearchRecord]] = defaultdict(list)
+        for r in records:
+            by_file[_domain_file(r.domain)].append(r)
+
+        for fname, new_records in by_file.items():
+            current = {r.id: r for r in self._read_file(fname)}
+            for r in new_records:
+                current[r.id] = r
+            self._write_file(fname, list(current.values()))
+
+    # ------------------------------------------------------------------
+    # Read
+    # ------------------------------------------------------------------
 
     def get_by_url(self, url: str) -> Optional[SearchRecord]:
         normalized = normalize_url(url)
-        for record in self._read_records():
-            if normalize_url(record.url) == normalized:
-                return record
+        for fname in _ALL_FILES:
+            for record in self._read_file(fname):
+                if normalize_url(record.url) == normalized:
+                    return record
         return None
 
     def _filter(
@@ -76,8 +147,11 @@ class FileSearchStore(SearchStore):
             if language and item.language != language:
                 continue
             if domain:
-                if domain in ("academic", "medical", "research"):
-                    if item.domain not in ("academic", "medical", "research"):
+                if domain == "medical":
+                    if item.domain != "medical":
+                        continue
+                elif domain in ("academic", "research"):
+                    if item.domain not in ("academic", "research"):
                         continue
                 elif item.domain != domain:
                     continue
@@ -103,17 +177,14 @@ class FileSearchStore(SearchStore):
         recent_hours: Optional[int] = None,
     ) -> List[SearchRecord]:
         items = self._filter(
-            self._read_records(),
+            self._read_domain(domain),
             language=language,
             domain=domain,
             category=category,
             recent_hours=recent_hours,
         )
         items.sort(
-            key=lambda x: (
-                1 if x.is_breaking else 0,
-                x.published_at or x.fetched_at or utc_now(),
-            ),
+            key=lambda x: (1 if x.is_breaking else 0, x.published_at or x.fetched_at or utc_now()),
             reverse=True,
         )
         return items[:limit]
@@ -130,7 +201,7 @@ class FileSearchStore(SearchStore):
     ) -> List[SearchRecord]:
         q_lower = query.lower()
         items = self._filter(
-            self._read_records(),
+            self._read_domain(domain),
             language=language,
             domain=domain,
             category=category,
@@ -170,7 +241,7 @@ class FileSearchStore(SearchStore):
         record_types: Optional[List[str]] = None,
     ) -> List[SearchRecord]:
         items = self._filter(
-            self._read_records(),
+            self._read_domain(domain),
             language=language,
             domain=domain,
             category=category,
@@ -197,16 +268,18 @@ class FileSearchStore(SearchStore):
 
     def archive_daily_snapshot(self) -> None:
         stamp = utc_now().strftime("%Y-%m-%d")
-        out = self.daily_dir / f"{stamp}.json"
+        snapshot_dir = self.daily_dir / stamp
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
 
-        records = self._read_records()
-        payload = {
-            "date": stamp,
-            "archived_at": utc_now().isoformat(),
-            "records": [r.model_dump(mode="json") for r in records],
-        }
-
-        out.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        for fname in _ALL_FILES:
+            records = self._read_file(fname)
+            if not records:
+                continue
+            out = snapshot_dir / fname
+            payload = {
+                "date": stamp,
+                "archived_at": utc_now().isoformat(),
+                "category": fname.replace(".json", ""),
+                "records": [r.model_dump(mode="json") for r in records],
+            }
+            out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -1,0 +1,9 @@
+{
+  "model_id": "BAAI/bge-m3",
+  "task": "embedding",
+  "max_length": 8192,
+  "pooling": "mean",
+  "normalize": true,
+  "query_prefix": "",
+  "document_prefix": ""
+}

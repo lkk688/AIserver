@@ -17,6 +17,7 @@ class EmbeddingClient:
             base_url=config.api_url.rstrip("/"),
             api_key=config.api_key,
             timeout=config.timeout_seconds,
+            max_retries=0,  # our callers already handle failures; built-in retries just add latency
         )
 
     def embed_texts(self, texts: List[str]) -> List[List[float]]:

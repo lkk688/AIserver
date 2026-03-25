@@ -49,7 +49,11 @@ class HybridSearcher:
                 )
                 for r in chunk
             ]
-            vectors = self.embedding_client.embed_texts(texts)
+            try:
+                vectors = self.embedding_client.embed_texts(texts)
+            except Exception:
+                logger.warning("Embedding service unavailable, skipping embeddings for this batch")
+                continue
             for record, vec in zip(chunk, vectors):
                 record.embedding = vec
                 record.embedding_model = self.embedding_client.config.api_model

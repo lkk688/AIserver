@@ -16,7 +16,7 @@ class EmbeddingConfig(BaseModel):
     api_key: str = Field(default=os.getenv("EMBEDDING_API_KEY", "EMPTY"))
     api_model: str = Field(default=os.getenv("EMBEDDING_API_MODEL", "text-embeddings-inference"))
     batch_size: int = Field(default=int(os.getenv("EMBEDDING_BATCH_SIZE", "32")))
-    timeout_seconds: int = Field(default=int(os.getenv("EMBEDDING_TIMEOUT_SECONDS", "30")))
+    timeout_seconds: int = Field(default=int(os.getenv("EMBEDDING_TIMEOUT_SECONDS", "8")))
 
 
 class RerankConfig(BaseModel):
@@ -28,7 +28,7 @@ class RerankConfig(BaseModel):
 
 
 class StoreConfig(BaseModel):
-    file_cache_dir: Path = Field(default=Path(os.getenv("SEARCH_FILE_CACHE_DIR", "./search_cache")))
+    file_cache_dir: Path = Field(default=Path(os.getenv("SEARCH_FILE_CACHE_DIR", ".cache/search")))
     postgres_enabled: bool = Field(default=os.getenv("SEARCH_POSTGRES_ENABLED", "false").lower() == "true")
     postgres_dsn: str = Field(default=os.getenv("SEARCH_POSTGRES_DSN", "postgresql://postgres:postgres@localhost:5432/searchdb"))
     pgvector_enabled: bool = Field(default=os.getenv("SEARCH_PGVECTOR_ENABLED", "true").lower() == "true")

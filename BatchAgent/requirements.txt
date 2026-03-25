@@ -1,3 +1,4 @@
+PyJWT
 python-jose[cryptography]
 beautifulsoup4
 markdownify
@@ -17,3 +18,4 @@ psycopg[binary]>=3.2.0
 pgvector>=0.3.2
 APScheduler>=3.10.4
 pydantic>=2.8.2
+rich>=13.0.0

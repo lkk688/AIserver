@@ -86,9 +86,13 @@ def build_academic_search_fn(
         use_pubmed: bool = True,
         use_medlineplus: bool = True,
         use_nimh: bool = False,
+        use_cdc: bool = False,
+        use_who: bool = False,
+        use_europe_pmc: bool = False,
         use_crawler: bool = False,
         use_semantic_scholar: bool = True,
         use_arxiv: bool = True,
+        target_domain: str = "academic",
         **kwargs,
     ) -> List[SearchRecord]:
         return fetcher.search(
@@ -99,9 +103,13 @@ def build_academic_search_fn(
             use_pubmed=use_pubmed,
             use_medlineplus=use_medlineplus,
             use_nimh=use_nimh,
+            use_cdc=use_cdc,
+            use_who=use_who,
+            use_europe_pmc=use_europe_pmc,
             use_crawler=use_crawler,
             use_semantic_scholar=use_semantic_scholar,
             use_arxiv=use_arxiv,
+            target_domain=target_domain,
         )
 
     return _search_academic

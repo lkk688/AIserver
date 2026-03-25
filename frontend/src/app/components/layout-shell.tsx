@@ -2,17 +2,18 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { 
-  LayoutDashboard, 
-  Upload, 
-  FileText, 
-  History, 
-  Sparkles, 
+import {
+  LayoutDashboard,
+  Upload,
+  FileText,
+  CalendarClock,
+  Sparkles,
   Search,
   Bell,
   User,
   Settings,
-  Waves
+  Waves,
+  Globe,
 } from "lucide-react";
 import clsx from "clsx";
 
@@ -23,10 +24,10 @@ function Sidebar() {
     { icon: LayoutDashboard, label: "Dashboard", href: "/dashboard" },
     { icon: Upload, label: "Upload Documents", href: "/sources" },
     { icon: FileText, label: "My Documents", href: "/documents" },
-    { icon: History, label: "History", href: "/jobs" },
+    { icon: CalendarClock, label: "Scheduler", href: "/jobs" },
     { icon: Waves, label: "Audio Lab", href: "/audio" },
     { icon: Sparkles, label: "Chat Agent", href: "/chat" },
-    { icon: Search, label: "Smart Search", href: "/search" },
+    { icon: Globe, label: "Online Search", href: "/search" },
   ];
 
   return (

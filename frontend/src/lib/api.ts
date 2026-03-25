@@ -131,3 +131,121 @@ export const search = async (query: string, top_k: number = 10): Promise<SearchR
   const { data } = await api.post<SearchResult[]>('/search', { query, top_k });
   return data;
 };
+
+// ─── Online Search Toolkit ──────────────────────────────────────────────────
+
+export type OnlineSearchDomain = 'web' | 'news' | 'academic' | 'medical';
+
+export interface OnlineSearchRecord {
+  id: string;
+  url: string;
+  title: string;
+  summary: string;
+  content?: string | null;
+  source: string;
+  domain: string;
+  category: string;
+  language: string;
+  published_at?: string | null;
+  fetched_at?: string | null;
+  is_breaking: boolean;
+  record_type: string;
+  query?: string | null;
+  embedding?: null;
+}
+
+export interface OnlineSearchResult {
+  query: string;
+  domain: string;
+  count: number;
+  items: OnlineSearchRecord[];
+  metadata: Record<string, unknown>;
+}
+
+export interface SchedulerJob {
+  id: string;
+  next_run: string | null;
+  trigger: string;
+}
+
+export interface SchedulerConfig {
+  breaking_interval_minutes: number;
+  daily_refresh_hour_1: number;
+  daily_refresh_hour_2: number;
+  seed_crawl_hour: number;
+  seed_urls: string[];
+  news_refresh_queries: string[];
+  academic_refresh_queries: string[];
+  web_refresh_queries: string[];
+}
+
+export interface SchedulerStatus {
+  running: boolean;
+  jobs: SchedulerJob[];
+  config: SchedulerConfig;
+}
+
+export interface OnlineSearchReq {
+  query: string;
+  limit?: number;
+  language?: string;
+  category?: string;
+  no_cache?: boolean;
+}
+
+export const onlineSearch = async (
+  domain: OnlineSearchDomain,
+  req: OnlineSearchReq,
+): Promise<OnlineSearchResult> => {
+  const { data } = await api.post<OnlineSearchResult>(`/online-search/${domain}`, req);
+  return data;
+};
+
+export const onlineReadUrl = async (
+  url: string,
+  domain = 'general',
+  category = 'general',
+  force_refresh = false,
+): Promise<OnlineSearchRecord> => {
+  const { data } = await api.post<OnlineSearchRecord>('/online-search/url', {
+    url, domain, category, force_refresh,
+  });
+  return data;
+};
+
+export const onlineGetCache = async (params: {
+  domain?: string;
+  category?: string;
+  limit?: number;
+  recent_hours?: number;
+} = {}): Promise<{ count: number; items: OnlineSearchRecord[] }> => {
+  const { data } = await api.get('/online-search/cache', { params });
+  return data;
+};
+
+export const onlineSchedulerStatus = async (): Promise<SchedulerStatus> => {
+  const { data } = await api.get<SchedulerStatus>('/online-search/scheduler/status');
+  return data;
+};
+
+export const onlineSchedulerStart = async (cfg?: Partial<SchedulerConfig>): Promise<{ status: string }> => {
+  const { data } = await api.post('/online-search/scheduler/start', cfg ?? {});
+  return data;
+};
+
+export const onlineSchedulerStop = async (): Promise<{ status: string }> => {
+  const { data } = await api.post('/online-search/scheduler/stop');
+  return data;
+};
+
+export const onlineSchedulerRunNow = async (): Promise<{ status: string }> => {
+  const { data } = await api.post('/online-search/scheduler/run-now');
+  return data;
+};
+
+export const onlineSchedulerUpdateConfig = async (
+  cfg: Partial<SchedulerConfig>,
+): Promise<{ status: string; config: SchedulerConfig }> => {
+  const { data } = await api.put('/online-search/scheduler/config', cfg);
+  return data;
+};

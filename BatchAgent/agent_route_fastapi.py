@@ -28,7 +28,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from BatchAgent.agent_services_fastapi import AgentService
+#from BatchAgent.agent_services_fastapi import AgentService
+from BatchAgent.agent_services_fastapi_v2 import AgentService
 from BatchAgent.tools_registry import get_base_tools
 
 try:
