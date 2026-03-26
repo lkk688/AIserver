@@ -12,13 +12,14 @@ from .base import SearchStore
 
 # Map each domain to its cache file name
 _DOMAIN_FILE: Dict[str, str] = {
-    "news":        "news.json",
-    "academic":    "academic.json",
-    "research":    "academic.json",
-    "medical":     "medical.json",
-    "general":     "general.json",
-    "programming": "general.json",
-    "finance":     "general.json",
+    "news":              "news.json",
+    "academic":          "academic.json",
+    "research":          "academic.json",
+    "medical":           "medical.json",
+    "medical_academic":  "medical.json",
+    "general":           "general.json",
+    "programming":       "general.json",
+    "finance":           "general.json",
 }
 _ALL_FILES = ["news.json", "academic.json", "medical.json", "general.json"]
 
@@ -147,8 +148,8 @@ class FileSearchStore(SearchStore):
             if language and item.language != language:
                 continue
             if domain:
-                if domain == "medical":
-                    if item.domain != "medical":
+                if domain in ("medical", "medical_academic"):
+                    if item.domain not in ("medical", "medical_academic"):
                         continue
                 elif domain in ("academic", "research"):
                     if item.domain not in ("academic", "research"):
@@ -265,6 +266,16 @@ class FileSearchStore(SearchStore):
 
         scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
         return [x[3] for x in scored[:limit]]
+
+    def delete_record(self, record_id: str) -> bool:
+        """Delete a record by ID from whichever domain file contains it. Returns True if found."""
+        for fname in _ALL_FILES:
+            records = self._read_file(fname)
+            new_records = [r for r in records if r.id != record_id]
+            if len(new_records) < len(records):
+                self._write_file(fname, new_records)
+                return True
+        return False
 
     def archive_daily_snapshot(self) -> None:
         stamp = utc_now().strftime("%Y-%m-%d")

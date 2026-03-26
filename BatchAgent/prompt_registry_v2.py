@@ -272,6 +272,10 @@ class PromptRegistry:
         if has_finish_task:
             general_rules += (
                 "4. **End of Task**: The moment you have fully achieved the user's goal, you MUST immediately call the `finish_task` tool in your very next response.\n"
+                "5. **Unrecoverable Failures**: If a tool returns a permanent error (e.g. `[URL Permanently Blocked]`, `[URL Not Found]`, `[Web Search Unavailable]`) "
+                "and no alternative source or tool can supply the needed information, do NOT keep retrying. "
+                "Call `finish_task` immediately, explaining what was attempted and why the information could not be retrieved. "
+                "Repeating failed tool calls in a loop wastes turns and never helps.\n"
             )
         else:
             general_rules += (
@@ -481,6 +485,18 @@ class PromptRegistry:
 
     @staticmethod
     def loop_detected(skipped_names: List[str]) -> str:
+        read_tools = {"read_file_chunk", "read_document_section", "read_file", "get_memory"}
+        is_read_loop = any(n in read_tools for n in skipped_names)
+        if is_read_loop:
+            return (
+                f"⚠️ **Loop detected**: You already called {skipped_names} with identical "
+                "arguments. Results already provided.\n"
+                "You are stuck in a read loop. **Stop reading.**\n"
+                "- If the output file is truncated/incomplete → call `write_file` with the "
+                "full content synthesized from your memory.\n"
+                "- If the output is complete → call `finish_task`.\n"
+                "Do NOT call any read tool again with the same arguments."
+            )
         return (
             f"⚠️ **Loop detected**: You already called {skipped_names} with identical "
             "arguments. Results already provided. Synthesize what you know — "
@@ -547,6 +563,28 @@ class PromptRegistry:
     @staticmethod
     def read_only_guidance(output_file: Optional[str]) -> str:
         if output_file:
+            # Check if the file looks truncated (ends mid-sentence / is very short).
+            import os as _os
+            try:
+                text = open(output_file, encoding="utf-8", errors="replace").read()
+                stripped = text.rstrip()
+                last_char = stripped[-1] if stripped else ""
+                is_truncated = (
+                    len(stripped) < 300
+                    or (last_char not in (".", "\n", ">", "}", "]", "-", "#", "*", "!", ":")
+                        and len(stripped) < 1500)
+                )
+            except Exception:
+                is_truncated = False
+
+            if is_truncated:
+                return (
+                    f"\n⚠️ Output file `{output_file}` appears **incomplete or truncated** "
+                    f"(ends with: ...{repr(stripped[-40:]) if stripped else '(empty)'}).\n"
+                    "The previous write was likely cut short by output token limits.\n"
+                    "**You MUST call `write_file` to rewrite the complete file.** "
+                    "Do NOT call `finish_task` until the file is complete."
+                )
             return (
                 f"\nResults above from your read. "
                 f"Output file exists: `{output_file}`. "

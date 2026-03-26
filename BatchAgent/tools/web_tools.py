@@ -496,8 +496,11 @@ def perform_domain_aware_search(
         parts.append(_format_records(items, query))
     else:
         parts.append(
-            "[Web Search Unavailable] No results returned. "
-            "Set SERPER_API_KEY or TAVILY_API_KEY to enable web search."
+            "[Web Search Unavailable] Web search is not configured on this system "
+            "(no SERPER_API_KEY or TAVILY_API_KEY). "
+            "Do NOT retry web_search — it will keep failing. "
+            "If the required information cannot be obtained from other available tools, "
+            "call finish_task explaining that web search is unavailable."
         )
 
     # Optional document RAG — skip placeholder messages when no document is loaded
@@ -512,10 +515,79 @@ def perform_domain_aware_search(
     return "\n\n".join(parts)
 
 
+_DEFAULT_URL_WINDOW = 200  # lines per read_url page
+_MAX_URL_WINDOW = 1000
+
+
+def _apply_line_window(text: str, offset: int = 0, limit: int = _DEFAULT_URL_WINDOW) -> str:
+    """Slice *text* to [offset, offset+limit) lines, appending pagination hints."""
+    lines = text.splitlines()
+    total = len(lines)
+    offset = max(0, offset)
+    limit = max(1, min(limit, _MAX_URL_WINDOW))
+    window = lines[offset: offset + limit]
+    result = "\n".join(window)
+    end = offset + len(window)
+    if end < total:
+        result += f"\n\n[... {total - end} more lines. Call read_url with offset={end} to continue ...]"
+    elif offset > 0:
+        result += f"\n\n[End of document ({total} lines total)]"
+    return result
+
+
+def _format_url_error(url: str, error_msg: str) -> str:
+    """
+    Return a structured, agent-actionable error message for a failed URL fetch.
+
+    Distinguishes permanent access failures (4xx) from transient errors so the
+    agent knows whether retrying will help.
+    """
+    msg_lower = error_msg.lower()
+
+    # Permanent access-denial errors — retrying is pointless
+    if any(code in msg_lower for code in ("403", "401", "forbidden", "unauthorized", "paywall")):
+        domain = url.split("/")[2] if url.count("/") >= 2 else url
+        return (
+            f"[URL Permanently Blocked] {url}\n"
+            f"Error: {error_msg}\n"
+            f"This URL is blocked by the server (bot protection / paywall / login required). "
+            f"Do NOT retry this URL. "
+            f"If web_search is available, try searching for the content title to find an alternative source. "
+            f"If no alternative source is available, call finish_task explaining that "
+            f"'{domain}' requires authentication or blocks automated access."
+        )
+
+    # Resource not found — also permanent
+    if any(code in msg_lower for code in ("404", "not found", "410", "gone")):
+        return (
+            f"[URL Not Found] {url}\n"
+            f"Error: {error_msg}\n"
+            f"This URL does not exist. Do NOT retry. "
+            f"Try a web_search to locate the content, or call finish_task if it cannot be found."
+        )
+
+    # Rate limiting — could succeed later but not in this session
+    if any(code in msg_lower for code in ("429", "too many requests", "rate limit")):
+        return (
+            f"[URL Rate Limited] {url}\n"
+            f"Error: {error_msg}\n"
+            f"The server is rate-limiting requests. Do NOT retry in this session. "
+            f"Try web_search to find the information from another source."
+        )
+
+    # Generic / transient error
+    return (
+        f"[URL Read Failed] {url}\n"
+        f"Error: {error_msg}\n"
+        f"The URL could not be fetched. If this was a transient network error you may retry once. "
+        f"If it fails again, try web_search or call finish_task explaining the limitation."
+    )
+
+
 def fetch_and_parse_url(
     url: str,
     offset: int = 0,
-    limit: int = _DEFAULT_LINK_WINDOW,
+    limit: int = _DEFAULT_URL_WINDOW,
     name_contains: str = "",
 ) -> str:
     """Fetch a URL and return its text content as a markdown string.
@@ -527,7 +599,7 @@ def fetch_and_parse_url(
     if not normalized_url:
         return "[URL Read Error] Empty URL"
     offset = max(0, int(offset or 0))
-    limit = max(1, min(int(limit or _DEFAULT_LINK_WINDOW), _MAX_LINK_WINDOW))
+    limit = max(1, min(int(limit or _DEFAULT_URL_WINDOW), _MAX_URL_WINDOW))
     name_contains = (name_contains or "").strip()
     service = _get_service()
 
@@ -562,10 +634,11 @@ def fetch_and_parse_url(
                 name_contains=name_contains,
             )
         if record.metadata.get("error"):
-            return f"[URL Read Failed] Failed to fetch {normalized_url}: {record.summary or 'unknown error'}"
+            return _format_url_error(normalized_url, record.summary or "unknown error")
 
-        return _record_to_markdown(record, normalized_url)
+        full_text = _record_to_markdown(record, normalized_url)
+        return _apply_line_window(full_text, offset=offset, limit=limit)
 
     except Exception as exc:
         logger.exception("fetch_and_parse_url failed for %s: %s", normalized_url, exc)
-        return f"[URL Read Error] Failed to fetch {normalized_url}: {exc}"
+        return _format_url_error(normalized_url, str(exc))

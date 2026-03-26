@@ -19,6 +19,31 @@ RERANK_MODEL_DIR = Path(os.getenv("RERANK_MODEL_DIR", "/models/reranker"))
 RERANK_CONFIG_PATH = Path(os.getenv("RERANK_SERVICE_CONFIG", RERANK_MODEL_DIR / "service_config.json"))
 
 
+EMBED_PRESETS = {
+    "qwen3-embedding": {
+        "pooling": "last_token",
+        "normalize": True,
+        "query_prefix": "Instruct: Given a search query, retrieve relevant passages.\nQuery: ",
+        "document_prefix": "",
+    },
+    "bge-m3": {
+        "pooling": "cls",
+        "normalize": True,
+        "query_prefix": "",
+        "document_prefix": "",
+    },
+}
+
+
+def infer_embed_preset(model_id: str) -> Optional[str]:
+    lowered = model_id.lower()
+    if "qwen3-embedding" in lowered:
+        return "qwen3-embedding"
+    if "bge-m3" in lowered:
+        return "bge-m3"
+    return None
+
+
 def parse_api_keys() -> set[str]:
     raw = os.getenv("API_KEYS", "")
     return {x.strip() for x in raw.split(",") if x.strip()}
@@ -133,10 +158,20 @@ class ORTBaseModel:
 class EmbeddingModel(ORTBaseModel):
     def __init__(self, model_dir: Path, config_path: Path):
         super().__init__(model_dir, config_path)
-        self.pooling = self.config.get("pooling", "mean")
-        self.normalize = bool(self.config.get("normalize", True))
-        self.query_prefix = self.config.get("query_prefix", "")
-        self.document_prefix = self.config.get("document_prefix", "")
+        preset_name = self.config.get("preset") or infer_embed_preset(self.model_id)
+        preset = EMBED_PRESETS.get(preset_name, {})
+        self.preset = preset_name
+        self.pooling = self.config.get("pooling", preset.get("pooling", "mean"))
+        self.normalize = bool(self.config.get("normalize", preset.get("normalize", True)))
+        self.query_prefix = self.config.get("query_prefix", preset.get("query_prefix", ""))
+        self.document_prefix = self.config.get("document_prefix", preset.get("document_prefix", ""))
+
+        # 缓存 ONNX 模型实际需要的输入名字
+        self.session_input_names = {x.name for x in self.session.get_inputs()}
+
+        print(f"[EmbeddingModel] model_id={self.model_id}")
+        print(f"[EmbeddingModel] session inputs={sorted(self.session_input_names)}")
+        print(f"[EmbeddingModel] pooling={self.pooling}, normalize={self.normalize}, preset={self.preset}")
 
     def _prepare_text(self, text: str, input_type: Optional[str]) -> str:
         if input_type == "query" and self.query_prefix:
@@ -144,6 +179,18 @@ class EmbeddingModel(ORTBaseModel):
         if input_type == "document" and self.document_prefix:
             return self.document_prefix + text
         return text
+
+    def _build_position_ids(self, attention_mask: np.ndarray) -> np.ndarray:
+        """
+        为需要 position_ids 的模型构造位置编码输入。
+        对 padding 场景更稳妥：
+        attention_mask = [0, 0, 1, 1, 1] -> position_ids = [0, 0, 0, 1, 2]
+        attention_mask = [1, 1, 1, 0, 0] -> position_ids = [0, 1, 2, 0, 0]
+        """
+        position_ids = np.cumsum(attention_mask, axis=1) - 1
+        position_ids = np.clip(position_ids, 0, None).astype(np.int64)
+        position_ids = position_ids * attention_mask
+        return position_ids
 
     def _tokenize(self, texts: list[str]) -> dict[str, np.ndarray]:
         enc = self.tokenizer(
@@ -153,35 +200,88 @@ class EmbeddingModel(ORTBaseModel):
             max_length=self.max_length,
             return_tensors="np",
         )
-        return {k: v.astype(np.int64) for k, v in enc.items()}
+
+        input_ids = enc["input_ids"].astype(np.int64)
+        attention_mask = enc["attention_mask"].astype(np.int64)
+
+        feeds: dict[str, np.ndarray] = {}
+
+        if "input_ids" in self.session_input_names:
+            feeds["input_ids"] = input_ids
+
+        if "attention_mask" in self.session_input_names:
+            feeds["attention_mask"] = attention_mask
+
+        if "position_ids" in self.session_input_names:
+            feeds["position_ids"] = self._build_position_ids(attention_mask)
+
+        if "token_type_ids" in self.session_input_names:
+            if "token_type_ids" in enc:
+                feeds["token_type_ids"] = enc["token_type_ids"].astype(np.int64)
+            else:
+                feeds["token_type_ids"] = np.zeros_like(input_ids, dtype=np.int64)
+
+        return feeds
 
     def _pool(self, token_embeddings: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
         mask = attention_mask.astype(np.float32)[..., None]
+
         if self.pooling == "cls":
             sent = token_embeddings[:, 0, :]
+
         elif self.pooling == "last_token":
             lengths = attention_mask.sum(axis=1) - 1
+            lengths = np.clip(lengths, 0, token_embeddings.shape[1] - 1)
             sent = token_embeddings[np.arange(token_embeddings.shape[0]), lengths]
-        else:
+
+        else:  # mean
             masked = token_embeddings * mask
             summed = masked.sum(axis=1)
             denom = np.clip(mask.sum(axis=1), 1e-9, None)
             sent = summed / denom
+
         if self.normalize:
             norms = np.linalg.norm(sent, axis=1, keepdims=True)
             sent = sent / np.clip(norms, 1e-12, None)
+
         return sent.astype(np.float32)
 
-    def embed(self, inputs: list[str], input_type: Optional[str], dimensions: Optional[int]) -> tuple[np.ndarray, int]:
+    def embed(
+        self,
+        inputs: list[str],
+        input_type: Optional[str],
+        dimensions: Optional[int],
+    ) -> tuple[np.ndarray, int]:
         texts = [self._prepare_text(x, input_type) for x in inputs]
         feeds = self._tokenize(texts)
+
         outputs = self.session.run(None, self._select_inputs(feeds))
+        #token_embeddings = outputs[0]
+
+        output_names = [o.name for o in self.session.get_outputs()]
+        outputs = self.session.run(None, self._select_inputs(feeds))
+
+        if len(outputs) == 0:
+            raise HTTPException(status_code=500, detail="ONNX model returned no outputs")
+
         token_embeddings = outputs[0]
+
+        if "attention_mask" not in feeds:
+            raise HTTPException(
+                status_code=500,
+                detail="ONNX model inputs do not include attention_mask; current pooling implementation requires it.",
+            )
+
         sentence_embeddings = self._pool(token_embeddings, feeds["attention_mask"])
+
         if dimensions is not None:
             if dimensions <= 0 or dimensions > sentence_embeddings.shape[1]:
-                raise HTTPException(status_code=400, detail=f"dimensions must be between 1 and {sentence_embeddings.shape[1]}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"dimensions must be between 1 and {sentence_embeddings.shape[1]}",
+                )
             sentence_embeddings = sentence_embeddings[:, :dimensions]
+
         token_count = int(feeds["attention_mask"].sum())
         return sentence_embeddings, token_count
 
@@ -193,9 +293,28 @@ class RerankerModel(ORTBaseModel):
         self.query_prefix = self.config.get("query_prefix", "")
         self.document_prefix = self.config.get("document_prefix", "")
 
-    def _tokenize_pairs(self, query: str, documents: list[str], max_length: Optional[int]) -> dict[str, np.ndarray]:
+        # 缓存 ONNX 模型实际输入
+        self.session_input_names = {x.name for x in self.session.get_inputs()}
+
+        print(f"[RerankerModel] model_id={self.model_id}")
+        print(f"[RerankerModel] session inputs={sorted(self.session_input_names)}")
+        print(f"[RerankerModel] normalize_scores={self.normalize_scores}")
+
+    def _build_position_ids(self, attention_mask: np.ndarray) -> np.ndarray:
+        position_ids = np.cumsum(attention_mask, axis=1) - 1
+        position_ids = np.clip(position_ids, 0, None).astype(np.int64)
+        position_ids = position_ids * attention_mask
+        return position_ids
+
+    def _tokenize_pairs(
+        self,
+        query: str,
+        documents: list[str],
+        max_length: Optional[int],
+    ) -> dict[str, np.ndarray]:
         query_text = f"{self.query_prefix}{query}" if self.query_prefix else query
         docs = [f"{self.document_prefix}{d}" if self.document_prefix else d for d in documents]
+
         enc = self.tokenizer(
             [query_text] * len(docs),
             docs,
@@ -204,12 +323,43 @@ class RerankerModel(ORTBaseModel):
             max_length=max_length or self.max_length,
             return_tensors="np",
         )
-        return {k: v.astype(np.int64) for k, v in enc.items()}
 
-    def rerank(self, query: str, documents: list[str], max_length: Optional[int]) -> tuple[list[float], int]:
+        input_ids = enc["input_ids"].astype(np.int64)
+        attention_mask = enc["attention_mask"].astype(np.int64)
+
+        feeds: dict[str, np.ndarray] = {}
+
+        if "input_ids" in self.session_input_names:
+            feeds["input_ids"] = input_ids
+
+        if "attention_mask" in self.session_input_names:
+            feeds["attention_mask"] = attention_mask
+
+        if "position_ids" in self.session_input_names:
+            feeds["position_ids"] = self._build_position_ids(attention_mask)
+
+        if "token_type_ids" in self.session_input_names:
+            if "token_type_ids" in enc:
+                feeds["token_type_ids"] = enc["token_type_ids"].astype(np.int64)
+            else:
+                feeds["token_type_ids"] = np.zeros_like(input_ids, dtype=np.int64)
+
+        return feeds
+
+    def rerank(
+        self,
+        query: str,
+        documents: list[str],
+        max_length: Optional[int],
+    ) -> tuple[list[float], int]:
         feeds = self._tokenize_pairs(query, documents, max_length)
+
         outputs = self.session.run(None, self._select_inputs(feeds))
+        if len(outputs) == 0:
+            raise HTTPException(status_code=500, detail="ONNX reranker returned no outputs")
+
         logits = outputs[0]
+
         if logits.ndim == 2:
             if logits.shape[1] == 1:
                 scores = logits[:, 0]
@@ -217,9 +367,18 @@ class RerankerModel(ORTBaseModel):
                 scores = logits[:, -1]
         else:
             scores = logits.reshape(-1)
+
         scores = scores.astype(np.float32)
+
         if self.normalize_scores:
             scores = 1.0 / (1.0 + np.exp(-scores))
+
+        if "attention_mask" not in feeds:
+            raise HTTPException(
+                status_code=500,
+                detail="ONNX reranker inputs do not include attention_mask; token counting requires it.",
+            )
+
         token_count = int(feeds["attention_mask"].sum())
         return scores.astype(float).tolist(), token_count
 

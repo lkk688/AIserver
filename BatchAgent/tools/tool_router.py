@@ -274,7 +274,7 @@ class ToolRouter:
         return fetch_and_parse_url(
             args.get("url", ""),
             offset=args.get("offset", 0),
-            limit=args.get("limit", 8),
+            limit=args.get("limit", 200),
             name_contains=args.get("name_contains", ""),
         )
 
@@ -414,20 +414,29 @@ class ToolRouter:
 
     def _handle_execute_parallel_branches(self, args: Dict[str, Any]) -> str:
         """
-        Execute multiple instruction branches concurrently.
+        Dispatch multiple read-heavy sub-tasks to independent LLM branches running concurrently.
 
-        Each branch makes one LLM call, executes any returned tool calls
-        synchronously, and returns the raw result.  All branches run in
-        parallel via asyncio.gather inside asyncio.run() (safe because this
-        handler is always called from asyncio.to_thread).
+        Design
+        ------
+        Each branch gets its own isolated LLM call with full tool access.  The
+        branch LLM reads the content it needs (read_document_section, read_url,
+        read_file_chunk, etc.) and returns a compact summary.  All branches run
+        concurrently via asyncio.gather, exploiting vLLM's prefix-sharing to
+        process the shared system/task prompt once across the batch.
+
+        Why this matters
+        ----------------
+        Sequential tool calls pile raw content into the main context window.
+        For long documents or many URLs, the context fills up before any writing
+        can happen.  By offloading reading + summarisation to branches, only the
+        distilled results return to the main context — preventing overflow.
 
         Overflow protection
         -------------------
-        If the combined results exceed _BRANCH_INLINE_LIMIT chars, the first
-        _BRANCH_STORE_LEN chars of each branch are saved to working memory
-        (knowledge.summaries) and only a compact overview is returned.
-        The model can call get_memory('knowledge') to read the stored
-        summaries, or use read_document_section / other tools for full content.
+        If the combined branch summaries still exceed _BRANCH_INLINE_LIMIT chars,
+        each branch result is stored in working memory (knowledge.summaries) and
+        only a compact overview is returned inline.  The main agent can call
+        get_memory('knowledge') to access the stored summaries.
         """
         branches_raw = args.get("branches", [])
         branches = self._parse_branches(branches_raw)

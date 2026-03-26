@@ -20,6 +20,8 @@ import {
   BookOpen,
   ChevronRight,
   RefreshCw,
+  Wifi,
+  Database,
 } from "lucide-react";
 import clsx from "clsx";
 
@@ -61,16 +63,25 @@ const DOMAINS: DomainConfig[] = [
     color: "text-purple-600",
     accent: "bg-purple-50 border-purple-200",
     defaultLanguage: "en",
-    placeholder: "Search papers on arXiv, PubMed, Semantic Scholar…",
+    placeholder: "Search papers on arXiv, Semantic Scholar…",
+  },
+  {
+    id: "medical_academic",
+    label: "Med Papers",
+    icon: Stethoscope,
+    color: "text-teal-600",
+    accent: "bg-teal-50 border-teal-200",
+    defaultLanguage: "en",
+    placeholder: "Search PubMed, Europe PMC for research papers…",
   },
   {
     id: "medical",
-    label: "Medical",
+    label: "Health Info",
     icon: Stethoscope,
     color: "text-green-600",
     accent: "bg-green-50 border-green-200",
     defaultLanguage: "en",
-    placeholder: "Search PubMed, Europe PMC, MedlinePlus…",
+    placeholder: "Search MedlinePlus, PubMed for health information…",
   },
 ];
 
@@ -130,11 +141,15 @@ function ResultCard({
                 <Zap className="w-3 h-3" /> Breaking
               </span>
             )}
-            {record.record_type === "url" && (
-              <span className="px-2 py-0.5 rounded-full text-xs bg-slate-100 text-slate-600">
-                Cached
+            {record.from_cache === true ? (
+              <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-600">
+                <Database className="w-3 h-3" /> Cached
               </span>
-            )}
+            ) : record.from_cache === false ? (
+              <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-100 text-emerald-700">
+                <Wifi className="w-3 h-3" /> Online
+              </span>
+            ) : null}
           </div>
 
           {/* Title */}
@@ -166,6 +181,52 @@ function ResultCard({
 }
 
 // ── Detail panel ───────────────────────────────────────────────────────────────
+
+function IframeWithFallback({ src, title, content, url }: { src: string; title?: string; content?: string | null; url: string }) {
+  const [failed, setFailed] = useState(false);
+
+  if (failed) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full gap-4 px-6 text-center bg-gray-50">
+        <Globe className="w-10 h-10 text-gray-300" />
+        <p className="text-sm text-gray-500 font-medium">This page cannot be embedded.</p>
+        <a
+          href={url}
+          target="_blank"
+          rel="noreferrer"
+          className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-xl text-sm hover:bg-blue-700 transition-colors"
+        >
+          <ExternalLink className="w-4 h-4" /> Open in New Tab
+        </a>
+        {content && (
+          <div className="w-full mt-2 bg-white border border-gray-200 rounded-xl p-4 max-h-64 overflow-y-auto text-left">
+            <p className="text-xs font-medium text-gray-400 uppercase tracking-wide mb-2">Extracted Text</p>
+            <p className="text-xs text-gray-700 whitespace-pre-wrap leading-relaxed">{content}</p>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <iframe
+      src={src}
+      title={title}
+      className="w-full h-full border-0"
+      sandbox="allow-scripts allow-same-origin"
+      onError={() => setFailed(true)}
+      onLoad={(e) => {
+        // Detect X-Frame-Options / CSP block: contentDocument is null or empty
+        try {
+          const doc = (e.target as HTMLIFrameElement).contentDocument;
+          if (!doc || doc.body?.innerHTML === "") setFailed(true);
+        } catch {
+          setFailed(true);
+        }
+      }}
+    />
+  );
+}
 
 function DetailPanel({
   record,
@@ -239,17 +300,18 @@ function DetailPanel({
 
             <div className="flex-1 overflow-hidden bg-gray-50">
               {leftTab === "web" ? (
-                <iframe
+                <IframeWithFallback
                   src={record.url}
                   title={record.title}
-                  className="w-full h-full border-0"
-                  sandbox="allow-scripts allow-same-origin"
+                  content={record.content}
+                  url={record.url}
                 />
               ) : isPdf ? (
-                <iframe
+                <IframeWithFallback
                   src={`https://mozilla.github.io/pdf.js/web/viewer.html?file=${encodeURIComponent(record.url)}`}
                   title="PDF viewer"
-                  className="w-full h-full border-0"
+                  content={record.content}
+                  url={record.url}
                 />
               ) : (
                 <div className="flex flex-col items-center justify-center h-full text-gray-400 gap-2">
@@ -370,44 +432,74 @@ const QUICK_CATEGORIES: Record<OnlineSearchDomain, string[]> = {
   academic: [
     "large language models",
     "autonomous driving",
+    "transformer architecture",
+    "reinforcement learning",
+  ],
+  medical_academic: [
+    "GLP-1 weight loss RCT",
+    "CBT anxiety disorder efficacy",
     "HIIT metabolic syndrome",
-    "GLP-1 weight loss",
+    "mRNA vaccine immunogenicity",
   ],
   medical: [
-    "depression treatment",
-    "dietary guidelines",
-    "physical activity adults",
-    "child nutrition",
+    "depression treatment options",
+    "dietary guidelines adults",
+    "physical activity recommendations",
+    "child nutrition guidelines",
   ],
 };
+
+// ── Per-domain state ───────────────────────────────────────────────────────────
+
+interface DomainState {
+  query: string;
+  results: OnlineSearchRecord[];
+  resultMeta: { query: string; count: number; sources: Record<string, number> } | null;
+  error: string | null;
+}
+
+const emptyDomainState = (): DomainState => ({
+  query: "",
+  results: [],
+  resultMeta: null,
+  error: null,
+});
 
 // ── Main page ──────────────────────────────────────────────────────────────────
 
 export default function OnlineSearchPage() {
   const [activeDomain, setActiveDomain] = useState<OnlineSearchDomain>("web");
-  const [query, setQuery] = useState("");
   const [noCache, setNoCache] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [results, setResults] = useState<OnlineSearchRecord[]>([]);
-  const [resultMeta, setResultMeta] = useState<{
-    query: string;
-    count: number;
-    sources: Record<string, number>;
-  } | null>(null);
-  const [selectedRecord, setSelectedRecord] =
-    useState<OnlineSearchRecord | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [selectedRecord, setSelectedRecord] = useState<OnlineSearchRecord | null>(null);
 
+  // Per-domain state — persists when switching tabs
+  const [domainStates, setDomainStates] = useState<Record<OnlineSearchDomain, DomainState>>({
+    web: emptyDomainState(),
+    news: emptyDomainState(),
+    academic: emptyDomainState(),
+    medical_academic: emptyDomainState(),
+    medical: emptyDomainState(),
+  });
+
+  const current = domainStates[activeDomain];
   const domain = DOMAINS.find((d) => d.id === activeDomain)!;
+
+  const updateCurrent = useCallback(
+    (patch: Partial<DomainState>) =>
+      setDomainStates((prev) => ({
+        ...prev,
+        [activeDomain]: { ...prev[activeDomain], ...patch },
+      })),
+    [activeDomain]
+  );
 
   const handleSearch = useCallback(
     async (q?: string) => {
-      const finalQuery = (q ?? query).trim();
+      const finalQuery = (q ?? current.query).trim();
       if (!finalQuery) return;
       setLoading(true);
-      setError(null);
-      setResults([]);
-      setResultMeta(null);
+      updateCurrent({ error: null, results: [], resultMeta: null });
       try {
         const result = await onlineSearch(activeDomain, {
           query: finalQuery,
@@ -415,19 +507,21 @@ export default function OnlineSearchPage() {
           language: domain.defaultLanguage,
           no_cache: noCache,
         });
-        setResults(result.items);
         const sources: Record<string, number> = {};
         result.items.forEach((r) => {
           sources[r.source] = (sources[r.source] || 0) + 1;
         });
-        setResultMeta({ query: finalQuery, count: result.count, sources });
+        updateCurrent({
+          results: result.items,
+          resultMeta: { query: finalQuery, count: result.count, sources },
+        });
       } catch (e) {
-        setError(e instanceof Error ? e.message : "Search failed");
+        updateCurrent({ error: e instanceof Error ? e.message : "Search failed" });
       } finally {
         setLoading(false);
       }
     },
-    [query, activeDomain, domain.defaultLanguage, noCache]
+    [current.query, activeDomain, domain.defaultLanguage, noCache, updateCurrent]
   );
 
   return (
@@ -446,15 +540,11 @@ export default function OnlineSearchPage() {
         {DOMAINS.map((d) => {
           const Icon = d.icon;
           const isActive = d.id === activeDomain;
+          const hasResults = domainStates[d.id].results.length > 0;
           return (
             <button
               key={d.id}
-              onClick={() => {
-                setActiveDomain(d.id);
-                setResults([]);
-                setResultMeta(null);
-                setError(null);
-              }}
+              onClick={() => setActiveDomain(d.id)}
               className={clsx(
                 "flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium border transition-all duration-150",
                 isActive
@@ -464,6 +554,9 @@ export default function OnlineSearchPage() {
             >
               <Icon className="w-4 h-4" />
               {d.label}
+              {hasResults && !isActive && (
+                <span className="w-1.5 h-1.5 rounded-full bg-blue-400" />
+              )}
             </button>
           );
         })}
@@ -480,8 +573,8 @@ export default function OnlineSearchPage() {
         <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
         <input
           type="text"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
+          value={current.query}
+          onChange={(e) => updateCurrent({ query: e.target.value })}
           placeholder={domain.placeholder}
           className="w-full pl-12 pr-36 py-4 text-base border-2 border-gray-200 rounded-2xl shadow-sm focus:border-blue-500 focus:ring-4 focus:ring-blue-50 outline-none transition-all bg-white"
           autoFocus
@@ -498,7 +591,7 @@ export default function OnlineSearchPage() {
           </label>
           <button
             type="submit"
-            disabled={loading || !query.trim()}
+            disabled={loading || !current.query.trim()}
             className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-xl hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm font-medium"
           >
             {loading ? (
@@ -512,12 +605,15 @@ export default function OnlineSearchPage() {
       </form>
 
       {/* Quick chips */}
-      <div className="flex flex-wrap gap-2 mb-6">
+      <div className="flex flex-wrap items-center gap-2 mb-6">
+        <span className="text-xs font-medium text-gray-400 uppercase tracking-wide">
+          Examples:
+        </span>
         {QUICK_CATEGORIES[activeDomain].map((chip) => (
           <button
             key={chip}
             onClick={() => {
-              setQuery(chip);
+              updateCurrent({ query: chip });
               handleSearch(chip);
             }}
             className="px-3 py-1 bg-white border border-gray-200 rounded-full text-xs text-gray-600 hover:bg-gray-50 hover:border-gray-300 transition-colors"
@@ -528,27 +624,27 @@ export default function OnlineSearchPage() {
       </div>
 
       {/* Error */}
-      {error && (
+      {current.error && (
         <div className="mb-4 p-4 bg-red-50 border border-red-200 rounded-xl text-sm text-red-700">
-          {error}
+          {current.error}
         </div>
       )}
 
       {/* Results header */}
-      {resultMeta && (
+      {current.resultMeta && (
         <div className="mb-4 flex items-center justify-between flex-wrap gap-3">
           <div className="flex items-center gap-3 flex-wrap">
             <span className="text-sm text-gray-600">
-              <span className="font-semibold text-gray-900">{resultMeta.count}</span>{" "}
-              results for &quot;{resultMeta.query}&quot;
+              <span className="font-semibold text-gray-900">{current.resultMeta.count}</span>{" "}
+              results for &quot;{current.resultMeta.query}&quot;
             </span>
-            {Object.entries(resultMeta.sources).map(([src, count]) => (
+            {Object.entries(current.resultMeta.sources).map(([src, cnt]) => (
               <span
                 key={src}
                 className="flex items-center gap-1 text-xs text-gray-500 bg-white border border-gray-200 px-2 py-1 rounded-full"
               >
                 <SourceBadge source={src} />
-                <span className="text-gray-400">×{count}</span>
+                <span className="text-gray-400">×{cnt}</span>
               </span>
             ))}
           </div>
@@ -582,9 +678,9 @@ export default function OnlineSearchPage() {
       )}
 
       {/* Results */}
-      {!loading && results.length > 0 && (
+      {!loading && current.results.length > 0 && (
         <div className="space-y-3">
-          {results.map((r) => (
+          {current.results.map((r) => (
             <ResultCard
               key={r.id}
               record={r}
@@ -595,16 +691,16 @@ export default function OnlineSearchPage() {
       )}
 
       {/* Empty state */}
-      {!loading && resultMeta && results.length === 0 && (
+      {!loading && current.resultMeta && current.results.length === 0 && (
         <div className="text-center py-16 text-gray-500">
           <Search className="w-10 h-10 mx-auto mb-3 text-gray-300" />
-          <p className="font-medium">No results found for &quot;{resultMeta.query}&quot;</p>
+          <p className="font-medium">No results found for &quot;{current.resultMeta.query}&quot;</p>
           <p className="text-sm mt-1">Try enabling &quot;Live&quot; to bypass the cache.</p>
         </div>
       )}
 
       {/* Initial empty state */}
-      {!loading && !resultMeta && (
+      {!loading && !current.resultMeta && (
         <div className="flex flex-col items-center justify-center py-20 text-gray-400">
           <div className={clsx("w-16 h-16 rounded-2xl flex items-center justify-center mb-4", domain.accent)}>
             <domain.icon className={clsx("w-8 h-8", domain.color)} />
@@ -612,9 +708,11 @@ export default function OnlineSearchPage() {
           <p className="font-medium text-gray-600">Search {domain.label}</p>
           <p className="text-sm mt-1">
             {activeDomain === "medical"
-              ? "Sources: PubMed · Europe PMC · MedlinePlus"
+              ? "Sources: PubMed · MedlinePlus · Europe PMC"
+              : activeDomain === "medical_academic"
+              ? "Sources: PubMed · Europe PMC"
               : activeDomain === "academic"
-              ? "Sources: arXiv · Semantic Scholar · PubMed"
+              ? "Sources: arXiv · Semantic Scholar"
               : activeDomain === "news"
               ? "Sources: GNews · NewsData · NewsAPI · RSS"
               : "Sources: Serper · Tavily · Wikipedia · Crawler"}

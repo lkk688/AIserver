@@ -9,6 +9,7 @@ import {
   onlineSchedulerRunNow,
   onlineSchedulerUpdateConfig,
   onlineGetCache,
+  onlineDeleteCacheRecord,
   onlineReadUrl,
   SchedulerConfig,
   OnlineSearchRecord,
@@ -224,46 +225,89 @@ const DOMAIN_ICONS: Record<string, React.ElementType> = {
   academic: GraduationCap,
   research: GraduationCap,
   medical: Stethoscope,
+  medical_academic: Stethoscope,
   general: Globe,
 };
 
-function CacheCard({ record }: { record: OnlineSearchRecord }) {
+const DOMAIN_COLORS: Record<string, string> = {
+  news: "text-orange-600 bg-orange-50",
+  academic: "text-purple-600 bg-purple-50",
+  research: "text-purple-600 bg-purple-50",
+  medical: "text-green-600 bg-green-50",
+  medical_academic: "text-teal-600 bg-teal-50",
+  general: "text-blue-600 bg-blue-50",
+};
+
+function CacheCard({
+  record,
+  onDelete,
+}: {
+  record: OnlineSearchRecord;
+  onDelete: (id: string) => void;
+}) {
   const [expanded, setExpanded] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const Icon = DOMAIN_ICONS[record.domain] ?? Globe;
+  const domainColor = DOMAIN_COLORS[record.domain] ?? "text-gray-600 bg-gray-50";
   const date = record.published_at || record.fetched_at;
 
+  const handleDelete = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!confirm(`Delete "${record.title || record.id}"?`)) return;
+    setDeleting(true);
+    try {
+      await onlineDeleteCacheRecord(record.id);
+      onDelete(record.id);
+    } catch {
+      alert("Failed to delete record.");
+      setDeleting(false);
+    }
+  };
+
   return (
-    <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
-      <button
-        onClick={() => setExpanded((v) => !v)}
-        className="w-full flex items-start gap-3 px-4 py-3 text-left hover:bg-gray-50 transition-colors"
-      >
-        <Icon className="w-4 h-4 text-gray-400 mt-0.5 flex-shrink-0" />
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 mb-0.5 flex-wrap">
-            <span className="text-xs font-medium text-gray-500">{record.source}</span>
-            <span className="text-xs text-gray-400">{record.category}</span>
-            {date && (
-              <span className="text-xs text-gray-400">
-                {new Date(date).toLocaleDateString()}
+    <div className={clsx("bg-white border border-gray-200 rounded-xl overflow-hidden", deleting && "opacity-50 pointer-events-none")}>
+      <div className="flex items-start gap-3 px-4 py-3">
+        <button
+          onClick={() => setExpanded((v) => !v)}
+          className="flex-1 flex items-start gap-3 text-left min-w-0"
+        >
+          <Icon className="w-4 h-4 text-gray-400 mt-0.5 flex-shrink-0" />
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 mb-0.5 flex-wrap">
+              <span className={clsx("px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide", domainColor)}>
+                {record.domain.replace("_", " ")}
               </span>
+              <span className="text-xs font-medium text-gray-500">{record.source}</span>
+              {date && (
+                <span className="text-xs text-gray-400">
+                  {new Date(date).toLocaleDateString()}
+                </span>
+              )}
+            </div>
+            <p className="text-sm font-medium text-gray-900 line-clamp-1">
+              {record.title || "(no title)"}
+            </p>
+            {!expanded && (
+              <p className="text-xs text-gray-500 line-clamp-2 mt-0.5">
+                {record.summary}
+              </p>
             )}
           </div>
-          <p className="text-sm font-medium text-gray-900 line-clamp-1">
-            {record.title || "(no title)"}
-          </p>
-          {!expanded && (
-            <p className="text-xs text-gray-500 line-clamp-2 mt-0.5">
-              {record.summary}
-            </p>
+          {expanded ? (
+            <ChevronUp className="w-4 h-4 text-gray-400 flex-shrink-0" />
+          ) : (
+            <ChevronDown className="w-4 h-4 text-gray-400 flex-shrink-0" />
           )}
-        </div>
-        {expanded ? (
-          <ChevronUp className="w-4 h-4 text-gray-400 flex-shrink-0" />
-        ) : (
-          <ChevronDown className="w-4 h-4 text-gray-400 flex-shrink-0" />
-        )}
-      </button>
+        </button>
+        <button
+          onClick={handleDelete}
+          disabled={deleting}
+          title="Delete from cache"
+          className="p-1.5 rounded-lg text-gray-300 hover:text-red-500 hover:bg-red-50 transition-colors flex-shrink-0"
+        >
+          {deleting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+        </button>
+      </div>
 
       {expanded && (
         <div className="px-4 pb-4 space-y-3 border-t border-gray-100">
@@ -293,6 +337,7 @@ function CacheCard({ record }: { record: OnlineSearchRecord }) {
 // ── Cache tab ──────────────────────────────────────────────────────────────────
 
 function CacheTab() {
+  const queryClient = useQueryClient();
   const [domainFilter, setDomainFilter] = useState<string>("all");
   const [urlInput, setUrlInput] = useState("");
   const [crawling, setCrawling] = useState(false);
@@ -325,7 +370,15 @@ function CacheTab() {
     }
   };
 
-  const domains = ["all", "news", "academic", "medical", "general"];
+  const domains = ["all", "news", "academic", "medical_academic", "medical", "general"];
+
+  const handleDelete = (id: string) => {
+    queryClient.setQueryData(
+      ["online-cache", domainFilter],
+      (old: typeof data) =>
+        old ? { ...old, items: old.items.filter((i) => i.id !== id), count: old.count - 1 } : old
+    );
+  };
 
   return (
     <div className="space-y-5">
@@ -397,7 +450,7 @@ function CacheTab() {
       {/* Records */}
       <div className="space-y-2">
         {data?.items.map((r) => (
-          <CacheCard key={r.id} record={r} />
+          <CacheCard key={r.id} record={r} onDelete={handleDelete} />
         ))}
         {!isLoading && data?.items.length === 0 && (
           <div className="text-center py-10 text-gray-400 text-sm">

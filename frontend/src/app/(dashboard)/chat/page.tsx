@@ -854,7 +854,7 @@ function SessionList({
       .then(d => setSessions(d.sessions ?? []))
       .catch(() => { })
       .finally(() => setLoading(false));
-  }, [apiBaseUrl]);
+  }, [agentApiUrl]);
 
   useEffect(() => {
     const t = window.setTimeout(() => { load(); }, 0);
@@ -870,7 +870,7 @@ function SessionList({
   return (
     <div className={clsx(
       "flex flex-col bg-gray-50",
-      embedded ? "h-full" : "-m-8 h-[calc(100vh-5rem)]"
+      embedded ? "h-full" : "-m-8 h-screen"
     )}>
       {/* Header */}
       <div className="bg-white border-b border-gray-200 px-8 py-5 flex items-center justify-between">
@@ -1019,6 +1019,7 @@ function ChatView({
   const [isVoiceMode, setIsVoiceMode] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamStatus, setStreamStatus] = useState('');
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // Resizable split
   const containerRef = useRef<HTMLDivElement>(null);
@@ -1058,7 +1059,7 @@ function ChatView({
     tool_strategy: 'hybrid',
     domain: 'general',
     max_turns: 15,
-    parallel_thinking: false,
+    parallel_thinking: true,
     asr_language: 'auto',
     voice_send_mode: 'input',
     tts_enabled: false,
@@ -1457,6 +1458,13 @@ function ChatView({
     });
   }, []);
 
+  const handleStop = useCallback(() => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsStreaming(false);
+    setStreamStatus('');
+  }, []);
+
   const handleSend = useCallback(async (e?: React.FormEvent, forcedInput?: string) => {
     e?.preventDefault();
     const outgoingInput = (forcedInput ?? input).trim();
@@ -1470,11 +1478,15 @@ function ChatView({
     setMessages(prev => [...prev, { id: assistantId, role: 'assistant', content: '', blocks: [] }]);
     let assistantTextBuffer = '';
 
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     try {
       const effectiveTaskId = currentTaskId || taskId || undefined;
       const contextResources = await buildContextResources(effectiveTaskId);
       const response = await fetch(`${agentApiUrl}/agent/stream`, {
         method: 'POST',
+        signal: controller.signal,
         headers: buildAuthHeaders({
           'Content-Type': 'application/json',
           'Accept': 'text/event-stream',
@@ -1489,6 +1501,7 @@ function ChatView({
           domain: settings.domain,
           max_turns: settings.max_turns,
           enable_turn_limits: true,
+          parallel_thinking: settings.parallel_thinking,
         }),
       });
 
@@ -1625,8 +1638,13 @@ function ChatView({
         }
       }
     } catch (err) {
-      console.error('Chat stream error:', err);
+      if (err instanceof Error && err.name === 'AbortError') {
+        // user stopped the task — not an error
+      } else {
+        console.error('Chat stream error:', err);
+      }
     } finally {
+      abortControllerRef.current = null;
       setIsStreaming(false);
       setStreamStatus('');
     }
@@ -1661,7 +1679,7 @@ function ChatView({
   return (
     <div className={clsx(
       "flex flex-col bg-white overflow-hidden",
-      embedded ? "h-full" : "-m-8 h-[calc(100vh-5rem)]"
+      embedded ? "h-full" : "-m-8 h-screen"
     )}>
       {/* Top bar */}
       <div className="h-12 border-b border-gray-200 bg-white flex items-center px-4 gap-3 shrink-0 z-10">
@@ -1790,6 +1808,8 @@ function ChatView({
                 { key: 'voice', icon: <Mic size={15} />, label: 'Voice', active: isVoiceMode, onClick: () => { setIsVoiceMode(true); requestPermission(); } },
               ]}
               onSend={() => { if (!isVoiceMode) void handleSend(); }}
+              onStop={handleStop}
+              isStreaming={isStreaming}
               sendDisabled={isVoiceMode || !input.trim() || isStreaming}
               rightSlot={(
                 <button
@@ -1830,7 +1850,7 @@ function ChatView({
                 <textarea
                   value={input}
                   onChange={e => setInput(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void handleSend(); } }}
+                  onKeyDown={e => { if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); void handleSend(); } }}
                   placeholder={uiConfig.inputPlaceholder}
                   className="w-full min-h-[84px] max-h-[220px] bg-white border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-200 focus:border-blue-300 resize-y p-3 text-sm text-gray-800"
                 />

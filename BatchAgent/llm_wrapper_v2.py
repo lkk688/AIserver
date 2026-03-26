@@ -353,6 +353,15 @@ async def complete_with_continuation_async(
 
         elapsed = time.time() - start_time
         if verbose: console.print()
+
+        # Emit a usage event so upstream token_stats accumulators are updated.
+        if on_event and usage_info:
+            await on_event({
+                "type": "usage",
+                "prompt_tokens": int(usage_info.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(usage_info.get("completion_tokens", 0) or 0),
+                "elapsed_s": elapsed,
+            })
         
         # 3. Continuation Sanitizer
         if i > 0: 
@@ -374,8 +383,19 @@ async def complete_with_continuation_async(
             
         completion_tokens = int(usage_info.get("completion_tokens", 0) or 0)
         near_budget_cap = completion_tokens >= int(max(128, safe_tokens * 0.9))
+
+        # Detect "think-only" response: model spent its whole budget on <think>...</think>
+        # but produced no actual tool call or action text.  This happens when the output
+        # budget is so small the model never gets past the reasoning phase.
+        _content_without_think = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+        think_only_no_action = bool(
+            re.search(r'<think>', content, re.DOTALL)
+            and not _content_without_think
+        )
+
         likely_truncated = (
             finish_reason == "length"
+            or think_only_no_action
             or (finish_reason in ("stop", None, "") and (_has_unclosed_tool_markup(content) or near_budget_cap))
         )
 
@@ -398,9 +418,23 @@ async def complete_with_continuation_async(
                     if tool_strategy != "hybrid":
                         # Only add parse error if NOT hybrid — in hybrid, mutations fall through to XML
                         final_actions.append(ActionToolCall(
-                            name="json_parse_error", 
+                            name="json_parse_error",
                             args={"error": f"The JSON tool call for '{tool_name}' was malformed."}
                         ))
+                    else:
+                        # In hybrid mode, flag as truncated so the continuation loop retries
+                        # with an explicit "malformed JSON" warning injected into the context.
+                        likely_truncated = True
+                        current_messages.append({"role": "assistant", "content": content})
+                        current_messages.append({
+                            "role": "user",
+                            "content": (
+                                f"⚠️ Your `{tool_name}` tool call contained malformed JSON and could not be parsed. "
+                                "Please call it again with valid JSON. Make sure all string values use `\\n` "
+                                "for newlines and `\\\"` for quotes inside strings."
+                            ),
+                        })
+                        break  # restart the continuation loop with the error injected
             
             if final_actions:
                 break

@@ -107,7 +107,7 @@ OBSERVATION_TOOLS = [
     },
     {
         "name": "read_url",
-        "description": "Fetch and read a webpage, file, or GitHub URL. For missing URLs it returns nearby reachable links. For GitHub folders it returns a paged folder listing. Use offset to continue and name_contains to narrow by filename or folder name.",
+        "description": "Fetch and read a webpage, file, or GitHub URL. Returns up to `limit` lines starting at line `offset`. Default window is 200 lines. If the response ends with '[... N more lines. Call read_url with offset=X ...]', call again with that offset to read the next page. For GitHub folders it returns a paged folder listing; use name_contains to narrow by filename.",
         "properties": {
             "url": {"type": "string"},
             "offset": {"type": "integer", "minimum": 0},
@@ -125,13 +125,27 @@ OBSERVATION_TOOLS = [
     {
         "name": "execute_parallel_branches",
         "description": (
-            "Execute multiple independent instruction branches concurrently. "
-            "USE THIS when the document is LARGE (🚨 flag in get_document_overview) or when you need to "
-            "brainstorm multiple distinct approaches simultaneously. "
-            "Each branch gets one LLM call + tool access and runs in parallel. "
-            "If the combined results exceed the context window, they are stored in memory automatically — "
-            "call get_memory('knowledge') to retrieve branch summaries, "
-            "or call read_document_section / other tools directly for full content."
+            "Dispatch multiple read-heavy sub-tasks to independent LLM branches that run concurrently. "
+            "Each branch gets its own LLM call with full tool access, reads what it needs, "
+            "and returns a compact summary — so only summaries flow back to your context, "
+            "not raw content. This prevents context-window overflow when you need to read "
+            "multiple long documents, many URL pages, or several code files before writing. "
+            "\n\n"
+            "When to use: "
+            "(1) Reading a LARGE document — split sections across branches so each branch "
+            "reads and summarizes its portion (use section IDs from get_document_overview). "
+            "(2) Reading multiple URLs — each branch fetches and distills one URL, avoiding "
+            "the context pressure of sequential read_url calls piling up. "
+            "(3) Exploring multiple code areas or hypotheses simultaneously. "
+            "\n\n"
+            "Each branch instruction should tell the branch what to read AND what to extract/summarize, "
+            "e.g. 'Read section sec_4 and extract the main algorithm described' or "
+            "'Fetch https://example.com/paper and summarize the evaluation results'. "
+            "The branch LLM calls the appropriate tools (read_document_section, read_url, etc.) "
+            "and returns a condensed result. "
+            "\n\n"
+            "If combined branch results still exceed the context window, they are stored in memory "
+            "automatically — call get_memory('knowledge') to retrieve summaries."
         ),
         "properties": {
             "branches": {
@@ -140,8 +154,12 @@ OBSERVATION_TOOLS = [
                 "items": {
                     "type": "object",
                     "properties": {
-                        "branch_id": {"type": "string", "description": "Unique snake_case ID, e.g. 'branch_intro' or 'branch_quicksort'"},
-                        "instruction": {"type": "string", "description": "Specific instruction for this branch (e.g. 'Read sections sec_4 and sec_5', or 'Search for Python 3.13 typing features')."}
+                        "branch_id": {"type": "string", "description": "Unique snake_case ID, e.g. 'sec_intro', 'url_paper1', 'hypothesis_a'"},
+                        "instruction": {"type": "string", "description": (
+                            "What this branch should read and what to extract or summarize from it. "
+                            "Be specific: name the section IDs, URLs, or files to read, and state "
+                            "exactly what information to return."
+                        )}
                     },
                     "required": ["branch_id", "instruction"]
                 }

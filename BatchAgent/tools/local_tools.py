@@ -340,18 +340,30 @@ def robust_json_loads(json_str: str, tool_name: str = "") -> Optional[Dict[str, 
                     i += 1
                 return "".join(value_chars) if value_chars else None
 
+            def _unescape_json_string(raw: str) -> str:
+                """Unescape a JSON string value using json.loads (handles all escapes + Unicode)."""
+                try:
+                    return json.loads('"' + raw + '"')
+                except Exception:
+                    pass
+                # Partial truncation fallback: append a dummy closing quote so json.loads
+                # can parse as much as possible, then unescape manually.
+                try:
+                    return json.loads('"' + raw + ' [truncated]"')
+                except Exception:
+                    pass
+                return (
+                    raw.replace("\\n", "\n")
+                    .replace("\\t", "\t")
+                    .replace('\\"', '"')
+                    .replace("\\\\", "\\")
+                )
+
             path_raw = _extract_string_field(json_str, "path")
             content_raw = _extract_string_field(json_str, "content")
             if path_raw is not None and content_raw is not None:
-                path = bytes(path_raw, "utf-8").decode("unicode_escape")
-                try:
-                    clean_content = bytes(content_raw, "utf-8").decode("unicode_escape")
-                except Exception:
-                    clean_content = (
-                        content_raw.replace("\\n", "\n")
-                        .replace('\\"', '"')
-                        .replace("\\\\", "\\")
-                    )
+                path = _unescape_json_string(path_raw)
+                clean_content = _unescape_json_string(content_raw)
                 return {"path": path, "content": clean_content}
         except Exception as e:
             logging.error(f"Violent regex extraction failed: {e}")
@@ -956,7 +968,10 @@ def compute_safe_max_tokens(
             f"Returning available tokens to avoid exceeding context window.[/red]"
         )
         return max(1, available)
-    return min(desired_max_output, available)
+    # Never return less than min_output when headroom allows it —
+    # caller may pass a small desired_max_output (e.g. 256) due to an upstream
+    # context-overflow formula, but that would silently truncate write_file calls.
+    return max(min_output, min(desired_max_output, available))
 
 
 def compress_messages(messages: List[Dict[str, str]], max_allowed_tokens: int) -> List[Dict[str, str]]:

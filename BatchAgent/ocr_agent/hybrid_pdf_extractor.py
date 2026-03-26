@@ -1151,7 +1151,13 @@ class HybridPDFExtractor:
                 pass
 
         page_img_path = self._save_full_page_image(page_fitz, page_num, dpi=self.ocr_dpi)
-        md = self.ocr_backend.ocr_page_image(page_img_path, page_num=page_num, page_hint=page_hint)
+        try:
+            md = self.ocr_backend.ocr_page_image(page_img_path, page_num=page_num, page_hint=page_hint)
+        except Exception as exc:
+            # OCR server unavailable or failed — fall back to empty placeholder
+            # so the rest of the document can still be extracted.
+            print(f"[HybridPDFExtractor] OCR failed for page {page_num}: {exc}")
+            md = f"[OCR unavailable for page {page_num}]"
         return f"\n\n<!-- OCR page {page_num} -->\n\n{md}\n\n"
 
     # -------------------------------------------------------------------------

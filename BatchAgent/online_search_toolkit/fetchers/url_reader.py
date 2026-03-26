@@ -8,7 +8,7 @@ import re
 import traceback
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 import markdownify
@@ -411,6 +411,11 @@ class URLReader:
             )
 
             if main_content:
+                # Resolve relative hrefs to absolute URLs so the LLM gets clickable links
+                for a_tag in main_content.find_all("a", href=True):
+                    href = a_tag["href"]
+                    if href and not href.startswith(("http://", "https://", "mailto:", "#", "javascript:")):
+                        a_tag["href"] = urljoin(url, href)
                 markdown_text = markdownify.markdownify(
                     str(main_content),
                     heading_style="ATX",

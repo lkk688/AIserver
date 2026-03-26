@@ -104,7 +104,7 @@ class OnlineSearchService:
             plan.use_wikimedia = False
             plan.recent_hours = self.config.general_cache_hours
 
-        elif request.domain in ("academic", "medical", "research"):
+        elif request.domain in ("academic", "medical", "medical_academic", "research"):
             plan.use_pubmed = request.use_academic_sources or request.use_medical_sources
             plan.use_medlineplus = request.use_medical_sources
             plan.use_nimh = False  # consistently 403; disabled
@@ -113,14 +113,24 @@ class OnlineSearchService:
             plan.use_news_api = False
             plan.use_wikimedia = True
             plan.recent_hours = self.config.general_cache_hours
-            # For medical queries prefer PubMed/MedlinePlus/CDC/WHO; arXiv/SS are CS-heavy
             if request.domain == "medical":
+                # Health info: PubMed + MedlinePlus consumer pages + Europe PMC
                 plan.use_arxiv = False
                 plan.use_semantic_scholar = False
-                plan.use_cdc = False  # CDC search page is JS-rendered; no usable API
-                plan.use_who = False  # iris.who.int requires auth (403); WHO docs via Europe PMC
+                plan.use_cdc = False  # JS-rendered, no usable API
+                plan.use_who = False  # iris.who.int requires auth (403)
+                plan.use_europe_pmc = True
+            elif request.domain == "medical_academic":
+                # Research papers only: PubMed + Europe PMC; no consumer health pages
+                plan.use_pubmed = True
+                plan.use_medlineplus = False
+                plan.use_arxiv = False
+                plan.use_semantic_scholar = False
+                plan.use_cdc = False
+                plan.use_who = False
                 plan.use_europe_pmc = True
             else:
+                # academic / research: arXiv + Semantic Scholar
                 plan.use_arxiv = True
                 plan.use_semantic_scholar = True
 
@@ -168,7 +178,7 @@ class OnlineSearchService:
                 logger.exception("news_search_fn failed for query=%s", request.query)
 
         if (
-            request.domain in ("academic", "medical", "research")
+            request.domain in ("academic", "medical", "medical_academic", "research")
             and self.academic_search_fn is not None
             and (request.use_academic_sources or request.use_medical_sources)
         ):
@@ -229,7 +239,12 @@ class OnlineSearchService:
                     domain=request.domain,
                     count=len(cached),
                     items=cached,
-                    metadata={"cached_count": len(cached), "sources_count": sources},
+                    metadata={
+                        "cached_count": len(cached),
+                        "sources_count": sources,
+                        "all_from_cache": True,
+                        "fetched_ids": [],
+                    },
                 )
 
         plan = self.build_search_plan(request)
@@ -256,7 +271,12 @@ class OnlineSearchService:
             domain=request.domain,
             count=len(final_items),
             items=final_items,
-            metadata={"cached_count": cached_count, "sources_count": sources},
+            metadata={
+                "cached_count": cached_count,
+                "sources_count": sources,
+                "all_from_cache": False,
+                "fetched_ids": list(fetched_ids),
+            },
         )
 
     def search_news(

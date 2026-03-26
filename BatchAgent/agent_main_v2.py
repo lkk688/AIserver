@@ -119,7 +119,10 @@ class AgentConfig:
     domain: str = "general"
 
     # ── Document / OCR tools ───────────────────────────────────────────────────
-    ocr_server: str = "http://localhost:8002/v1"
+    # Leave ocr_server empty by default — the HybridPDFExtractor works well
+    # without OCR for digital PDFs.  Set this only when an olmOCR server is
+    # actually running; otherwise every upload triggers a Connection Refused.
+    ocr_server: str = ""
     ocr_model: str = "allenai/olmOCR-2-7B-1025-FP8"
     ocr_workspace: str = "./output_old/tmp_ocr"
 
@@ -894,7 +897,19 @@ class UniversalAgent:
         max_ctx = self.config.max_context
         _raw_input = sum(estimate_tokens(m.get("content", "")) for m in self.messages)
         _est_input = int(_raw_input * self._TOKEN_ESTIMATE_CORRECTION)
-        _effective_max_output = min(self.config.max_output, max(256, max_ctx - _est_input - 256))
+        _headroom = max_ctx - _est_input - 256
+        if _headroom < 1024:
+            # Input is near or over context limit; give the LLM enough tokens to write
+            # a meaningful response (or a short write_file call) rather than capping to
+            # 256 which causes truncated file writes.
+            _effective_max_output = min(self.config.max_output, 2048)
+            console.print(
+                f"[bold red]⚠ Context headroom only {_headroom} tokens "
+                f"({100 - int(_headroom * 100 / max_ctx)}% used) — "
+                f"clamping max_output to 2048 to avoid truncated writes.[/bold red]"
+            )
+        else:
+            _effective_max_output = min(self.config.max_output, _headroom)
 
         async def _call():
             return await complete_with_continuation_async(

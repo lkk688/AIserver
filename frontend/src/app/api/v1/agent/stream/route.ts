@@ -10,7 +10,8 @@ import { NextRequest } from 'next/server';
 
 export const dynamic = 'force-dynamic';
 
-const BACKEND = 'http://127.0.0.1:8080';
+// Agent backend runs standalone on port 8090
+const AGENT_BACKEND = process.env.AGENT_BACKEND_URL || 'http://127.0.0.1:8090';
 
 export async function POST(req: NextRequest) {
   let body: unknown;
@@ -20,7 +21,7 @@ export async function POST(req: NextRequest) {
     return new Response('Invalid JSON body', { status: 400 });
   }
 
-  const backendRes = await fetch(`${BACKEND}/api/v1/agent/stream`, {
+  const backendRes = await fetch(`${AGENT_BACKEND}/agent/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
     body: JSON.stringify(body),

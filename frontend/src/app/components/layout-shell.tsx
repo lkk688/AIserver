@@ -8,10 +8,7 @@ import {
   FileText,
   CalendarClock,
   Sparkles,
-  Search,
-  Bell,
   User,
-  Settings,
   Waves,
   Globe,
 } from "lucide-react";
@@ -81,28 +78,6 @@ function Sidebar() {
   );
 }
 
-function TopBar() {
-  return (
-    <header className="h-20 bg-white border-b border-gray-100 flex items-center justify-between px-8 sticky top-0 z-10">
-      <h2 className="text-xl font-semibold text-gray-800">Document Processing Center</h2>
-      <div className="flex items-center gap-6">
-        <div className="relative">
-          <div className="w-2 h-2 bg-red-500 rounded-full absolute top-0 right-0"></div>
-          <Bell className="w-5 h-5 text-gray-500" />
-        </div>
-        <div className="relative">
-          <input 
-            type="text" 
-            placeholder="Search documents..." 
-            className="w-64 pl-4 pr-10 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
-          <Search className="w-4 h-4 text-gray-400 absolute right-3 top-1/2 -translate-y-1/2" />
-        </div>
-      </div>
-    </header>
-  );
-}
-
 export default function RootLayout({
   children,
 }: {
@@ -111,9 +86,8 @@ export default function RootLayout({
   return (
     <div className="min-h-screen bg-gray-50 flex font-sans">
       <Sidebar />
-      <div className="flex-1 ml-64 flex flex-col">
-        <TopBar />
-        <main className="flex-1 p-8 overflow-y-auto">
+      <div className="flex-1 ml-64 min-w-0 flex flex-col">
+        <main className="flex-1 p-8 overflow-y-auto overflow-x-hidden min-w-0">
           {children}
         </main>
         <footer className="px-8 py-4 text-xs text-gray-400 border-t flex justify-between">

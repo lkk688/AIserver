@@ -10,7 +10,7 @@ const nextConfig: NextConfig = {
       },
       {
         source: "/agent/:path*",
-        destination: "http://127.0.0.1:8000/agent/:path*",
+        destination: "http://127.0.0.1:8090/agent/:path*",
       },
     ];
   },

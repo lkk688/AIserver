@@ -337,6 +337,19 @@ class MutationManager:
 
         if ok:
             self._record_written_file(target_path)
+            # Warn if written content is suspiciously short — likely a truncated LLM output.
+            content = action.content or ""
+            last_char = content.rstrip()[-1] if content.strip() else ""
+            is_truncated = (
+                len(content) < 300
+                or (last_char not in (".", "\n", ">", "}", "]", "-", "#", "*", "!") and len(content) < 2000)
+            )
+            if is_truncated:
+                return True, [
+                    f"⚠️ Written content is very short ({len(content)} chars) and may be "
+                    "truncated due to output token limits. "
+                    "If the file is incomplete, call `write_file` again with the full content."
+                ]
             return True, []
 
         return False, [f"write_file failed for path: {action.path}"]

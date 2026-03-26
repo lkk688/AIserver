@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { Send } from "lucide-react";
+import { Send, Square } from "lucide-react";
 import clsx from "clsx";
 
 interface ComposerMode {
@@ -16,6 +16,8 @@ interface ChatComposerShellProps {
   children: React.ReactNode;
   modes?: ComposerMode[];
   onSend: () => void;
+  onStop?: () => void;
+  isStreaming?: boolean;
   sendTitle?: string;
   sendDisabled?: boolean;
   rightSlot?: React.ReactNode;
@@ -26,7 +28,9 @@ export default function ChatComposerShell({
   children,
   modes = [],
   onSend,
-  sendTitle = "Send",
+  onStop,
+  isStreaming = false,
+  sendTitle = "Send (Shift+Enter)",
   sendDisabled = false,
   rightSlot,
   className,
@@ -57,14 +61,24 @@ export default function ChatComposerShell({
         </div>
         <div className="flex items-center gap-2">
           {rightSlot}
-          <button
-            onClick={onSend}
-            title={sendTitle}
-            disabled={sendDisabled}
-            className="p-2.5 bg-blue-600 text-white rounded-full shadow-md hover:bg-blue-700 hover:shadow-blue-500/30 transition-all disabled:bg-blue-300 disabled:cursor-not-allowed"
-          >
-            <Send size={18} />
-          </button>
+          {isStreaming ? (
+            <button
+              onClick={onStop}
+              title="Stop task"
+              className="p-2.5 bg-red-500 text-white rounded-full shadow-md hover:bg-red-600 transition-all"
+            >
+              <Square size={18} />
+            </button>
+          ) : (
+            <button
+              onClick={onSend}
+              title={sendTitle}
+              disabled={sendDisabled}
+              className="p-2.5 bg-blue-600 text-white rounded-full shadow-md hover:bg-blue-700 hover:shadow-blue-500/30 transition-all disabled:bg-blue-300 disabled:cursor-not-allowed"
+            >
+              <Send size={18} />
+            </button>
+          )}
         </div>
       </div>
     </div>

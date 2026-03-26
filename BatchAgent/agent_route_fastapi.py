@@ -805,6 +805,7 @@ class RunRequest(BaseModel):
     max_turns: int = Field(15, description="Maximum ReAct turns before aborting")
     backend: str = Field(default_factory=lambda: os.environ.get("VLLM_BACKEND", "vllm"))
     enable_thinking: bool = Field(default_factory=lambda: os.environ.get("ENABLE_THINKING", "true").lower() == "true")
+    parallel_thinking: bool = Field(True, description="Enable execute_parallel_branches tool")
     context_resources: List[Dict[str, Any]] = Field(default_factory=list)
 
 
@@ -870,6 +871,7 @@ def _make_service(req: RunRequest) -> AgentService:
         max_turns=req.max_turns,
         backend=req.backend,
         enable_thinking=req.enable_thinking,
+        enable_parallel=req.parallel_thinking,
     )
 
 
@@ -929,7 +931,14 @@ def _build_goal_with_context(goal: str, context_resources: List[Dict[str, Any]])
         elif content:
             lines.append(f"   Content: {content[:240].rstrip()}…")
         if source_url and not include_all:
-            lines.append(f"   Access: Use read_url with this URL for full details.")
+            # Local agent-file URLs (e.g. /api/v1/agent/sessions/.../files/download?name=...)
+            # cannot be fetched by read_url (no protocol, relative path).
+            # For uploaded documents the file is in the workspace — direct the agent there.
+            is_local_file_url = source_url.startswith("/api/v1/agent/sessions/") and "files/download" in source_url
+            if is_local_file_url:
+                lines.append(f"   Access: File is available in your workspace. Use get_document_overview(filepath=\"{title}\") to load and read it.")
+            else:
+                lines.append(f"   Access: Use read_url with this URL for full details.")
         compact_lines.append("\n".join(lines))
         if len(compact_lines) >= 15:
             break

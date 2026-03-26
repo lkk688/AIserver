@@ -74,11 +74,18 @@ def _record_to_dict(r: SearchRecord) -> Dict[str, Any]:
 
 
 def _result_response(result) -> Dict[str, Any]:
+    # fetched_ids are IDs that came from a live online fetch (not cache)
+    fetched_ids: set = set(result.metadata.get("fetched_ids", []))
+    items = []
+    for r in result.items:
+        d = _record_to_dict(r)
+        d["from_cache"] = r.id not in fetched_ids if fetched_ids else result.metadata.get("all_from_cache", False)
+        items.append(d)
     return {
         "query": result.query,
         "domain": result.domain,
         "count": result.count,
-        "items": [_record_to_dict(r) for r in result.items],
+        "items": items,
         "metadata": result.metadata,
     }
 
@@ -125,6 +132,17 @@ def search_medical(req: SearchReq):
     return _result_response(result)
 
 
+@router.post("/medical_academic")
+def search_medical_academic(req: SearchReq):
+    """Search PubMed + Europe PMC for research papers (no consumer health pages)."""
+    svc = _get_service()
+    result = svc.search(SearchRequest(
+        query=req.query, domain="medical_academic", limit=req.limit,
+        language="en", category=req.category, use_cache=not req.no_cache,
+    ))
+    return _result_response(result)
+
+
 @router.post("/url")
 def read_url(req: URLReq):
     svc = _get_service()
@@ -153,6 +171,16 @@ def get_cache(
         recent_hours=recent_hours,
     )
     return {"count": len(records), "items": [_record_to_dict(r) for r in records]}
+
+
+@router.delete("/cache/{record_id}")
+def delete_cache_record(record_id: str):
+    """Delete a single cached record by ID."""
+    svc = _get_service()
+    deleted = svc.file_store.delete_record(record_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Record '{record_id}' not found")
+    return {"deleted": record_id}
 
 
 # ── Scheduler helpers ──────────────────────────────────────────────────────────

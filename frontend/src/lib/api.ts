@@ -134,7 +134,7 @@ export const search = async (query: string, top_k: number = 10): Promise<SearchR
 
 // ─── Online Search Toolkit ──────────────────────────────────────────────────
 
-export type OnlineSearchDomain = 'web' | 'news' | 'academic' | 'medical';
+export type OnlineSearchDomain = 'web' | 'news' | 'academic' | 'medical' | 'medical_academic';
 
 export interface OnlineSearchRecord {
   id: string;
@@ -152,6 +152,7 @@ export interface OnlineSearchRecord {
   record_type: string;
   query?: string | null;
   embedding?: null;
+  from_cache?: boolean;
 }
 
 export interface OnlineSearchResult {
@@ -220,6 +221,11 @@ export const onlineGetCache = async (params: {
   recent_hours?: number;
 } = {}): Promise<{ count: number; items: OnlineSearchRecord[] }> => {
   const { data } = await api.get('/online-search/cache', { params });
+  return data;
+};
+
+export const onlineDeleteCacheRecord = async (recordId: string): Promise<{ deleted: string }> => {
+  const { data } = await api.delete(`/online-search/cache/${encodeURIComponent(recordId)}`);
   return data;
 };
 

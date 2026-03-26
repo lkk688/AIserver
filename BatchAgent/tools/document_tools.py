@@ -438,9 +438,10 @@ class DocumentToolManager:
 
         ocr_workspace = str(extract_dir / "ocr_workspace")
 
+        _ocr_server = getattr(self.config, "ocr_server", None) or None  # treat "" as None
         agent = create_document_agent_from_pdf(
             pdf_filepath=str(pdf_path),
-            ocr_server=getattr(self.config, "ocr_server", None),
+            ocr_server=_ocr_server,
             ocr_model=getattr(self.config, "ocr_model", "allenai/olmOCR-2-7B-1025-FP8"),
             ocr_workspace=ocr_workspace,
             use_pdf_page_ocr=getattr(self.config, "use_pdf_page_ocr", False),
