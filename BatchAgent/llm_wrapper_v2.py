@@ -13,6 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 console = Console()
 
+
+class LLMUnavailableError(RuntimeError):
+    """Raised when the LLM backend is unreachable after all retries."""
+
 from BatchAgent.mini_batch_agent_libs import (
     estimate_tokens, compress_messages, compute_safe_max_tokens, now_stamp, write_jsonl, robust_json_loads
 )
@@ -349,7 +353,7 @@ async def complete_with_continuation_async(
                 if attempt < 2:
                     await asyncio.sleep(2 ** attempt)
                     continue
-                return full_content, parse_text_actions(full_content, allowlist, dynamic_tools_registry)
+                raise LLMUnavailableError(f"LLM backend unavailable after 3 attempts: {e}") from e
 
         elapsed = time.time() - start_time
         if verbose: console.print()

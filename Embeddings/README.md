@@ -242,7 +242,29 @@ That keeps the implementation simple and predictable on older GPUs.
 ```bash
 curl http://localhost:8000/healthz
 curl -H 'Authorization: Bearer my-secret-key' http://localhost:8000/v1/models
+
+curl http://100.83.246.7:8002/healthz
+curl -H 'Authorization: Bearer embeddingp100' http://100.83.246.7:8002/v1/models
+
+curl http://100.83.246.7:8002/v1/embeddings   -H "Content-Type: application/json"   -H "Authorization: Bearer embeddingp100"   -d '{"input":"hello world","model":"Qwen/Qwen3-Embedding-0.6B"}'
+
+curl http://100.83.246.7:8002/v1/rerank \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer embeddingp100' \
+  -d '{
+    "model": "Qwen/Qwen3-Reranker-0.6B",
+    "query": "best way to deploy embeddings on a Tesla P100",
+    "documents": [
+      "Use ONNX Runtime with a small FastAPI wrapper.",
+      "Run TEI on the newest Hopper GPU.",
+      "Use a reranker after vector search to improve precision."
+    ],
+    "top_n": 2,
+    "return_documents": true
+  }'
 ```
+
+
 
 ## Notes
 

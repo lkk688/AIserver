@@ -18,7 +18,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, FastAPI
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, FastAPI, Query
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
@@ -130,7 +130,11 @@ def _resolve_user_workspace_root(output_dir: str, user_id: str) -> str:
 
 
 def _resolve_task_workspace_dir(output_dir: str, user_id: str, task_id: str) -> str:
-    return str((Path(_resolve_user_workspace_root(output_dir, user_id)) / task_id).resolve())
+    from BatchAgent.mini_batch_agent_libs import now_stamp
+    sessions_root = _user_root_dir(user_id) / ".agent" / "sessions"
+    sessions_root.mkdir(parents=True, exist_ok=True)
+    session_name = f"{now_stamp()}_{task_id}"
+    return str((sessions_root / session_name).resolve())
 
 
 def _user_root_dir(user_id: str) -> Path:
@@ -174,6 +178,10 @@ def _init_agent_db(user_id: str) -> None:
             conn.execute("ALTER TABLE agent_sessions ADD COLUMN user_id TEXT NOT NULL DEFAULT 'anonymous'")
         if "token_stats_json" not in cols:
             conn.execute("ALTER TABLE agent_sessions ADD COLUMN token_stats_json TEXT NULL")
+        if "rating" not in cols:
+            conn.execute("ALTER TABLE agent_sessions ADD COLUMN rating INTEGER NULL")
+        if "rating_comment" not in cols:
+            conn.execute("ALTER TABLE agent_sessions ADD COLUMN rating_comment TEXT NULL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_sessions_user_updated ON agent_sessions(user_id, updated_at DESC)")
         conn.commit()
     finally:
@@ -723,8 +731,12 @@ def _build_workspace_file_entries(workspace: Optional[str], task_id: str) -> Lis
 
     from BatchAgent.minio_uploader import upload_file
 
+    # Session-internal files that are not user output
+    _SESSION_INTERNAL = {"rl_trajectory.jsonl", "working_memory.json"}
     for f in sorted(ws.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
         if not f.is_file() or f.name.startswith(".") or f.suffix == ".db":
+            continue
+        if f.name in _SESSION_INTERNAL:
             continue
         ext = f.suffix.lstrip(".").lower()
         object_name = f"agent/{task_id}/{f.name}"
@@ -745,29 +757,39 @@ def _build_workspace_file_entries(workspace: Optional[str], task_id: str) -> Lis
 
 
 def _init_minio():
-    import yaml
+    # Priority: environment variables > config.yaml
+    endpoint = os.getenv("MINIO_ENDPOINT", "")
+    access_key = os.getenv("MINIO_ACCESS_KEY", "")
+    secret_key = os.getenv("MINIO_SECRET_KEY", "")
+    bucket = os.getenv("MINIO_BUCKET", "aiagent")
+    secure = os.getenv("MINIO_SECURE", "false").lower() == "true"
 
-    cfg_path = os.getenv("APP_CONFIG_PATH", "backend/config.yaml")
-    try:
-        with open(cfg_path) as f:
-            cfg = yaml.safe_load(f) or {}
-        mc = cfg.get("minio", {})
-        if mc.get("endpoint"):
+    if not endpoint:
+        # Fall back to config.yaml
+        import yaml
+        cfg_path = os.getenv("APP_CONFIG_PATH", "backend/config.yaml")
+        try:
+            with open(cfg_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            mc = cfg.get("minio", {})
+            endpoint = mc.get("endpoint", "")
+            access_key = mc.get("access_key", access_key)
+            secret_key = mc.get("secret_key", secret_key)
+            bucket = mc.get("bucket", bucket)
+            secure = mc.get("secure", secure)
+        except Exception:
+            pass
+
+    if endpoint:
+        try:
             from BatchAgent.minio_uploader import init_minio
-
-            init_minio(
-                endpoint=mc["endpoint"],
-                access_key=mc.get("access_key", ""),
-                secret_key=mc.get("secret_key", ""),
-                bucket=mc.get("bucket", "aiagent"),
-                secure=mc.get("secure", False),
-            )
+            init_minio(endpoint=endpoint, access_key=access_key,
+                       secret_key=secret_key, bucket=bucket, secure=secure)
             from BatchAgent.minio_uploader import _client as _mc_check
-
             if _mc_check is not None:
-                print(f"[MinIO] Ready → {mc['endpoint']}/{mc.get('bucket','aiagent')}")
-    except Exception as exc:
-        print(f"[MinIO] Config load failed: {exc}")
+                print(f"[MinIO] Ready → {endpoint}/{bucket}")
+        except Exception as exc:
+            print(f"[MinIO] Init failed: {exc}")
 
 
 _init_minio()
@@ -781,6 +803,41 @@ def health():
     return {"status": "ok", "service": "BatchAgent"}
 
 
+@router.get("/agent/model/context", tags=["Meta"], summary="Detect model context window length")
+async def get_model_context(
+    base_url: str = Query(..., description="LLM base URL"),
+    api_key: str = Query("EMPTY"),
+    model: str = Query(..., description="Model name"),
+    provider: str = Query("openai"),
+):
+    """Probe the LLM API to detect the model's actual context window length."""
+    if provider == "anthropic":
+        return {"context_length": 200000, "model": model}
+    import httpx
+    from openai import AsyncOpenAI
+    client = AsyncOpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        http_client=httpx.AsyncClient(timeout=10.0),
+    )
+    try:
+        ctx = 0
+        if hasattr(client, "models"):
+            models = await client.models.list()
+            for m in models.data:
+                if m.id == model and hasattr(m, "max_model_len") and m.max_model_len:
+                    ctx = int(m.max_model_len)
+                    break
+        if ctx == 0:
+            # Fallback: small test completion
+            await client.chat.completions.create(
+                model=model, messages=[{"role": "user", "content": "Hi"}], max_tokens=1
+            )
+        return {"context_length": ctx or 0, "model": model}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Cannot connect to LLM API: {e}")
+
+
 class RunRequest(BaseModel):
     task_id: Optional[str] = None
     goal: str = Field(..., description="Natural language task goal")
@@ -789,7 +846,7 @@ class RunRequest(BaseModel):
     model: str = Field(default_factory=lambda: os.environ.get("VLLM_MODEL", "qwen3.5-9b"))
     base_url: str = Field(default_factory=lambda: os.environ.get("VLLM_BASE_URL", "http://100.110.236.127:8000/v1"))
     api_key: str = Field(default_factory=lambda: os.environ.get("VLLM_API_KEY", "EMPTY"))
-    max_context: int = 16384
+    max_context: int = 0   # 0 = auto-detect via API
     max_output: int = 4096
     verbose: bool = False
     output_dir: str = "./agent_workspace"
@@ -806,6 +863,14 @@ class RunRequest(BaseModel):
     backend: str = Field(default_factory=lambda: os.environ.get("VLLM_BACKEND", "vllm"))
     enable_thinking: bool = Field(default_factory=lambda: os.environ.get("ENABLE_THINKING", "true").lower() == "true")
     parallel_thinking: bool = Field(True, description="Enable execute_parallel_branches tool")
+    # Embedding service (TEI-compatible)
+    embedding_base_url: str = Field(default_factory=lambda: os.environ.get("EMBEDDING_API_URL", "http://localhost:8081/v1"))
+    embedding_api_key: str = Field(default_factory=lambda: os.environ.get("EMBEDDING_API_KEY", "EMPTY"))
+    embedding_model: str = Field(default_factory=lambda: os.environ.get("EMBEDDING_API_MODEL", "text-embeddings-inference"))
+    # Reranker service (TEI /v1/rerank compatible)
+    reranker_base_url: str = Field(default_factory=lambda: os.environ.get("RERANK_API_URL", ""))
+    reranker_api_key: str = Field(default_factory=lambda: os.environ.get("RERANK_API_KEY", ""))
+    reranker_model: str = Field(default_factory=lambda: os.environ.get("RERANK_API_MODEL", ""))
     context_resources: List[Dict[str, Any]] = Field(default_factory=list)
 
 
@@ -872,7 +937,14 @@ def _make_service(req: RunRequest) -> AgentService:
         backend=req.backend,
         enable_thinking=req.enable_thinking,
         enable_parallel=req.parallel_thinking,
+        embedding_base_url=req.embedding_base_url,
+        embedding_api_key=req.embedding_api_key,
+        embedding_model=req.embedding_model,
+        reranker_base_url=req.reranker_base_url,
+        reranker_api_key=req.reranker_api_key,
+        reranker_model=req.reranker_model,
     )
+
 
 
 def _finalize_token_stats(stats: Dict[str, Any]) -> Dict[str, Any]:
@@ -1852,6 +1924,30 @@ def delete_session_file(
         "deleted": removed_entry is not None,
         "removed_from_workspace": removed_from_workspace,
     }
+
+
+class RatingRequest(BaseModel):
+    rating: int = Field(0, description="1=thumbs up, -1=thumbs down, 0=withdrawn")
+    comment: str = Field("", description="Optional feedback comment")
+
+
+@router.post("/agent/sessions/{task_id}/rating", summary="Rate a completed task session")
+def rate_session(
+    task_id: str,
+    body: RatingRequest,
+    current_user: Annotated[dict, Depends(_get_current_user_optional)],
+):
+    user_id = _normalize_user_id(current_user)
+    db_path = _agent_db_path(user_id)
+    with sqlite3.connect(str(db_path)) as conn:
+        result = conn.execute(
+            "UPDATE agent_sessions SET rating = ?, rating_comment = ?, updated_at = ? WHERE task_id = ? AND user_id = ?",
+            (body.rating, body.comment or None, datetime.utcnow().isoformat(), task_id, user_id),
+        )
+        conn.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail=f"Session '{task_id}' not found")
+    return {"ok": True, "task_id": task_id, "rating": body.rating}
 
 
 @router.delete("/agent/sessions/{task_id}", summary="Delete a task session")

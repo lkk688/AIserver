@@ -47,7 +47,7 @@ from rich.text import Text
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # ── v2 modules ─────────────────────────────────────────────────────────────────
-from BatchAgent.llm_wrapper_v2 import complete_with_continuation_async
+from BatchAgent.llm_wrapper_v2 import complete_with_continuation_async, LLMUnavailableError
 from BatchAgent.prompt_registry_v2 import PromptRegistry
 from BatchAgent.tools.tools_registry import compile_tools_for_provider, get_base_tools
 from BatchAgent.tools.tool_registry_runtime import configure_global_tool_registry
@@ -125,6 +125,13 @@ class AgentConfig:
     ocr_server: str = ""
     ocr_model: str = "allenai/olmOCR-2-7B-1025-FP8"
     ocr_workspace: str = "./output_old/tmp_ocr"
+    # Shared document cache across sessions (absolute path preferred).
+    # If empty, DocumentToolManager falls back to ".cache/documents" relative to CWD.
+    document_cache_dir: str = ""
+    # Reranker (TEI /v1/rerank compatible). Empty = no reranking.
+    reranker_base_url: str = ""
+    reranker_api_key: str = ""
+    reranker_model: str = ""
 
     # ── Working memory (set by UniversalAgent at task start) ──────────────────
     # ToolRouter reads this via getattr(config, "working_memory", None).
@@ -1283,7 +1290,17 @@ class UniversalAgent:
                 (turn_dir / "user_prompt.md").write_text(prompt_md, encoding="utf-8")
 
             # ── LLM call ────────────────────────────────────────────────────
-            content, actions = await self._run_llm_call(display_turn, allowlist)
+            try:
+                content, actions = await self._run_llm_call(display_turn, allowlist)
+            except LLMUnavailableError as e:
+                err_msg = f"LLM backend unavailable: {e}. Check your vLLM server or API key."
+                console.log(f"[red]CRITICAL: {err_msg}[/red]")
+                if self.config.stream_callback:
+                    await self.config.stream_callback({
+                        "type": "error",
+                        "detail": err_msg
+                    })
+                return False, err_msg
             (turn_dir / "response.md").write_text(content, encoding="utf-8")
             self._log_rl("assistant", content)
             final_result_text = content

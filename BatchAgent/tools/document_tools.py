@@ -106,9 +106,8 @@ class DocumentToolManager:
         self.loaded_source_infos: Dict[str, DocumentSourceInfo] = {}
         self.active_doc_key: Optional[str] = None
 
-        self.doc_cache_root = Path(
-            getattr(config, "document_cache_dir", ".cache/documents")
-        ).resolve()
+        _cache_val = getattr(config, "document_cache_dir", "") or ".cache/documents"
+        self.doc_cache_root = Path(_cache_val).resolve()
 
         self.extracted_cache_dir = self.doc_cache_root / "extracted"
         self.converted_cache_dir = self.doc_cache_root / "converted"

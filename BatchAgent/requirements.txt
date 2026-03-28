@@ -1,5 +1,6 @@
 PyJWT
 python-jose[cryptography]
+python-dotenv
 beautifulsoup4
 markdownify
 python-multipart

@@ -7,6 +7,7 @@ import {
   Zap, Clock, BarChart2, ExternalLink, Plus, Trash2, Settings,
   ChevronRight, ArrowLeft, ChevronDown, ChevronUp, Globe, Type, CirclePlay, Link2,
   Copy, Check, History, Mic, Loader2, Pause, Play, Volume2, VolumeX,
+  ThumbsUp, ThumbsDown, Square, MicOff,
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -14,6 +15,7 @@ import clsx from 'clsx';
 import { useVoiceInput } from '../audio/useVoiceInput';
 import { useTts } from '../audio/useTts';
 import ChatComposerShell from './ChatComposerShell';
+import { config as appConfig } from '@/config';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -53,6 +55,7 @@ interface AgentSettings {
   asr_language: 'auto' | 'en' | 'zh';
   voice_send_mode: 'input' | 'direct';
   tts_enabled: boolean;
+  selectedModelId: string;
 }
 
 interface SessionFile {
@@ -330,6 +333,92 @@ function CompletionBadge({ success, stats }: CompletionBlock) {
   );
 }
 
+// ─── Rating bar ──────────────────────────────────────────────────────────────
+
+function RatingBar({ taskId, agentApiUrl }: { taskId: string; agentApiUrl: string }) {
+  const [rating, setRating] = useState<'up' | 'down' | null>(null);
+  const [comment, setComment] = useState('');
+  const [showComment, setShowComment] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+
+  const submit = async (value: 'up' | 'down') => {
+    const next = rating === value ? null : value;
+    setRating(next);
+    if (next) setShowComment(true);
+    const body = { rating: next === 'up' ? 1 : next === 'down' ? -1 : 0, comment };
+    await fetch(`${agentApiUrl}/agent/sessions/${taskId}/rating`, {
+      method: 'POST',
+      headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body),
+    }).catch(() => { });
+    if (next) setSubmitted(true);
+  };
+
+  const submitComment = async () => {
+    await fetch(`${agentApiUrl}/agent/sessions/${taskId}/rating`, {
+      method: 'POST',
+      headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ rating: rating === 'up' ? 1 : -1, comment }),
+    }).catch(() => { });
+    setShowComment(false);
+  };
+
+  return (
+    <div className="mt-3 pt-3 border-t border-gray-100">
+      <div className="flex items-center gap-3">
+        <span className="text-[11px] text-gray-400">Was this helpful?</span>
+        <button
+          onClick={() => submit('up')}
+          className={clsx(
+            "flex items-center gap-1 px-2 py-1 rounded-lg text-xs border transition-colors",
+            rating === 'up' ? "bg-emerald-50 border-emerald-300 text-emerald-600" : "border-gray-200 text-gray-400 hover:border-emerald-300 hover:text-emerald-500"
+          )}
+        >
+          <ThumbsUp className="w-3.5 h-3.5" />
+          <span>Yes</span>
+        </button>
+        <button
+          onClick={() => submit('down')}
+          className={clsx(
+            "flex items-center gap-1 px-2 py-1 rounded-lg text-xs border transition-colors",
+            rating === 'down' ? "bg-red-50 border-red-300 text-red-500" : "border-gray-200 text-gray-400 hover:border-red-300 hover:text-red-400"
+          )}
+        >
+          <ThumbsDown className="w-3.5 h-3.5" />
+          <span>No</span>
+        </button>
+        {submitted && !showComment && (
+          <span className="text-[11px] text-gray-400">Thanks for the feedback!</span>
+        )}
+      </div>
+      {showComment && (
+        <div className="mt-2 flex gap-2">
+          <input
+            type="text"
+            value={comment}
+            onChange={e => setComment(e.target.value)}
+            placeholder="Optional: add a comment…"
+            className="flex-1 text-xs border border-gray-200 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-300"
+            onKeyDown={e => { if (e.key === 'Enter') void submitComment(); }}
+          />
+          <button
+            onClick={submitComment}
+            className="px-2.5 py-1 rounded-lg bg-indigo-600 text-white text-xs hover:bg-indigo-500"
+          >
+            Send
+          </button>
+          <button
+            onClick={() => setShowComment(false)}
+            className="px-2.5 py-1 rounded-lg border border-gray-200 text-xs text-gray-500 hover:bg-gray-50"
+          >
+            Skip
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Code block with copy button + macOS chrome ──────────────────────────────
 
 function CodeBlock({ lang, children }: { lang: string; children: string }) {
@@ -396,7 +485,8 @@ function MarkdownContent({ content }: { content: string }) {
   );
 }
 
-function AssistantMessage({ blocks }: { blocks: Block[] }) {
+function AssistantMessage({ blocks, taskId, agentApiUrl }: { blocks: Block[]; taskId?: string; agentApiUrl: string }) {
+  const hasCompletion = blocks.some(b => b.type === 'completion');
   return (
     <div className="space-y-0.5">
       {blocks.map((block, i) => {
@@ -414,6 +504,9 @@ function AssistantMessage({ blocks }: { blocks: Block[] }) {
           default: return null;
         }
       })}
+      {hasCompletion && taskId && (
+        <RatingBar taskId={taskId} agentApiUrl={agentApiUrl} />
+      )}
     </div>
   );
 }
@@ -627,8 +720,44 @@ function SettingsPanel({
       </button>
       {open && (
         <div className="px-4 pb-4 space-y-3 bg-gray-50/80 border-t border-gray-100 max-h-72 overflow-y-auto">
-          {/* Tool strategy */}
+          {/* Model selector */}
           <div className="pt-3">
+            <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Model</label>
+            <div className="space-y-1">
+              {appConfig.agent.models.map(m => {
+                const hasKey = m.provider === 'openai'
+                  ? !!(m.apiKey && m.apiKey !== 'EMPTY') || m.backend === 'vllm'
+                  : !!(m.apiKey);
+                const isSelected = settings.selectedModelId === m.id;
+                return (
+                  <button
+                    key={m.id}
+                    onClick={() => hasKey && onChange({ ...settings, selectedModelId: m.id })}
+                    disabled={!hasKey}
+                    className={clsx(
+                      "w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md border text-xs transition-colors text-left",
+                      isSelected
+                        ? "border-indigo-400 bg-indigo-50 text-indigo-700 font-medium"
+                        : hasKey
+                          ? "border-gray-200 bg-white text-gray-700 hover:border-indigo-200 hover:bg-gray-50"
+                          : "border-gray-100 bg-gray-50 text-gray-400 cursor-not-allowed"
+                    )}
+                  >
+                    <span className={clsx(
+                      "w-1.5 h-1.5 rounded-full shrink-0",
+                      hasKey ? "bg-green-400" : "bg-gray-300"
+                    )} />
+                    <span className="flex-1 truncate">{m.name}</span>
+                    {!hasKey && <span className="text-[10px] text-gray-400 shrink-0">no key</span>}
+                    {isSelected && hasKey && <span className="text-[10px] text-indigo-500 shrink-0">✓</span>}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Tool strategy */}
+          <div className="pt-1">
             <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wide mb-1">Tool Strategy</label>
             <div className="flex gap-1">
               {(['hybrid', 'native_all', 'text_only'] as const).map(s => (
@@ -870,7 +999,7 @@ function SessionList({
   return (
     <div className={clsx(
       "flex flex-col bg-gray-50",
-      embedded ? "h-full" : "-m-8 h-screen"
+      embedded ? "h-full" : "h-full"
     )}>
       {/* Header */}
       <div className="bg-white border-b border-gray-200 px-8 py-5 flex items-center justify-between">
@@ -1017,6 +1146,8 @@ function ChatView({
   const [historyLoading, setHistoryLoading] = useState(isHistory);
   const [input, setInput] = useState(isHistory ? '' : (initialGoal ?? ''));
   const [isVoiceMode, setIsVoiceMode] = useState(false);
+  const [isContinuousRecording, setIsContinuousRecording] = useState(false);
+  const [sourcesTabPulse, setSourcesTabPulse] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamStatus, setStreamStatus] = useState('');
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -1041,14 +1172,28 @@ function ChatView({
   }, []);
 
   // Right panel state
-  const [activeTab, setActiveTab] = useState<'editor' | 'sources'>('editor');
+  const [activeTab, setActiveTab] = useState<'editor' | 'sources'>('sources');
   const [documentState, setDocumentState] = useState<DocumentState>({
     title: 'Untitled Document.md',
     content: '# Welcome\n\nGenerated content will appear here.',
     isCustomizing: false,
   });
+  // All agent-generated output docs in this session (file browser)
+  const [outputDocs, setOutputDocs] = useState<Array<{ name: string; content: string }>>([]);
+  const [selectedDocName, setSelectedDocName] = useState<string>('');
   const [attachedFiles, setAttachedFiles] = useState<AttachedFileItem[]>([]);
   const [showUrlComposer, setShowUrlComposer] = useState(false);
+  const [showAttachMenu, setShowAttachMenu] = useState(false);
+  const attachMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!showAttachMenu) return;
+    const handler = (e: MouseEvent) => {
+      if (attachMenuRef.current && !attachMenuRef.current.contains(e.target as Node))
+        setShowAttachMenu(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [showAttachMenu]);
   const [urlDraft, setUrlDraft] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [activeTools, setActiveTools] = useState<string[]>([]);
@@ -1056,21 +1201,47 @@ function ChatView({
 
   // Agent settings
   const [settings, setSettings] = useState<AgentSettings>({
-    tool_strategy: 'hybrid',
+    tool_strategy: 'native_all',
     domain: 'general',
     max_turns: 15,
     parallel_thinking: true,
     asr_language: 'auto',
     voice_send_mode: 'input',
     tts_enabled: false,
+    selectedModelId: appConfig.agent.defaultModel,
   });
   const [browserLanguage, setBrowserLanguage] = useState<'en' | 'zh'>('en');
+  const [detectedContextK, setDetectedContextK] = useState<number | null>(null);
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
       setBrowserLanguage(window.navigator.language.toLowerCase().startsWith('zh') ? 'zh' : 'en');
     }
   }, []);
+
+  // Probe LLM context window whenever the selected model changes
+  useEffect(() => {
+    const modelCfg = appConfig.agent.models.find(m => m.id === settings.selectedModelId)
+      ?? appConfig.agent.models[0];
+    if (modelCfg.provider === 'anthropic') {
+      setDetectedContextK(200);
+      return;
+    }
+    if (!modelCfg.baseUrl) return;
+    const params = new URLSearchParams({
+      base_url: modelCfg.baseUrl,
+      api_key: modelCfg.apiKey || 'EMPTY',
+      model: modelCfg.model,
+      provider: modelCfg.provider,
+    });
+    setDetectedContextK(null);
+    fetch(`${agentApiUrl}/agent/model/context?${params}`)
+      .then(r => r.ok ? r.json() : null)
+      .then((data: { context_length: number } | null) => {
+        if (data?.context_length) setDetectedContextK(Math.round(data.context_length / 1024));
+      })
+      .catch(() => setDetectedContextK(null));
+  }, [settings.selectedModelId, agentApiUrl]);
 
   useEffect(() => {
     setCurrentTaskId(taskId ?? '');
@@ -1092,6 +1263,8 @@ function ChatView({
     stopRecording,
     resetTranscript,
     requestPermission,
+    setAutoRestart,
+    volume: micVolume,
   } = useVoiceInput(effectiveAsrLanguage);
   const {
     setIsEnabled: setIsTtsEnabled,
@@ -1141,6 +1314,9 @@ function ChatView({
       .then(r => r.json())
       .then(async (data: TurnsApiResponse) => {
         setCurrentTaskId(data.task_id || taskId);
+        const hasTurns = (data.total_turns ?? 0) > 0
+          || (data.turns && data.turns.length > 0)
+          || (data.chat_history && data.chat_history.length > 0);
         const userMsg: Message = { id: 'user-0', role: 'user', content: data.goal };
         const turnBlocks = reconstructBlocksFromHistory(data);
         const hasRichTurnContent = turnBlocks.some((b) => b.type === 'turn_header' || b.type === 'think' || b.type === 'tool' || b.type === 'text');
@@ -1152,7 +1328,15 @@ function ChatView({
           id: 'assistant-0', role: 'assistant', content: '',
           blocks: assistantBlocks,
         };
-        setMessages([userMsg, assistantMsg]);
+        // Only show the goal as a sent user message if the task was actually started
+        if (hasTurns) {
+          setMessages([userMsg, assistantMsg]);
+        } else {
+          // Session was created (e.g. for file upload) but goal was never sent —
+          // restore the goal text to the input bar so the user can continue editing.
+          setMessages([]);
+          if (data.goal) setInput(data.goal);
+        }
         const mappedFiles = (data.files ?? []).map((f, idx) => ({
           id: `${f.name}-${idx}`,
           name: f.name,
@@ -1167,42 +1351,60 @@ function ChatView({
         }));
         setAttachedFiles(mappedFiles);
 
-        const mdFile = data.files?.find(f => f.ext === 'md' || f.ext === 'markdown' || f.name.toLowerCase().endsWith('.md') || f.name.toLowerCase().endsWith('.markdown'));
-        if (mdFile) {
-          if (mdFile.content) {
-            setDocumentState(prev => ({ ...prev, title: mdFile.name, content: mdFile.content ?? '' }));
-            setActiveTab('editor');
-            return;
+        // Only auto-load agent-generated .md files (not user-uploaded sources).
+        const agentMdFiles = hasTurns
+          ? (data.files ?? []).filter(f =>
+              (f.ext === 'md' || f.ext === 'markdown' || f.name.toLowerCase().endsWith('.md') || f.name.toLowerCase().endsWith('.markdown'))
+              && !f.source_url && !f.resource_type
+            )
+          : [];
+
+        const loadedDocs: Array<{ name: string; content: string }> = [];
+        for (const mdFile of agentMdFiles) {
+          let content = mdFile.content ?? '';
+          if (!content) {
+            const resolved = resolveFileUrl(mdFile.url || mdFile.file_api_path);
+            if (resolved) {
+              try {
+                content = await fetch(resolved, {
+                  headers: ((resolved.startsWith(apiBaseUrl) || resolved.startsWith(agentApiUrl))) ? buildAuthHeaders() : undefined,
+                }).then(r => (r.ok ? r.text() : ''));
+              } catch { }
+            }
           }
-          const resolved = resolveFileUrl(mdFile.url || mdFile.file_api_path);
-          if (resolved) {
+          if (!content) {
             try {
-              const content = await fetch(resolved, {
-                headers: ((resolved.startsWith(apiBaseUrl) || resolved.startsWith(agentApiUrl)) || resolved.startsWith(agentApiUrl)) ? buildAuthHeaders() : undefined,
-              }).then(r => (r.ok ? r.text() : ''));
-              if (content) {
-                setDocumentState(prev => ({ ...prev, title: mdFile.name, content }));
-                setActiveTab('editor');
-                return;
-              }
+              const fileApi = `${agentApiUrl}/agent/sessions/${taskId}/files/content?name=${encodeURIComponent(mdFile.name)}`;
+              const payload = await fetch(fileApi, { headers: buildAuthHeaders() }).then(r => r.ok ? r.json() : null);
+              content = typeof payload?.content === 'string' ? payload.content : '';
             } catch { }
           }
-          try {
-            const fileApi = `${agentApiUrl}/agent/sessions/${taskId}/files/content?name=${encodeURIComponent(mdFile.name)}`;
-            const payload = await fetch(fileApi, { headers: buildAuthHeaders() }).then(r => r.ok ? r.json() : null);
-            const text = typeof payload?.content === 'string' ? payload.content : '';
-            if (text) {
-              setDocumentState(prev => ({ ...prev, title: mdFile.name, content: text }));
-              setActiveTab('editor');
-              return;
-            }
-          } catch { }
-          setDocumentState(prev => ({ ...prev, title: mdFile.name, content: prev.content }));
+          if (content) loadedDocs.push({ name: mdFile.name, content });
+        }
+        if (loadedDocs.length > 0) {
+          setOutputDocs(loadedDocs);
+          const last = loadedDocs[loadedDocs.length - 1];
+          setSelectedDocName(last.name);
+          setDocumentState(prev => ({ ...prev, title: last.name, content: last.content }));
         }
       })
       .catch(console.error)
       .finally(() => setHistoryLoading(false));
   }, [agentApiUrl, apiBaseUrl, taskId, resolveFileUrl]);
+
+  // Accumulate agent-generated docs; update documentState to the latest
+  const upsertOutputDoc = useCallback((name: string, content: string) => {
+    setOutputDocs(prev => {
+      const idx = prev.findIndex(d => d.name === name);
+      const next = idx >= 0
+        ? prev.map((d, i) => i === idx ? { name, content } : d)
+        : [...prev, { name, content }];
+      return next;
+    });
+    setSelectedDocName(name);
+    setDocumentState(prev => ({ ...prev, title: name, content }));
+    setActiveTab('editor');
+  }, []);
 
   const downloadDocument = () => {
     const blob = new Blob([documentState.content], { type: 'text/plain;charset=utf-8' });
@@ -1278,6 +1480,9 @@ function ChatView({
       status: 'processing' as const,
     }));
     setAttachedFiles(prev => [...prev, ...pending]);
+    setActiveTab('sources');
+    setSourcesTabPulse(true);
+    setTimeout(() => setSourcesTabPulse(false), 1500);
     await Promise.all(pending.map(async (item, idx) => {
       const file = files[idx];
       try {
@@ -1351,6 +1556,9 @@ function ChatView({
     setAttachedFiles(prev => [...prev, ...pending]);
     setUrlDraft('');
     setShowUrlComposer(false);
+    setActiveTab('sources');
+    setSourcesTabPulse(true);
+    setTimeout(() => setSourcesTabPulse(false), 1500);
     await Promise.all(pending.map(async (item) => {
       try {
         const response = await fetch(`${agentApiUrl}/agent/sessions/${effectiveTaskId}/resources/attach`, {
@@ -1473,6 +1681,8 @@ function ChatView({
     const userMsg: Message = { id: Date.now().toString(), role: 'user', content: outgoingInput };
     setMessages(prev => [...prev, userMsg]);
     setInput('');
+    setOutputDocs([]);
+    setSelectedDocName('');
     setIsStreaming(true);
     const assistantId = (Date.now() + 1).toString();
     setMessages(prev => [...prev, { id: assistantId, role: 'assistant', content: '', blocks: [] }]);
@@ -1492,19 +1702,41 @@ function ChatView({
           'Accept': 'text/event-stream',
           'Cache-Control': 'no-cache',
         }),
-        body: JSON.stringify({
-          task_id: effectiveTaskId,
-          goal: userMsg.content,
-          context_resources: contextResources,
-          backend: 'vllm',
-          tool_strategy: settings.tool_strategy,
-          domain: settings.domain,
-          max_turns: settings.max_turns,
-          enable_turn_limits: true,
-          parallel_thinking: settings.parallel_thinking,
-        }),
+        body: JSON.stringify((() => {
+          const modelCfg = appConfig.agent.models.find(m => m.id === settings.selectedModelId)
+            ?? appConfig.agent.models[0];
+          return {
+            task_id: effectiveTaskId,
+            goal: userMsg.content,
+            context_resources: contextResources,
+            provider: modelCfg.provider,
+            model: modelCfg.model,
+            base_url: modelCfg.baseUrl,
+            api_key: modelCfg.apiKey,
+            backend: modelCfg.backend,
+            tool_strategy: settings.tool_strategy,
+            domain: settings.domain,
+            max_turns: settings.max_turns,
+            enable_turn_limits: true,
+            parallel_thinking: settings.parallel_thinking,
+            max_context: 0,  // 0 = auto-detect via API
+            // Embedding service
+            embedding_base_url: appConfig.embedding.baseUrl,
+            embedding_api_key: appConfig.embedding.apiKey,
+            embedding_model: appConfig.embedding.model,
+            // Reranker service
+            reranker_base_url: appConfig.reranker.baseUrl,
+            reranker_api_key: appConfig.reranker.apiKey,
+            reranker_model: appConfig.reranker.model,
+          };
+        })()),
       });
 
+      if (!response.ok) {
+        const errText = await response.text().catch(() => response.statusText);
+        updateBlocks(b => [...b, { type: 'text', content: `\n\n❌ **Server error ${response.status}:** ${errText}` } as TextBlock]);
+        return;
+      }
       if (!response.body) throw new Error('No readable stream');
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -1571,55 +1803,37 @@ function ChatView({
               if (isTextDoc) {
                 const inline = event.content;
                 if (inline) {
-                  setDocumentState(prev => ({ ...prev, title: fileName || prev.title, content: inline }));
-                  setActiveTab('editor');
+                  upsertOutputDoc(fileName, inline);
                 } else if (resolvedUrl) {
                   fetch(resolvedUrl, {
-                    headers: ((resolvedUrl.startsWith(apiBaseUrl) || resolvedUrl.startsWith(agentApiUrl)) || resolvedUrl.startsWith(agentApiUrl)) ? buildAuthHeaders() : undefined,
+                    headers: ((resolvedUrl.startsWith(apiBaseUrl) || resolvedUrl.startsWith(agentApiUrl))) ? buildAuthHeaders() : undefined,
                   })
                     .then(r => (r.ok ? r.text() : ''))
                     .then(md => {
                       if (md) {
-                        setDocumentState(prev => ({ ...prev, title: fileName || prev.title, content: md }));
-                        setActiveTab('editor');
+                        upsertOutputDoc(fileName, md);
                       } else if (currentTaskId) {
                         const fileApi = `${agentApiUrl}/agent/sessions/${currentTaskId}/files/content?name=${encodeURIComponent(fileName)}`;
                         fetch(fileApi, { headers: buildAuthHeaders() })
                           .then(r => r.ok ? r.json() : null)
                           .then(payload => {
                             const text = typeof payload?.content === 'string' ? payload.content : '';
-                            if (text) {
-                              setDocumentState(prev => ({ ...prev, title: fileName || prev.title, content: text }));
-                              setActiveTab('editor');
-                            }
+                            if (text) upsertOutputDoc(fileName, text);
                           })
                           .catch(() => { });
                       }
                     })
                     .catch(() => { });
                 } else {
-                  if (!currentTaskId) {
-                    setDocumentState(prev => ({ ...prev, title: fileName || prev.title, content: prev.content }));
-                    setActiveTab('editor');
-                    continue;
-                  }
+                  if (!currentTaskId) { continue; }
                   const fileApi = `${agentApiUrl}/agent/sessions/${currentTaskId}/files/content?name=${encodeURIComponent(fileName)}`;
                   fetch(fileApi, { headers: buildAuthHeaders() })
                     .then(r => r.ok ? r.json() : null)
                     .then(payload => {
                       const text = typeof payload?.content === 'string' ? payload.content : '';
-                      if (text) {
-                        setDocumentState(prev => ({ ...prev, title: fileName || prev.title, content: text }));
-                        setActiveTab('editor');
-                      } else {
-                        setDocumentState(prev => ({ ...prev, title: fileName || prev.title, content: prev.content }));
-                        setActiveTab('editor');
-                      }
+                      upsertOutputDoc(fileName, text);
                     })
-                    .catch(() => {
-                      setDocumentState(prev => ({ ...prev, title: fileName || prev.title, content: prev.content }));
-                      setActiveTab('editor');
-                    });
+                    .catch(() => { });
                 }
               }
             } else if (event.type === 'done') {
@@ -1658,8 +1872,12 @@ function ChatView({
     settings.tts_enabled,
     currentTaskId,
     updateBlocks,
+    upsertOutputDoc,
     initAudio,
     speak,
+    agentApiUrl,
+    settings.selectedModelId,
+    settings.parallel_thinking,
     resolveFileUrl,
     buildContextResources,
     taskId,
@@ -1676,26 +1894,53 @@ function ChatView({
     resetTranscript();
   }, [finalTranscript, settings.voice_send_mode, isStreaming, resetTranscript, handleSend]);
 
+  const selectedModel = appConfig.agent.models.find(m => m.id === settings.selectedModelId)
+    ?? appConfig.agent.models[0];
+  const modelDisplayName = selectedModel.model.split('/').pop() ?? selectedModel.model;
+
   return (
     <div className={clsx(
       "flex flex-col bg-white overflow-hidden",
-      embedded ? "h-full" : "-m-8 h-screen"
+      embedded ? "h-full" : "h-full"
     )}>
-      {/* Top bar */}
-      <div className="h-12 border-b border-gray-200 bg-white flex items-center px-4 gap-3 shrink-0 z-10">
-        <button onClick={onBack} className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-800 transition-colors px-2 py-1 rounded-lg hover:bg-gray-100">
-          <ArrowLeft className="w-3.5 h-3.5" /> All tasks
+      {/* Top bar — sticky, matches SessionList header height/style */}
+      <div className="bg-white border-b border-gray-200 px-6 py-4 flex items-center gap-4 shrink-0 sticky top-0 z-20 shadow-sm">
+        <button
+          onClick={onBack}
+          className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-800 transition-colors px-2 py-1.5 rounded-lg hover:bg-gray-100"
+        >
+          <ArrowLeft className="w-4 h-4" /> All tasks
         </button>
-        <div className="w-px h-4 bg-gray-200" />
-        {isHistory
-          ? <><History className="w-4 h-4 text-amber-500" /><span className="font-semibold text-gray-800 text-sm">Session History</span></>
-          : <><Sparkles className="w-4 h-4 text-indigo-500" /><span className="font-semibold text-gray-800 text-sm">Agent Chat</span></>
-        }
+        <div className="w-px h-5 bg-gray-200" />
+        <div className="flex items-center gap-2">
+          {isHistory
+            ? <><History className="w-5 h-5 text-amber-500" /><span className="font-bold text-gray-900 text-base">Session History</span></>
+            : <><Sparkles className="w-5 h-5 text-indigo-500" /><span className="font-bold text-gray-900 text-base">Agent Chat</span></>
+          }
+        </div>
         {!isHistory && (
-          <div className="flex gap-1.5 ml-1">
-            <span className="px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 text-xs font-medium">qwen3.5-9b</span>
-            <span className="px-2 py-0.5 rounded-full bg-green-100 text-green-700 text-xs font-medium capitalize">{settings.tool_strategy}</span>
+          <div className="flex gap-2 ml-1">
+            <span className="px-2.5 py-1 rounded-full bg-indigo-100 text-indigo-700 text-xs font-semibold"
+              title={selectedModel.name}>
+              {modelDisplayName}
+            </span>
+            <span className="px-2.5 py-1 rounded-full bg-green-100 text-green-700 text-xs font-semibold capitalize">
+              {settings.tool_strategy}
+            </span>
+            {settings.parallel_thinking && (
+              <span className="px-2.5 py-1 rounded-full bg-purple-100 text-purple-700 text-xs font-semibold">
+                parallel
+              </span>
+            )}
+            {detectedContextK !== null && detectedContextK > 0 && (
+              <span className="px-2.5 py-1 rounded-full bg-amber-100 text-amber-700 text-xs font-semibold" title="Detected model context window">
+                {detectedContextK}K ctx
+              </span>
+            )}
           </div>
+        )}
+        {isStreaming && streamStatus && (
+          <span className="ml-auto text-xs text-indigo-500 font-medium animate-pulse">{streamStatus}</span>
         )}
       </div>
 
@@ -1733,7 +1978,7 @@ function ChatView({
                       ? <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
                       : (
                         <>
-                          <AssistantMessage blocks={msg.blocks ?? [{ type: 'text', content: msg.content }]} />
+                          <AssistantMessage blocks={msg.blocks ?? [{ type: 'text', content: msg.content }]} taskId={currentTaskId || taskId} agentApiUrl={agentApiUrl} />
                           <div className="mt-2 flex items-center gap-1.5">
                             <button
                               type="button"
@@ -1804,60 +2049,151 @@ function ChatView({
           <div className="bg-white border-t border-gray-200 shrink-0">
             <ChatComposerShell
               modes={[
-                { key: 'text', icon: <Type size={15} />, label: 'Text', active: !isVoiceMode, onClick: () => setIsVoiceMode(false) },
-                { key: 'voice', icon: <Mic size={15} />, label: 'Voice', active: isVoiceMode, onClick: () => { setIsVoiceMode(true); requestPermission(); } },
+                { key: 'text', icon: <Type size={15} />, label: 'Text', active: !isVoiceMode, onClick: () => { setIsVoiceMode(false); if (isContinuousRecording) { stopRecording(); setIsContinuousRecording(false); } } },
               ]}
-              onSend={() => { if (!isVoiceMode) void handleSend(); }}
+              onSend={() => void handleSend()}
               onStop={handleStop}
               isStreaming={isStreaming}
-              sendDisabled={isVoiceMode || !input.trim() || isStreaming}
+              sendDisabled={!input.trim() || isStreaming}
               rightSlot={(
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  className="p-2 text-gray-400 hover:text-gray-600 rounded-full hover:bg-gray-100 transition-colors"
-                  title="Attach files"
-                >
-                  <Paperclip className="w-4 h-4" />
-                </button>
+                <div className="flex items-center gap-1 relative">
+                  {/* Attach button with dropdown */}
+                  <div className="relative" ref={attachMenuRef}>
+                    <button
+                      type="button"
+                      onClick={() => setShowAttachMenu(prev => !prev)}
+                      className="p-2 text-gray-400 hover:text-gray-600 rounded-full hover:bg-gray-100 transition-colors"
+                      title="Attach"
+                    >
+                      <Paperclip className="w-4 h-4" />
+                    </button>
+                    {showAttachMenu && (
+                      <div className="absolute bottom-full right-0 mb-1 bg-white border border-gray-200 rounded-xl shadow-lg py-1 min-w-[150px] z-30">
+                        <button
+                          type="button"
+                          onClick={() => { fileInputRef.current?.click(); setShowAttachMenu(false); }}
+                          className="w-full flex items-center gap-2 px-3 py-2 text-xs text-gray-700 hover:bg-gray-50"
+                        >
+                          <FileText className="w-3.5 h-3.5 text-indigo-500" /> Attach file
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => { handleAttachResource(); setActiveTab('sources'); setShowAttachMenu(false); }}
+                          className="w-full flex items-center gap-2 px-3 py-2 text-xs text-gray-700 hover:bg-gray-50"
+                        >
+                          <Link2 className="w-3.5 h-3.5 text-sky-500" /> Attach link
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  {/* Mic toggle */}
+                  <button
+                    type="button"
+                    onClick={() => { const next = !isVoiceMode; setIsVoiceMode(next); if (next) requestPermission(); else if (isContinuousRecording) { stopRecording(); setIsContinuousRecording(false); } }}
+                    className={clsx(
+                      "p-2 rounded-full transition-colors",
+                      isVoiceMode ? "bg-indigo-100 text-indigo-600 hover:bg-indigo-200" : "text-gray-400 hover:text-gray-600 hover:bg-gray-100"
+                    )}
+                    title={isVoiceMode ? 'Hide voice controls' : 'Show voice controls'}
+                  >
+                    {isVoiceMode ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+                  </button>
+                </div>
               )}
             >
               <input type="file" ref={fileInputRef} className="hidden" onChange={handleFileChange} multiple />
-              {isVoiceMode ? (
-                <button
-                  type="button"
-                  className={clsx(
-                    "w-full min-h-[84px] rounded-xl border text-sm font-medium transition-colors",
-                    isRecording ? "bg-gray-200 border-gray-300 text-gray-800" :
-                      isProcessing ? "bg-gray-100 border-gray-200 text-gray-400 cursor-wait" :
-                        "bg-white border-gray-200 hover:bg-gray-50 text-gray-700"
-                  )}
-                  onMouseDown={e => { e.preventDefault(); if (settings.tts_enabled) initAudio(); if (!isProcessing) startRecording(); }}
-                  onMouseUp={e => { e.preventDefault(); stopRecording(); }}
-                  onMouseLeave={e => { e.preventDefault(); if (isRecording) stopRecording(); }}
-                  onTouchStart={e => { e.preventDefault(); if (settings.tts_enabled) initAudio(); if (!isProcessing) startRecording(); }}
-                  onTouchEnd={e => { e.preventDefault(); stopRecording(); }}
-                  disabled={isStreaming}
-                >
-                  {isProcessing ? (
-                    <span className="inline-flex items-center gap-2">
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      {statusMessage || (isReady ? 'Processing...' : 'Loading Model...')}
-                    </span>
-                  ) : isRecording ? 'Release to Send' : 'Hold to Talk'}
-                </button>
-              ) : (
-                <textarea
-                  value={input}
-                  onChange={e => setInput(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); void handleSend(); } }}
-                  placeholder={uiConfig.inputPlaceholder}
-                  className="w-full min-h-[84px] max-h-[220px] bg-white border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-200 focus:border-blue-300 resize-y p-3 text-sm text-gray-800"
-                />
+              {/* Text input always visible */}
+              <textarea
+                value={input}
+                onChange={e => setInput(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); void handleSend(); } }}
+                placeholder={uiConfig.inputPlaceholder}
+                className="w-full min-h-[84px] max-h-[220px] bg-white border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-200 focus:border-blue-300 resize-y p-3 text-sm text-gray-800"
+              />
+              {/* Voice control bar — shown when isVoiceMode */}
+              {isVoiceMode && (
+                <div className="mt-2 flex items-center gap-2 px-1">
+                  {/* Hold-to-talk */}
+                  <button
+                    type="button"
+                    className={clsx(
+                      "flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-medium transition-colors select-none shrink-0",
+                      isRecording && !isContinuousRecording
+                        ? "bg-red-50 border-red-300 text-red-600"
+                        : isProcessing
+                          ? "bg-gray-100 border-gray-200 text-gray-400 cursor-wait"
+                          : "bg-white border-gray-300 text-gray-600 hover:border-indigo-300 hover:text-indigo-600"
+                    )}
+                    onMouseDown={e => { e.preventDefault(); if (!isContinuousRecording && !isProcessing) { setAutoRestart(true); if (settings.tts_enabled) initAudio(); startRecording(); } }}
+                    onMouseUp={e => { e.preventDefault(); if (!isContinuousRecording) { setAutoRestart(false); stopRecording(); } }}
+                    onMouseLeave={e => { e.preventDefault(); if (!isContinuousRecording) { setAutoRestart(false); stopRecording(); } }}
+                    onTouchStart={e => { e.preventDefault(); if (!isContinuousRecording && !isProcessing) { setAutoRestart(true); if (settings.tts_enabled) initAudio(); startRecording(); } }}
+                    onTouchEnd={e => { e.preventDefault(); if (!isContinuousRecording) { setAutoRestart(false); stopRecording(); } }}
+                    disabled={isStreaming || isContinuousRecording}
+                  >
+                    <Mic className="w-3.5 h-3.5 shrink-0" />
+                    {isProcessing && !isContinuousRecording
+                      ? (isReady ? 'Processing…' : 'Loading…')
+                      : isRecording && !isContinuousRecording
+                        ? 'Release'
+                        : 'Hold'}
+                  </button>
+
+                  {/* Wave animation */}
+                  <div className="flex-1 flex items-center justify-center gap-0.5 h-8">
+                    {Array.from({ length: 20 }).map((_, i) => {
+                      const active = isRecording;
+                      // micVolume=0 for native ASR; use a static sine pattern so bars look alive
+                      const vol = micVolume > 0 ? micVolume : (active ? 0.25 : 0);
+                      const height = active
+                        ? Math.max(3, Math.round(vol * 28 * (0.35 + 0.65 * Math.abs(Math.sin(i * 0.75)))))
+                        : 3;
+                      return (
+                        <div
+                          key={i}
+                          className={clsx(
+                            "w-0.5 rounded-full",
+                            active ? "bg-indigo-500" : "bg-gray-200",
+                            active && micVolume === 0 ? "animate-pulse" : "transition-all duration-75"
+                          )}
+                          style={{ height: `${height}px` }}
+                        />
+                      );
+                    })}
+                  </div>
+
+                  {/* Continuous record toggle */}
+                  <button
+                    type="button"
+                    className={clsx(
+                      "flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-medium transition-colors shrink-0",
+                      isContinuousRecording
+                        ? "bg-red-500 border-red-500 text-white hover:bg-red-600"
+                        : "bg-white border-gray-300 text-gray-600 hover:border-red-300 hover:text-red-500"
+                    )}
+                    onClick={() => {
+                      if (isContinuousRecording) {
+                        stopRecording();
+                        setIsContinuousRecording(false);
+                      } else {
+                        if (settings.tts_enabled) initAudio();
+                        startRecording();
+                        setIsContinuousRecording(true);
+                      }
+                    }}
+                    disabled={isStreaming || (isRecording && !isContinuousRecording)}
+                  >
+                    {isContinuousRecording
+                      ? <><Square className="w-3 h-3 shrink-0" /> Stop</>
+                      : <><div className="w-3 h-3 rounded-full bg-red-500 shrink-0" /> Rec</>
+                    }
+                  </button>
+                </div>
               )}
-              {(voiceError || transcript || ttsStatus) && (
+              {/* Status / interim transcript */}
+              {(voiceError || (isVoiceMode && (transcript || statusMessage)) || ttsStatus) && (
                 <div className="mt-1 px-1 text-[10px] text-gray-500 truncate">
-                  {voiceError || transcript || ttsStatus}
+                  {voiceError || (isVoiceMode && (transcript || statusMessage)) || ttsStatus}
                 </div>
               )}
             </ChatComposerShell>
@@ -1892,21 +2228,51 @@ function ChatView({
 
         {/* Document / Sources pane */}
         <div className="flex flex-col bg-white overflow-hidden flex-1">
-          {/* Tabs */}
+          {/* Tabs — Sources first, Editor second */}
           <div className="flex border-b border-gray-200 text-sm shrink-0">
-            {(['editor', 'sources'] as const).map(tab => (
+            {(['sources', 'editor'] as const).map(tab => (
               <button key={tab} onClick={() => setActiveTab(tab)}
                 className={clsx(
-                  "flex-1 py-3 flex items-center justify-center gap-1.5 border-b-2 transition-colors text-xs font-medium",
+                  "flex-1 py-3 flex items-center justify-center gap-1.5 border-b-2 transition-colors text-xs font-medium relative",
                   activeTab === tab ? "border-indigo-600 text-indigo-700 bg-indigo-50/30" : "border-transparent text-gray-500 hover:text-gray-700 hover:bg-gray-50"
                 )}>
-                {tab === 'editor' ? <><FileText className="w-3.5 h-3.5" /> Output Document</> : <><Search className="w-3.5 h-3.5" /> Sources & Tools</>}
+                {tab === 'sources'
+                  ? <><Search className="w-3.5 h-3.5" /> Sources & Tools
+                    {sourcesTabPulse && activeTab !== 'sources' && (
+                      <span className="absolute top-1.5 right-3 w-2 h-2 rounded-full bg-indigo-500 animate-ping" />
+                    )}
+                  </>
+                  : <><FileText className="w-3.5 h-3.5" /> Output Document</>
+                }
               </button>
             ))}
           </div>
 
           {activeTab === 'editor' ? (
             <div className="flex-1 flex flex-col overflow-hidden">
+              {/* File browser — shown when session has multiple output docs */}
+              {outputDocs.length > 1 && (
+                <div className="flex items-center gap-1 px-3 py-1.5 border-b border-gray-100 bg-gray-50 overflow-x-auto shrink-0">
+                  {outputDocs.map(doc => (
+                    <button
+                      key={doc.name}
+                      onClick={() => {
+                        setSelectedDocName(doc.name);
+                        setDocumentState(prev => ({ ...prev, title: doc.name, content: doc.content }));
+                      }}
+                      className={clsx(
+                        "flex items-center gap-1 px-2.5 py-1 rounded-md text-xs whitespace-nowrap shrink-0 transition-colors",
+                        selectedDocName === doc.name
+                          ? "bg-indigo-600 text-white"
+                          : "bg-white border border-gray-200 text-gray-600 hover:border-indigo-300 hover:text-indigo-600"
+                      )}
+                    >
+                      <FileText className="w-3 h-3 shrink-0" />
+                      {doc.name}
+                    </button>
+                  ))}
+                </div>
+              )}
               {/* Toolbar */}
               <div className="px-4 py-2 border-b border-gray-100 flex items-center gap-2 bg-white shrink-0">
                 <input value={documentState.title}

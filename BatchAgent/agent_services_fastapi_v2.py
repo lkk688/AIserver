@@ -8,7 +8,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 import httpx
 
 from BatchAgent.agent_main_v2 import AgentConfig, UniversalAgent, check_api_and_context
-from BatchAgent.mini_batch_agent_libs import ensure_dirs, now_stamp
+from BatchAgent.mini_batch_agent_libs import ensure_dirs
 from BatchAgent.prompt_registry_v2 import PromptRegistry
 from BatchAgent.tools.tools_registry import compile_tools_for_provider, get_base_tools
 from BatchAgent.tools.tool_registry_runtime import configure_global_tool_registry
@@ -58,6 +58,10 @@ class AgentService:
         enable_bash: bool = True,
         enable_parallel: bool = False,
         enable_meta: bool = True,
+        # Reranker (TEI /v1/rerank compatible)
+        reranker_base_url: str = "",
+        reranker_api_key: str = "",
+        reranker_model: str = "",
     ) -> None:
         self.base_url = base_url
         self.api_key = api_key
@@ -95,6 +99,9 @@ class AgentService:
         self.enable_bash = enable_bash
         self.enable_parallel = enable_parallel
         self.enable_meta = enable_meta
+        self.reranker_base_url = reranker_base_url
+        self.reranker_api_key = reranker_api_key
+        self.reranker_model = reranker_model
 
     def _build_client(self) -> Any:
         if self.provider == "anthropic":
@@ -134,25 +141,35 @@ class AgentService:
         start_turn_index: int = 0,
     ) -> Tuple[bool, Path, Path, str]:
         allowlist = allowlist or []
+        # workspace_dir IS the session folder: {user_root}/.agent/sessions/{timestamp}_{task_id}/
+        # The agent's CWD, output files, and turn logs all live here.
         workspace_dir = Path(continue_workspace_dir or self.output_dir).resolve()
         workspace_dir.mkdir(parents=True, exist_ok=True)
 
-        agent_dir = (workspace_dir / ".agent").resolve()
+        # agent_dir is shared at the user root level: {user_root}/.agent/
+        # Path structure: workspace_dir -> sessions/{ts_id}/ -> .agent/ -> user_root/
+        agent_dir = workspace_dir.parent.parent
         ensure_dirs(agent_dir)
-        # Put sessions inside .agent/sessions/ so the timestamp folder does NOT
-        # appear in the workspace root where the agent writes its output files.
-        # If the agent sees "2026-03-21_234500/" in its working directory it gets
-        # confused, reads into it, and writes the output file there instead of "./"
-        sessions_root = agent_dir / "sessions"
-        sessions_root.mkdir(parents=True, exist_ok=True)
-        session_dir = (
-            Path(continue_session_dir).resolve()
-            if continue_session_dir
-            else (sessions_root / now_stamp())
-        )
-        session_dir.mkdir(parents=True, exist_ok=True)
+
+        # session_dir == workspace_dir: one session folder = one chat session
+        session_dir = workspace_dir
 
         client = self._build_client()
+
+        # Pre-flight connectivity check — raises before launching the agent so
+        # callers can emit a clean error SSE instead of looping on LLM failures.
+        if self.provider != "anthropic":
+            try:
+                if hasattr(client, "models"):
+                    await client.models.list()
+                else:
+                    await client.chat.completions.create(
+                        model=self.model,
+                        messages=[{"role": "user", "content": "ping"}],
+                        max_tokens=1,
+                    )
+            except Exception as e:
+                raise ConnectionError(f"Cannot connect to LLM API: {e}") from e
 
         # Auto-detect the model's actual context window unless the caller
         # pinned it explicitly.  max_output scales proportionally (ctx/4).
@@ -201,6 +218,12 @@ class AgentService:
             current_time=self.current_time,
         )
 
+        # Shared document cache lives at the user-root level: {user_root}/.cache/documents
+        # Structure: workspace_dir = {user_root}/.agent/sessions/{ts_id}/
+        # so user_root = workspace_dir.parent.parent.parent
+        user_root = workspace_dir.parent.parent.parent
+        document_cache_dir = str(user_root / ".cache" / "documents")
+
         config = AgentConfig(
             client=client,
             model=self.model,
@@ -229,9 +252,13 @@ class AgentService:
             ocr_server=self.ocr_server,
             ocr_model=self.ocr_model,
             ocr_workspace=self.ocr_workspace,
+            document_cache_dir=document_cache_dir,
             embedding_base_url=self.embedding_base_url,
             embedding_api_key=self.embedding_api_key,
             embedding_model=self.embedding_model,
+            reranker_base_url=self.reranker_base_url,
+            reranker_api_key=self.reranker_api_key,
+            reranker_model=self.reranker_model,
         )
 
         agent = UniversalAgent(config=config, system_message=system_prompt, tools=compiled_tools)
@@ -289,13 +316,20 @@ class AgentService:
         resume_rl_trajectory: Optional[List[Dict[str, str]]] = None,
         start_turn_index: int = 0,
     ) -> Tuple[bool, Path, Path, str]:
-        return await self._run_internal(
-            goal=goal,
-            allowlist=allowlist,
-            on_event=on_event,
-            continue_session_dir=continue_session_dir,
-            continue_workspace_dir=continue_workspace_dir,
-            resume_messages=resume_messages,
-            resume_rl_trajectory=resume_rl_trajectory,
-            start_turn_index=start_turn_index,
-        )
+        try:
+            return await self._run_internal(
+                goal=goal,
+                allowlist=allowlist,
+                on_event=on_event,
+                continue_session_dir=continue_session_dir,
+                continue_workspace_dir=continue_workspace_dir,
+                resume_messages=resume_messages,
+                resume_rl_trajectory=resume_rl_trajectory,
+                start_turn_index=start_turn_index,
+            )
+        except ConnectionError as e:
+            await on_event({"type": "error", "detail": str(e)})
+            # Return a failure tuple so producer sends a clean done event
+            # instead of a traceback-filled error SSE.
+            workspace_dir = Path(continue_workspace_dir or self.output_dir).resolve()
+            return False, workspace_dir, workspace_dir, str(e)

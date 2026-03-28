@@ -254,14 +254,21 @@ class ToolRouter:
             or datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         )
 
+        cfg = self.ctx.config
         return perform_domain_aware_search(
             query=query,
             category=category,
-            serper_api_key=getattr(self.ctx.config, "serper_api_key", ""),
+            serper_api_key=getattr(cfg, "serper_api_key", ""),
             current_time=configured_time,
-            enable_youtube=getattr(self.ctx.config, "enable_youtube", False),
-            tavily_api_key=getattr(self.ctx.config, "tavily_api_key", ""),
+            enable_youtube=getattr(cfg, "enable_youtube", False),
+            tavily_api_key=getattr(cfg, "tavily_api_key", ""),
             document_search_fn=self._document_search_proxy,
+            embedding_base_url=getattr(cfg, "embedding_base_url", ""),
+            embedding_api_key=getattr(cfg, "embedding_api_key", ""),
+            embedding_model=getattr(cfg, "embedding_model", ""),
+            reranker_base_url=getattr(cfg, "reranker_base_url", ""),
+            reranker_api_key=getattr(cfg, "reranker_api_key", ""),
+            reranker_model=getattr(cfg, "reranker_model", ""),
         )
 
     def _document_search_proxy(self, query: str, top_k: int) -> str:

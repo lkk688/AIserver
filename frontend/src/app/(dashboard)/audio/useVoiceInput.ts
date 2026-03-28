@@ -24,6 +24,8 @@ export function useVoiceInput(language: 'zh' | 'en' = 'en') {
     const audioBufferRef = useRef<Float32Array[]>([]);
     const startTimeRef = useRef<number>(0);
     const ignoreResultsRef = useRef<boolean>(false);
+    // When true, recognition restarts automatically after silence ends (for hold-to-talk)
+    const autoRestartRef = useRef<boolean>(false);
 
     // Debug: Log language changes
     useEffect(() => {
@@ -154,6 +156,25 @@ export function useVoiceInput(language: 'zh' | 'en' = 'en') {
                 console.log("[ASR] Native Recognition Ended");
                 setIsRecording(false);
                 recognitionRef.current = null;
+                // Auto-restart for hold-to-talk: browser stops after silence, we restart seamlessly
+                if (autoRestartRef.current) {
+                    setTimeout(() => {
+                        if (autoRestartRef.current) {
+                            const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+                            if (!SR) return;
+                            const r2 = new SR();
+                            r2.continuous = true;
+                            r2.interimResults = true;
+                            r2.lang = language === 'zh' ? 'zh-CN' : 'en-US';
+                            r2.onresult = recognition.onresult;
+                            r2.onerror = recognition.onerror;
+                            r2.onend = recognition.onend;
+                            recognitionRef.current = r2;
+                            r2.start();
+                            setIsRecording(true);
+                        }
+                    }, 80);
+                }
             };
 
             recognitionRef.current = recognition;
@@ -305,6 +326,7 @@ export function useVoiceInput(language: 'zh' | 'en' = 'en') {
         stopRecording,
         resetTranscript,
         requestPermission, // Exported
+        setAutoRestart: (val: boolean) => { autoRestartRef.current = val; },
         mode: asrType as any,
         setMode: (mode: any) => setAsrType(mode)
     };

@@ -83,23 +83,31 @@ export default function RootLayout({
 }: {
   children: React.ReactNode;
 }) {
+  const pathname = usePathname();
   return (
-    <div className="min-h-screen bg-gray-50 flex font-sans">
+    <div className="h-screen bg-gray-50 flex font-sans overflow-hidden">
       <Sidebar />
-      <div className="flex-1 ml-64 min-w-0 flex flex-col">
-        <main className="flex-1 p-8 overflow-y-auto overflow-x-hidden min-w-0">
+      <div className="flex-1 ml-64 min-w-0 flex flex-col min-h-0">
+        <main className={clsx(
+          "flex-1 min-w-0 min-h-0",
+          pathname.startsWith('/chat')
+            ? "overflow-hidden"
+            : "p-8 overflow-y-auto overflow-x-hidden"
+        )}>
           {children}
         </main>
-        <footer className="px-8 py-4 text-xs text-gray-400 border-t flex justify-between">
-          <span>© 2025 AI-OCR Pro. All rights reserved.</span>
-          <div className="flex items-center gap-2">
-            <span>User</span>
-            <div className="w-8 h-4 bg-gray-300 rounded-full relative cursor-pointer">
-              <div className="w-4 h-4 bg-white rounded-full shadow-sm absolute left-0"></div>
+        {!pathname.startsWith('/chat') && (
+          <footer className="px-8 py-4 text-xs text-gray-400 border-t flex justify-between">
+            <span>© 2025 AI-OCR Pro. All rights reserved.</span>
+            <div className="flex items-center gap-2">
+              <span>User</span>
+              <div className="w-8 h-4 bg-gray-300 rounded-full relative cursor-pointer">
+                <div className="w-4 h-4 bg-white rounded-full shadow-sm absolute left-0"></div>
+              </div>
+              <span>Admin</span>
             </div>
-            <span>Admin</span>
-          </div>
-        </footer>
+          </footer>
+        )}
       </div>
     </div>
   );

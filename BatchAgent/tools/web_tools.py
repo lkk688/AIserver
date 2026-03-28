@@ -39,6 +39,12 @@ _service: Optional[OnlineSearchService] = None
 def _get_service(
     serper_api_key: str = "",
     tavily_api_key: str = "",
+    embedding_base_url: str = "",
+    embedding_api_key: str = "",
+    embedding_model: str = "",
+    reranker_base_url: str = "",
+    reranker_api_key: str = "",
+    reranker_model: str = "",
 ) -> OnlineSearchService:
     """Return (or create) the shared OnlineSearchService.
 
@@ -49,11 +55,26 @@ def _get_service(
     global _service
     if _service is None:
         cfg = SearchConfig()
-        # Supplement env-var values with caller-supplied keys if missing
+        # Search API keys
         if serper_api_key and not cfg.api_keys.serper_api_key:
             cfg.api_keys.serper_api_key = serper_api_key
         if tavily_api_key and not cfg.api_keys.tavily_api_key:
             cfg.api_keys.tavily_api_key = tavily_api_key
+        # Embedding service
+        if embedding_base_url:
+            cfg.embedding.enabled = True
+            cfg.embedding.api_url = embedding_base_url
+        if embedding_api_key:
+            cfg.embedding.api_key = embedding_api_key
+        if embedding_model:
+            cfg.embedding.api_model = embedding_model
+        # Reranker service
+        if reranker_base_url and reranker_model:
+            cfg.rerank.enabled = True
+            cfg.rerank.provider = "api"
+            cfg.rerank.api_url = reranker_base_url
+            cfg.rerank.api_key = reranker_api_key or None
+            cfg.rerank.api_model = reranker_model
         _service = create_online_search_service(cfg)
     return _service
 
@@ -448,6 +469,12 @@ def perform_domain_aware_search(
     enable_youtube: bool = False,
     tavily_api_key: str = "",
     document_search_fn: Optional[Callable[[str, int], str]] = None,
+    embedding_base_url: str = "",
+    embedding_api_key: str = "",
+    embedding_model: str = "",
+    reranker_base_url: str = "",
+    reranker_api_key: str = "",
+    reranker_model: str = "",
 ) -> str:
     """Aggregated domain-aware web search.  Returns a formatted markdown string.
 
@@ -467,6 +494,12 @@ def perform_domain_aware_search(
     service = _get_service(
         serper_api_key=serper_api_key,
         tavily_api_key=tavily_api_key,
+        embedding_base_url=embedding_base_url,
+        embedding_api_key=embedding_api_key,
+        embedding_model=embedding_model,
+        reranker_base_url=reranker_base_url,
+        reranker_api_key=reranker_api_key,
+        reranker_model=reranker_model,
     )
     domain = _resolve_domain(category)
 
