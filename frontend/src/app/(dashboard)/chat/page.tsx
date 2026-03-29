@@ -688,10 +688,12 @@ const DOMAINS = ['general', 'software_eng', 'science', 'finance', 'medical', 'le
 function SettingsPanel({
   settings,
   onChange,
+  modelConnected,
   audio,
 }: {
   settings: AgentSettings;
   onChange: (s: AgentSettings) => void;
+  modelConnected: boolean | null;
   audio: {
     asrType: 'native' | 'webgpu' | 'none';
     setAsrType: (mode: 'native' | 'webgpu' | 'none') => void;
@@ -745,11 +747,15 @@ function SettingsPanel({
                   >
                     <span className={clsx(
                       "w-1.5 h-1.5 rounded-full shrink-0",
-                      hasKey ? "bg-green-400" : "bg-gray-300"
+                      !hasKey ? "bg-gray-300"
+                      : isSelected && modelConnected === false ? "bg-red-400"
+                      : isSelected && modelConnected === null ? "bg-yellow-400 animate-pulse"
+                      : "bg-green-400"
                     )} />
                     <span className="flex-1 truncate">{m.name}</span>
                     {!hasKey && <span className="text-[10px] text-gray-400 shrink-0">no key</span>}
-                    {isSelected && hasKey && <span className="text-[10px] text-indigo-500 shrink-0">✓</span>}
+                    {isSelected && modelConnected === false && <span className="text-[10px] text-red-400 shrink-0">offline</span>}
+                    {isSelected && hasKey && modelConnected !== false && <span className="text-[10px] text-indigo-500 shrink-0">✓</span>}
                   </button>
                 );
               })}
@@ -1219,15 +1225,18 @@ function ChatView({
     }
   }, []);
 
-  // Probe LLM context window whenever the selected model changes
+  const [modelConnected, setModelConnected] = useState<boolean | null>(null);
+
+  // Probe LLM context window + connectivity whenever the selected model changes
   useEffect(() => {
     const modelCfg = appConfig.agent.models.find(m => m.id === settings.selectedModelId)
       ?? appConfig.agent.models[0];
     if (modelCfg.provider === 'anthropic') {
       setDetectedContextK(200);
+      setModelConnected(true);
       return;
     }
-    if (!modelCfg.baseUrl) return;
+    if (!modelCfg.baseUrl) { setModelConnected(false); return; }
     const params = new URLSearchParams({
       base_url: modelCfg.baseUrl,
       api_key: modelCfg.apiKey || 'EMPTY',
@@ -1235,12 +1244,17 @@ function ChatView({
       provider: modelCfg.provider,
     });
     setDetectedContextK(null);
+    setModelConnected(null);
     fetch(`${agentApiUrl}/agent/model/context?${params}`)
-      .then(r => r.ok ? r.json() : null)
+      .then(r => {
+        if (!r.ok) { setModelConnected(false); return null; }
+        setModelConnected(true);
+        return r.json();
+      })
       .then((data: { context_length: number } | null) => {
         if (data?.context_length) setDetectedContextK(Math.round(data.context_length / 1024));
       })
-      .catch(() => setDetectedContextK(null));
+      .catch(() => { setModelConnected(false); setDetectedContextK(null); });
   }, [settings.selectedModelId, agentApiUrl]);
 
   useEffect(() => {
@@ -1919,23 +1933,34 @@ function ChatView({
           }
         </div>
         {!isHistory && (
-          <div className="flex gap-2 ml-1">
-            <span className="px-2.5 py-1 rounded-full bg-indigo-100 text-indigo-700 text-xs font-semibold"
-              title={selectedModel.name}>
-              {modelDisplayName}
-            </span>
-            <span className="px-2.5 py-1 rounded-full bg-green-100 text-green-700 text-xs font-semibold capitalize">
-              {settings.tool_strategy}
-            </span>
-            {settings.parallel_thinking && (
-              <span className="px-2.5 py-1 rounded-full bg-purple-100 text-purple-700 text-xs font-semibold">
-                parallel
+          <div className="flex gap-2 ml-1 items-center">
+            {modelConnected === false ? (
+              <span className="flex items-center gap-1 px-2.5 py-1 rounded-full bg-gray-100 text-gray-400 text-xs font-semibold">
+                <span className="w-1.5 h-1.5 rounded-full bg-gray-400" />
+                {modelDisplayName} · offline
               </span>
-            )}
-            {detectedContextK !== null && detectedContextK > 0 && (
-              <span className="px-2.5 py-1 rounded-full bg-amber-100 text-amber-700 text-xs font-semibold" title="Detected model context window">
-                {detectedContextK}K ctx
-              </span>
+            ) : (
+              <>
+                <span className="flex items-center gap-1 px-2.5 py-1 rounded-full bg-indigo-100 text-indigo-700 text-xs font-semibold" title={selectedModel.name}>
+                  {modelConnected === null
+                    ? <span className="w-1.5 h-1.5 rounded-full bg-yellow-400 animate-pulse" />
+                    : <span className="w-1.5 h-1.5 rounded-full bg-green-400" />}
+                  {modelDisplayName}
+                </span>
+                <span className="px-2.5 py-1 rounded-full bg-green-100 text-green-700 text-xs font-semibold capitalize">
+                  {settings.tool_strategy}
+                </span>
+                {settings.parallel_thinking && (
+                  <span className="px-2.5 py-1 rounded-full bg-purple-100 text-purple-700 text-xs font-semibold">
+                    parallel
+                  </span>
+                )}
+                {detectedContextK !== null && detectedContextK > 0 && (
+                  <span className="px-2.5 py-1 rounded-full bg-amber-100 text-amber-700 text-xs font-semibold" title="Detected model context window">
+                    {detectedContextK}K ctx
+                  </span>
+                )}
+              </>
             )}
           </div>
         )}
@@ -2200,6 +2225,7 @@ function ChatView({
             <SettingsPanel
               settings={settings}
               onChange={setSettings}
+              modelConnected={modelConnected}
               audio={{
                 asrType,
                 setAsrType,

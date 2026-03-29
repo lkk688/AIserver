@@ -108,8 +108,8 @@ export const config = {
 
   minio: {
     endpoint: process.env.NEXT_PUBLIC_MINIO_ENDPOINT || '100.83.246.7:9000',
-    accessKey: process.env.NEXT_PUBLIC_MINIO_ACCESS_KEY || 'minioadmin',
-    secretKey: process.env.NEXT_PUBLIC_MINIO_SECRET_KEY || 'minioadmin',
+    accessKey: process.env.NEXT_PUBLIC_MINIO_ACCESS_KEY || 'my_minio_admin',
+    secretKey: process.env.NEXT_PUBLIC_MINIO_SECRET_KEY || 'my_minio_secret',
     bucket: process.env.NEXT_PUBLIC_MINIO_BUCKET || 'aiagent',
   } satisfies MinioConfig,
 };

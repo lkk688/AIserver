@@ -9,10 +9,12 @@ from backend.app.util.hashing import compute_hash
 
 class LiteLLMEmbeddingProvider(EmbeddingProvider):
     def __init__(self, config: AppConfig):
-        self.api_base = "http://localhost:8005/v1" # Default, could be config
-        # Ideally config.embedding.provider could specify the URL or we derive it
-        # For now hardcode to our local service or use a specific env var
-        self.api_url = f"{self.api_base}/embeddings"
+        base_url = (
+            config.embedding.base_url
+            or os.environ.get("EMBEDDING_BASE_URL", "http://localhost:8005/v1")
+        ).rstrip("/")
+        self.api_url = f"{base_url}/embeddings"
+        self.api_key = config.embedding.api_key or os.environ.get("EMBEDDING_API_KEY", "")
         self.model_name = config.embedding.model_name
         self.dim = config.embedding.dim
         self.cache_dir = config.storage.data_dir / "cache" / "embeddings"
@@ -36,14 +38,12 @@ class LiteLLMEmbeddingProvider(EmbeddingProvider):
                 indices_to_fetch.append(i)
 
         if texts_to_fetch:
-            # Batch fetch from API
             try:
-                fetched_vectors = self._fetch_embeddings(texts_to_fetch)
+                fetched_vectors = self._fetch_embeddings_batched(texts_to_fetch)
                 for idx, vec in zip(indices_to_fetch, fetched_vectors):
                     vectors[idx] = vec
                     self._save_to_cache(texts[idx], vec)
             except Exception as e:
-                # If API fails, we might want to retry or raise
                 raise RuntimeError(f"Embedding API call failed: {e}")
 
         return vectors # type: ignore
@@ -69,21 +69,21 @@ class LiteLLMEmbeddingProvider(EmbeddingProvider):
         with open(path, "w") as f:
             json.dump(vector, f)
 
-    def _fetch_embeddings(self, texts: List[str]) -> List[List[float]]:
-        # Call the OpenAI compatible embedding endpoint
-        payload = {
-            "model": self.model_name,
-            "input": texts
-        }
-        
-        # We use a context manager for the client to ensure cleanup
-        # Note: synchronous for now as per interface, could be async in future
-        with httpx.Client(timeout=60.0) as client:
-            response = client.post(self.api_url, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            
-            # Sort by index to ensure order matches input
-            # OpenAI format: data: [{object: embedding, embedding: [...], index: 0}, ...]
-            results = sorted(data['data'], key=lambda x: x['index'])
-            return [item['embedding'] for item in results]
+    _BATCH_SIZE = 16  # max texts per embedding API request
+
+    def _fetch_embeddings_batched(self, texts: List[str]) -> List[List[float]]:
+        """Send texts to the embedding API in fixed-size batches."""
+        all_vectors: List[List[float]] = []
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        with httpx.Client(timeout=120.0) as client:
+            for i in range(0, len(texts), self._BATCH_SIZE):
+                batch = texts[i : i + self._BATCH_SIZE]
+                payload = {"model": self.model_name, "input": batch}
+                response = client.post(self.api_url, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+                results = sorted(data["data"], key=lambda x: x["index"])
+                all_vectors.extend(item["embedding"] for item in results)
+        return all_vectors

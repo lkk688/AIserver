@@ -1,7 +1,7 @@
 from enum import Enum
 from pathlib import Path
 from typing import Optional
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 class MetadataBackend(str, Enum):
     SQLITE = "sqlite"
@@ -49,6 +49,8 @@ class EmbeddingConfig(BaseModel):
     provider: str
     model_name: str
     dim: int = Field(gt=0)
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
 
 
 class TextProcessingConfig(BaseModel):
@@ -66,6 +68,16 @@ class TextProcessingConfig(BaseModel):
         return v
 
 
+class MinioConfig(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+
+    endpoint: str
+    bucket: str = "aiagent"
+    access_key: str = ""
+    secret_key: str = ""
+    secure: bool = False
+
+
 class AppConfig(BaseModel):
     metadata_backend: MetadataBackend
     lexical_backend: LexicalBackend
@@ -76,3 +88,4 @@ class AppConfig(BaseModel):
     web_fetch: WebFetchConfig
     embedding: EmbeddingConfig
     text_processing: TextProcessingConfig = TextProcessingConfig()
+    minio: Optional[MinioConfig] = None

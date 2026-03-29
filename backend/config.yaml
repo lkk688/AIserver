@@ -21,9 +21,11 @@ web_fetch:
   user_agent: "MyLocalSearch/0.1"
 
 embedding:
-  provider: "sentence-transformers"
-  model_name: "all-MiniLM-L6-v2"
-  dim: 384
+  provider: "openai-compatible"
+  base_url: "http://100.83.246.7:8002/v1"
+  api_key: "embeddingp100"
+  model_name: "Qwen/Qwen3-Embedding-0.6B"
+  dim: 1024
 
 text_processing:
   use_kenlm: true
@@ -37,5 +39,5 @@ minio:
   console_url: "http://100.83.246.7:9001"
   bucket: "aiagent"
   access_key: "my_minio_admin"
-  secret_key: "mypwd4minio"
+  secret_key: "my_minio_secret"
   secure: false

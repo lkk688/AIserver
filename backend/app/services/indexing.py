@@ -1,4 +1,6 @@
+import os
 import time
+from pathlib import Path
 from uuid import UUID
 from typing import List, Optional, Dict
 from backend.app.domain import models
@@ -308,6 +310,19 @@ class IndexingService:
 
             doc.status = "indexed"
             self.metadata.upsert_document(doc)
+
+            # Save extracted text to agent document cache so the agent can use it for RAG
+            if content.text:
+                try:
+                    doc_user_id = os.environ.get("DOC_USER_ID", "anonymous")
+                    workspace = Path(os.environ.get("AGENT_WORKSPACE", "./agent_workspace"))
+                    cache_dir = workspace / "users" / doc_user_id / ".cache" / "documents"
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    stem = Path(doc.title or str(doc.id)).stem
+                    cache_md = cache_dir / f"{stem}.md"
+                    cache_md.write_text(content.text, encoding="utf-8")
+                except Exception as cache_err:
+                    print(f"[DocCache] Failed to save extracted text: {cache_err}")
 
         except Exception as e:
             print(f"Indexing error for {doc.uri}: {e}")

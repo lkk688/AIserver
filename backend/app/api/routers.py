@@ -2,7 +2,10 @@ from typing import List, Optional, Dict
 from uuid import UUID
 from datetime import datetime
 from pathlib import Path
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+import io
+import os
+import re
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, Query
 from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 from backend.app.domain import models
@@ -25,6 +28,42 @@ router = APIRouter()
 
 UPLOADS_SOURCE_NAME = "My Documents"
 UPLOADS_DIR_NAME = "uploads"
+
+# Default user ID for document storage paths (mirrors agent's "anonymous" user)
+_DOC_USER_ID = os.environ.get("DOC_USER_ID", "anonymous")
+
+
+def _doc_cache_dir() -> Path:
+    """Return the shared agent document cache directory for uploaded files."""
+    workspace = Path(os.environ.get("AGENT_WORKSPACE", "./agent_workspace"))
+    d = workspace / "users" / _DOC_USER_ID / ".cache" / "documents"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _minio_upload(config, object_name: str, data: bytes, content_type: str) -> Optional[str]:
+    """Upload bytes to MinIO and return the public URL, or None if unavailable."""
+    mc = getattr(config, "minio", None)
+    if not mc or not mc.endpoint:
+        return None
+    # Env vars take priority over (potentially cached) config values
+    endpoint = os.environ.get("MINIO_ENDPOINT") or mc.endpoint
+    access_key = os.environ.get("MINIO_ACCESS_KEY") or mc.access_key
+    secret_key = os.environ.get("MINIO_SECRET_KEY") or mc.secret_key
+    bucket = os.environ.get("MINIO_BUCKET") or mc.bucket
+    secure = mc.secure
+    try:
+        from minio import Minio
+        endpoint_host = endpoint.replace("http://", "").replace("https://", "").rstrip("/")
+        client = Minio(endpoint_host, access_key=access_key, secret_key=secret_key, secure=secure)
+        if not client.bucket_exists(bucket):
+            client.make_bucket(bucket)
+        client.put_object(bucket, object_name, io.BytesIO(data), len(data), content_type=content_type)
+        scheme = "https" if secure else "http"
+        return f"{scheme}://{endpoint_host}/{bucket}/{object_name}"
+    except Exception as exc:
+        print(f"[MinIO] Upload failed for {object_name}: {exc}")
+        return None
 
 
 def _guess_mime(filename: str) -> str:
@@ -125,15 +164,32 @@ def delete_document(
     uri = doc.uri or ""
     if uri.startswith("file://"):
         uploads_root = (config.storage.data_dir / UPLOADS_DIR_NAME).resolve()
+        cache_root = _doc_cache_dir().resolve()
         file_path = Path(uri.replace("file://", "", 1)).resolve()
+        in_uploads = False
         try:
             file_path.relative_to(uploads_root)
+            in_uploads = True
         except ValueError:
             pass
-        else:
-            if file_path.exists():
+        in_cache = False
+        try:
+            file_path.relative_to(cache_root)
+            in_cache = True
+        except ValueError:
+            pass
+        if (in_uploads or in_cache) and file_path.exists():
+            try:
+                file_path.unlink()
+            except Exception:
+                pass
+        # Also remove the extracted .md cache file if it exists
+        if in_cache or in_uploads:
+            stem = Path(doc.title or file_path.stem).stem
+            cache_md = cache_root / f"{stem}.md"
+            if cache_md.exists():
                 try:
-                    file_path.unlink()
+                    cache_md.unlink()
                 except Exception:
                     pass
     lexical.delete_doc(doc_id)
@@ -184,10 +240,10 @@ def get_document_file(
 
 @router.post("/documents/upload", response_model=models.Document)
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     store: MetadataStore = Depends(get_metadata_store),
     indexing: IndexingService = Depends(get_indexing_service),
-    job_runner: JobRunner = Depends(get_job_runner),
     config: AppConfig = Depends(get_config),
 ):
     contents = await file.read()
@@ -196,45 +252,50 @@ async def upload_document(
     if size_bytes > max_bytes:
         raise HTTPException(status_code=400, detail="File too large")
 
-    uploads_root = Path(config.storage.data_dir) / UPLOADS_DIR_NAME
-    uploads_root.mkdir(parents=True, exist_ok=True)
-
     original_name = file.filename or "document"
+    mime = _guess_mime(original_name)
     base = Path(original_name).stem
     suffix = Path(original_name).suffix
-    candidate = uploads_root / original_name
-    index = 1
-    while candidate.exists():
-        candidate = uploads_root / f"{base}_{index}{suffix}"
-        index += 1
 
-    with open(candidate, "wb") as f:
+    # Save to shared document cache (agent_workspace/users/{user_id}/.cache/documents/)
+    cache_dir = _doc_cache_dir()
+    local_path = cache_dir / original_name
+    idx = 1
+    while local_path.exists():
+        local_path = cache_dir / f"{base}_{idx}{suffix}"
+        idx += 1
+    with open(local_path, "wb") as f:
         f.write(contents)
+
+    # Always use the local file:// URI for indexing (MinIO objects are private,
+    # direct HTTP GET would be 403). Upload to MinIO as a background backup copy.
+    document_uri = f"file://{local_path.resolve()}"
+    safe_name = re.sub(r"[^\w.\-]", "_", local_path.name)
+    minio_object = f"documents/{_DOC_USER_ID}/{safe_name}"
+    _minio_upload(config, minio_object, contents, mime)  # best-effort; result not stored
 
     sources = store.list_sources()
     upload_source = next((s for s in sources if s.name == UPLOADS_SOURCE_NAME), None)
     if upload_source is None:
         upload_source = models.Source(
             name=UPLOADS_SOURCE_NAME,
-            path=str(uploads_root),
+            path=str(cache_dir),
             config={},
         )
         upload_source = store.upsert_source(upload_source)
 
     doc = models.Document(
         source_id=upload_source.id,
-        uri=f"file://{candidate}",
+        uri=document_uri,
         title=original_name,
-        mime_type=_guess_mime(original_name),
+        mime_type=mime,
         size_bytes=size_bytes,
         mtime=datetime.utcnow(),
         status="pending",
     )
     saved = store.upsert_document(doc)
-    job_runner.enqueue_job(
-        type=models.JobType.INDEX_DOC,
-        payload={"doc_id": str(saved.id)},
-    )
+    # Run indexing as a background task — no job-queue DB writes required
+    background_tasks.add_task(indexing.index_document, saved.id)
     return saved
 
 @router.post("/search", response_model=List[SearchResult])
