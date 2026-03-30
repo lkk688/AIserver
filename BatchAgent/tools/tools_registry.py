@@ -29,10 +29,43 @@ from BatchAgent.tools.domain_tools import DOMAIN_REGISTRY
 # 1. observation tools, short parameters, used for information gathering and verification. Safe to expose in all strategies.
 OBSERVATION_TOOLS = [
     {
-        "name": "search_code",
-        "description": "Search for a string or regex pattern in the codebase.",
-        "properties": {"query": {"type": "string", "description": "The text pattern to search for"}},
-        "required": ["query"]
+        "name": "grep",
+        "description": (
+            "Search any file or directory for a regex or literal pattern. "
+            "Replaces both search_code and search_document — use this for ALL text search needs: "
+            "source code, markdown files, downloaded web pages, session logs, PDFs converted to text, "
+            "or any arbitrary path in the workspace.\n"
+            "Supports file-type filtering (glob), case-insensitive matching, and surrounding context lines.\n"
+            "Examples:\n"
+            "  grep(pattern='def train', glob='*.py', context=4)         — code search\n"
+            "  grep(pattern='Image:', path='page.md')                    — search a single file\n"
+            "  grep(pattern='upload\\.wikimedia', glob='*.md')           — all markdown files\n"
+            "  grep(pattern='error', path='logs/', ignore_case=True)     — case-insensitive in dir\n"
+            "  grep(pattern='conclusion', path='report.md', context=5)   — find section in document"
+        ),
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "Regex or literal string to search for"
+            },
+            "path": {
+                "type": "string",
+                "description": "File path or directory to search (default: current workspace)"
+            },
+            "glob": {
+                "type": "string",
+                "description": "Filename glob filter, e.g. '*.md', '*.py', '*.json' (default: all text files)"
+            },
+            "context": {
+                "type": "integer",
+                "description": "Lines of context to show before/after each match (default 2)"
+            },
+            "ignore_case": {
+                "type": "boolean",
+                "description": "Case-insensitive matching (default false)"
+            }
+        },
+        "required": ["pattern"]
     },
     {
         "name": "find_file",
@@ -211,17 +244,28 @@ OBSERVATION_TOOLS = [
         "required": []
     },
     {
-        "name": "search_document",
+        "name": "view_image",
         "description": (
-            "Search within the currently loaded PDF/document using hybrid retrieval. "
-            "Returns matched snippets, page numbers, and section IDs/titles."
+            "Load and visually analyze an image. "
+            "Accepts a local file path OR an http/https URL. "
+            "Supported formats: JPEG, PNG, GIF, BMP, WebP, TIFF, HEIC/HEIF. "
+            "The image is safely resized before being sent to the model. "
+            "Use this whenever the user refers to an image, screenshot, diagram, photo, or uploaded image file. "
+            "ALWAYS use view_image for images — never use read_url for image files. "
+            "The model will receive the actual pixels and can describe, compare, or extract information from them."
         ),
         "properties": {
-            "query": {"type": "string", "description": "Search query"},
-            "top_k": {"type": "integer", "description": "Maximum number of results to return"}
+            "path": {
+                "type": "string",
+                "description": (
+                    "Local file path (absolute or relative to workspace) "
+                    "OR an http/https URL pointing to an image. "
+                    "Example paths: 'demo.jpeg', '/workspace/photo.png', 'http://host/img.jpg'"
+                ),
+            }
         },
-        "required": ["query"]
-    }
+        "required": ["path"],
+    },
 ]
 
 # 2. memory tools — always safe, always available regardless of strategy

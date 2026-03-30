@@ -13,7 +13,7 @@ import uuid
 import zipfile
 from urllib.parse import quote
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any, Awaitable, Callable, Dict, List, Optional
@@ -229,7 +229,7 @@ def _upsert_task_db(record: TaskRecord) -> None:
                 json.dumps(record.files or [], ensure_ascii=False),
                 json.dumps(record.chat_history or [], ensure_ascii=False),
                 json.dumps(record.token_stats or {}, ensure_ascii=False),
-                datetime.utcnow().isoformat(),
+                datetime.now(timezone.utc).isoformat(),
             ),
         )
         conn.commit()
@@ -441,7 +441,7 @@ def _migrate_legacy_agent_storage() -> None:
                         row["files_json"] if "files_json" in cols else None,
                         row["chat_history_json"] if "chat_history_json" in cols else None,
                         row["token_stats_json"] if "token_stats_json" in cols else None,
-                        str(row["updated_at"] if "updated_at" in cols else datetime.utcnow().isoformat()),
+                        str(row["updated_at"] if "updated_at" in cols else datetime.now(timezone.utc).isoformat()),
                     ),
                 )
                 target_conn.commit()
@@ -592,6 +592,16 @@ def _decode_text_preview(data: bytes, limit: int = 4000) -> str:
     return data.decode("utf-8", errors="replace")[:limit]
 
 
+_IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp",
+    ".webp", ".tiff", ".tif", ".heic", ".heif", ".avif",
+}
+
+
+def _is_image_name(name: str) -> bool:
+    return Path(name).suffix.lower() in _IMAGE_EXTENSIONS
+
+
 def _extract_file_preview(name: str, data: bytes, limit: int = 4000) -> str:
     ext = Path(name).suffix.lower()
     if ext in {
@@ -606,6 +616,8 @@ def _extract_file_preview(name: str, data: bytes, limit: int = 4000) -> str:
         return _extract_docx_preview(data, limit=limit)
     if ext in {".doc", ".ppt", ".pptx", ".xls", ".xlsx"}:
         return f"[{ext.lstrip('.').upper()} file attached. Preview is not available.]"
+    if ext in _IMAGE_EXTENSIONS:
+        return f"[Image file ({ext.lstrip('.')}). Use view_image to analyze it visually.]"
     return ""
 
 
@@ -1003,11 +1015,37 @@ def _build_goal_with_context(goal: str, context_resources: List[Dict[str, Any]])
         elif content:
             lines.append(f"   Content: {content[:240].rstrip()}…")
         if source_url and not include_all:
-            # Local agent-file URLs (e.g. /api/v1/agent/sessions/.../files/download?name=...)
-            # cannot be fetched by read_url (no protocol, relative path).
-            # For uploaded documents the file is in the workspace — direct the agent there.
+            # Determine the best access method for this resource.
             is_local_file_url = source_url.startswith("/api/v1/agent/sessions/") and "files/download" in source_url
-            if is_local_file_url:
+            local_path = _clean_context_text(item.get("local_path"), limit=500)
+            resource_name_val = str(item.get("name") or item.get("title") or "").strip()
+            is_image = _is_image_name(resource_name_val) or _is_image_name(source_url)
+            # Attached web resources are saved as .md files in the workspace.
+            # The source_url is the original web URL; local_path points to the workspace file.
+            is_attached_resource = bool(
+                local_path
+                and (resource_name_val.startswith("resource_") and resource_name_val.endswith(".md"))
+            )
+
+            if is_image:
+                # Images must be loaded visually — read_url only returns raw bytes/403.
+                # Prefer the local path (always accessible); fall back to the URL
+                # which image_tools can fetch directly over http/https.
+                image_source = local_path or source_url
+                lines.append(
+                    f"   Access: This is an image file. "
+                    f"Use view_image(path=\"{image_source}\") to load and analyze it visually. "
+                    f"Do NOT use read_url for images."
+                )
+            elif is_attached_resource:
+                # The content was already fetched and saved as a workspace .md file.
+                # Use the local file — don't re-fetch source_url which may be blocked.
+                lines.append(
+                    f"   Access: Content already fetched and saved locally. "
+                    f"Use get_document_overview(filepath=\"{resource_name_val}\") to read it. "
+                    f"The file includes images found on the page."
+                )
+            elif is_local_file_url:
                 lines.append(f"   Access: File is available in your workspace. Use get_document_overview(filepath=\"{title}\") to load and read it.")
             else:
                 lines.append(f"   Access: Use read_url with this URL for full details.")
@@ -1074,7 +1112,7 @@ def _load_resume_payload(record: TaskRecord) -> Dict[str, Any]:
 
 async def _run_blocking(record: TaskRecord, req: RunRequest) -> bool:
     record.status = TaskStatus.RUNNING
-    record.started_at = datetime.utcnow().isoformat()
+    record.started_at = datetime.now(timezone.utc).isoformat()
     _persist(record)
     try:
         svc = _make_service(req)
@@ -1099,7 +1137,7 @@ async def _run_blocking(record: TaskRecord, req: RunRequest) -> bool:
         record.error = str(exc)
         record.status = TaskStatus.FAILED
     finally:
-        record.finished_at = datetime.utcnow().isoformat()
+        record.finished_at = datetime.now(timezone.utc).isoformat()
         _persist(record)
     return record.success or False
 
@@ -1110,7 +1148,7 @@ async def _run_streaming(
     on_event: Callable[[Dict[str, Any]], Awaitable[None]],
 ) -> bool:
     record.status = TaskStatus.RUNNING
-    record.started_at = datetime.utcnow().isoformat()
+    record.started_at = datetime.now(timezone.utc).isoformat()
     _persist(record)
     try:
         svc = _make_service(req)
@@ -1138,7 +1176,7 @@ async def _run_streaming(
         _persist(record)
         raise exc
     finally:
-        record.finished_at = datetime.utcnow().isoformat()
+        record.finished_at = datetime.now(timezone.utc).isoformat()
         _persist(record)
     return record.success or False
 
@@ -1274,7 +1312,10 @@ async def agent_stream(
                     "name": name,
                     "ext": Path(name).suffix.lstrip(".").lower(),
                     "size": int(event.get("size", 0) or 0),
-                    "url": event.get("url") or "",
+                    # Use the authenticated API proxy URL — MinIO direct URLs are
+                    # private and return 403/AccessDenied when opened by the browser.
+                    "url": file_api_path,
+                    "minio_url": event.get("url") or "",
                     "content": event.get("content") or "",
                     "source_url": event.get("source_url") or "",
                     "local_path": local_path,
@@ -1299,7 +1340,8 @@ async def agent_stream(
                     {
                         "type": "file_written",
                         "name": name,
-                        "url": event.get("url") or "",
+                        "url": file_api_path,
+                        "minio_url": event.get("url") or "",
                         "content": event.get("content") or "",
                         "file_api_path": file_api_path,
                         "download_api_path": download_api_path,
@@ -1328,7 +1370,15 @@ async def agent_stream(
             success = await _run_streaming(record, req, on_event=on_event)
             finalized_stats = _finalize_token_stats(token_stats)
             if stream_files_by_name:
-                record.files = list(stream_files_by_name.values())
+                # Merge with existing files (from previous tasks in the same session)
+                # rather than replacing — keeps output docs from all tasks visible.
+                existing_by_name: Dict[str, Dict[str, Any]] = {}
+                for item in record.files or []:
+                    item_name = str(item.get("name") or "").strip()
+                    if item_name:
+                        existing_by_name[item_name] = item
+                existing_by_name.update(stream_files_by_name)
+                record.files = list(existing_by_name.values())
             if stream_messages:
                 record.chat_history = stream_messages
             record.token_stats = finalized_stats
@@ -1779,15 +1829,21 @@ def attach_session_resource(
         parsed_content = fetch_and_parse_url(source_url)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to parse URL: {exc}") from exc
-    if not parsed_content or parsed_content.startswith("HTTP Error") or parsed_content.startswith("Network error"):
-        raise HTTPException(status_code=400, detail="Could not fetch or parse the URL")
+    _FETCH_ERROR_PREFIXES = (
+        "HTTP Error", "Network error",
+        "[URL Permanently Blocked]", "[URL Not Found]",
+        "[URL Rate Limited]", "[URL Read Failed]",
+    )
+    if not parsed_content or any(parsed_content.startswith(p) for p in _FETCH_ERROR_PREFIXES):
+        detail = parsed_content.split("\n")[0] if parsed_content else "Could not fetch or parse the URL"
+        raise HTTPException(status_code=400, detail=detail)
     resource_title = ""
-    title_match = re.search(r"^Title:\s*(.+?)\s*$", parsed_content, flags=re.MULTILINE)
+    title_match = re.search(r"^(?:Title:\s*|# )(.+?)\s*$", parsed_content, flags=re.MULTILINE)
     if title_match:
         resource_title = title_match.group(1).strip()
     workspace_dir = Path(record.workspace_dir or _resolve_task_workspace_dir("./agent_workspace", record.user_id, task_id)).resolve()
     workspace_dir.mkdir(parents=True, exist_ok=True)
-    resource_name = f"resource_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:6]}.md"
+    resource_name = f"resource_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:6]}.md"
     target_path = (workspace_dir / resource_name).resolve()
     heading = "# 🎬 Attached YouTube Resource" if resource_type == "youtube" else "# 🌐 Attached Web Resource"
     title_line = f"{heading}\n\nSource: {source_url}\n\n"
@@ -1804,18 +1860,26 @@ def attach_session_resource(
         item_name = str(item.get("name") or "").strip()
         if item_name:
             files_by_name[item_name] = item
+    # Use the agent-served path as the canonical URL so the frontend fetches
+    # through the authenticated proxy (Next.js /agent/* → agent server).
+    # The MinIO URL is private and returns 403 when fetched directly from the browser.
+    file_api = _file_api_path(task_id, resource_name)
+    download_api = _file_download_api_path(task_id, resource_name)
     files_by_name[resource_name] = {
         "name": resource_name,
         "ext": "md",
         "size": target_path.stat().st_size,
-        "url": url,
+        # Use relative API path, not the private MinIO URL.
+        # Falls back to MinIO url for server-side agent context only.
+        "url": file_api,
+        "minio_url": url,          # kept for optional direct download
         "content": (title_line + parsed_content)[:4000],
         "source_url": source_url,
         "resource_type": resource_type,
         "resource_title": resource_title,
         "local_path": str(target_path),
-        "file_api_path": _file_api_path(task_id, resource_name),
-        "download_api_path": _file_download_api_path(task_id, resource_name),
+        "file_api_path": file_api,
+        "download_api_path": download_api,
     }
     record.files = list(files_by_name.values())
     record.workspace_dir = str(workspace_dir)
@@ -1828,9 +1892,11 @@ def attach_session_resource(
         "resource_type": resource_type,
         "resource_title": resource_title,
         "size": target_path.stat().st_size,
-        "file_api_path": _file_api_path(task_id, resource_name),
-        "download_api_path": _file_download_api_path(task_id, resource_name),
-        "url": url,
+        "file_api_path": file_api,
+        "download_api_path": download_api,
+        # Return the API path as the primary URL so resolveFileUrl routes
+        # through the proxy instead of hitting MinIO directly.
+        "url": file_api,
         "snapshot": (title_line + parsed_content)[:500],
     }
 
@@ -1942,7 +2008,7 @@ def rate_session(
     with sqlite3.connect(str(db_path)) as conn:
         result = conn.execute(
             "UPDATE agent_sessions SET rating = ?, rating_comment = ?, updated_at = ? WHERE task_id = ? AND user_id = ?",
-            (body.rating, body.comment or None, datetime.utcnow().isoformat(), task_id, user_id),
+            (body.rating, body.comment or None, datetime.now(timezone.utc).isoformat(), task_id, user_id),
         )
         conn.commit()
     if result.rowcount == 0:
@@ -1983,4 +2049,20 @@ app.include_router(router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    _host = os.environ.get("AGENT_HOST", "0.0.0.0")
+    _port = int(os.environ.get("AGENT_PORT", "8100"))
+    uvicorn.run(app, host=_host, port=_port)
+
+"""
+AGENT_PORT=8100 python -m BatchAgent.agent_route_fastapi
+
+cd backend
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
+
+cd frontend
+# (Optional) Map URLs securely:
+# export NEXT_PUBLIC_API_URL="http://localhost:8080/api/v1"
+# export NEXT_PUBLIC_AGENT_API_URL="http://localhost:8000"
+
+npm run dev
+"""

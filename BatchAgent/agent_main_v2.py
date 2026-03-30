@@ -48,6 +48,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # ── v2 modules ─────────────────────────────────────────────────────────────────
 from BatchAgent.llm_wrapper_v2 import complete_with_continuation_async, LLMUnavailableError
+from BatchAgent.tools.image_tools import (
+    _MULTIMODAL_SENTINEL,
+    is_multimodal_sentinel,
+    decode_multimodal_sentinel,
+)
 from BatchAgent.prompt_registry_v2 import PromptRegistry
 from BatchAgent.tools.tools_registry import compile_tools_for_provider, get_base_tools
 from BatchAgent.tools.tool_registry_runtime import configure_global_tool_registry
@@ -160,6 +165,12 @@ class AgentConfig:
     embedding_api_key: str = "EMPTY"
     embedding_model: str = "text-embeddings-inference"
 
+    # ── Vision ────────────────────────────────────────────────────────────────
+    # Max token budget for a single view_image call.  0 = auto (25% of
+    # max_context, floor 512, ceiling 16384).  Set explicitly to allow
+    # higher-res on large-context models or save budget on small ones.
+    vision_max_tokens: int = 0
+
     # ── Streaming / SSE ───────────────────────────────────────────────────────
     stream_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = field(default=None)
 
@@ -212,6 +223,56 @@ def _fmt_args(args: dict) -> str:
         sv = str(v)
         parts.append(f"{k}={sv[:35]!r}" if len(sv) <= 35 else f"{k}={sv[:32]!r}…")
     return ", ".join(parts)
+
+
+def _get_content_text(content) -> str:
+    """
+    Extract plain text from a message ``content`` field that may be either a
+    plain string *or* a multimodal content-block list (from view_image results).
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return str(content)
+
+
+def _image_block_tokens(block: dict) -> int:
+    """
+    Estimate token cost for a single image_url content block.
+
+    For data-URI images (base64-embedded) the cost is proportional to the
+    URI length: base64 encoding ≈ 4 chars per 3 bytes, and the vLLM / OpenAI
+    image tokeniser charges ~1 token per 4 characters.  We add a small fixed
+    overhead for the JSON wrapper and MIME header.
+    For URL-referenced images we fall back to a conservative flat 512.
+    """
+    url = block.get("image_url", {}).get("url", "")
+    if url.startswith("data:"):
+        return max(256, len(url) // 4)
+    return 512
+
+
+def _estimate_msg_tokens(messages: list) -> int:
+    """
+    Token estimator for a message list that may contain multimodal content.
+    Accurately charges for data-URI image payloads instead of using a flat 512.
+    """
+    total = 0
+    for m in messages:
+        content = m.get("content")
+        total += estimate_tokens(_get_content_text(content))
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "image_url":
+                    total += _image_block_tokens(block)
+    return total
 
 
 # Tools whose successful results are worth auto-caching in working memory knowledge.
@@ -567,15 +628,22 @@ class UniversalAgent:
         tool_actions: List[ActionToolCall],
         turn_dir: Path,
         allowlist: List[str],
-    ) -> Tuple[str, Dict[int, str]]:
+    ) -> Tuple[str, Dict[int, str], List[Dict[str, Any]]]:
         """
         Execute observation tools concurrently via UniversalToolHandler.
-        Returns (combined_result_str, {action_index: error_summary}).
-        Memory tools are included — ToolRouter dispatches them using
-        config.working_memory which is set before every turn.
+
+        Returns
+        -------
+        combined_result_str : str
+            All tool results joined for the text feedback block.
+        errors : dict
+            {action_index: error_summary} for loop-detector bookkeeping.
+        image_blocks : list
+            ``image_url`` content dicts extracted from any ``view_image``
+            sentinel results — to be attached to the next user message.
         """
         if not tool_actions:
-            return "", {}
+            return "", {}, []
 
         console.print(
             f"[cyan]🚀 Executing {len(tool_actions)} tools concurrently...[/cyan]"
@@ -599,7 +667,7 @@ class UniversalAgent:
             *[_run_one(a) for a in tool_actions], return_exceptions=True
         )
 
-        combined, errors = [], {}
+        combined, errors, image_blocks = [], {}, []
         for idx, (action, res) in enumerate(zip(tool_actions, raw)):
             if isinstance(res, Exception):
                 err = f"### Result for {action.name}\n```text\nException: {res}\n```"
@@ -608,37 +676,136 @@ class UniversalAgent:
                 if self.config.verbose:
                     console.print(f"[red]{err}[/red]")
             else:
-                combined.append(res)
-                if _is_tool_error_result(res):
-                    errors[idx] = _extract_tool_error_summary(res)
-                if self.config.verbose:
-                    console.print(Panel(
-                        res[:500] + "..." if len(res) > 500 else res,
-                        title=f"Tool Output: {action.name}",
-                        border_style="magenta",
-                    ))
+                # ── Multimodal sentinel from view_image ───────────────────────
+                # The sentinel may arrive in two forms:
+                # (a) raw prefix: sentinel is the entire string (direct dispatch)
+                # (b) embedded:   UniversalToolHandler.format_for_llm() wrapped it
+                #     in "### Result for view_image\n```text\n<sentinel>{json}\n```"
+                mm_payload = None
+                if is_multimodal_sentinel(res):
+                    mm_payload = decode_multimodal_sentinel(res)
+                elif _MULTIMODAL_SENTINEL in res:
+                    # Extract the JSON that follows the sentinel inside the text block
+                    start = res.index(_MULTIMODAL_SENTINEL) + len(_MULTIMODAL_SENTINEL)
+                    raw_json = res[start:]
+                    # Trim any trailing markdown fence that format_for_llm added
+                    fence_pos = raw_json.find("\n```")
+                    if fence_pos != -1:
+                        raw_json = raw_json[:fence_pos]
+                    try:
+                        mm_payload = json.loads(raw_json)
+                    except Exception:
+                        mm_payload = None  # fall through to plain text handling
 
-        return "\n\n".join(combined), errors
+                if mm_payload is not None:
+                    text_desc = mm_payload.get("text", f"Image loaded for {action.name}.")
+                    text_result = (
+                        f"### Result for {action.name}\n"
+                        f"```text\n{text_desc}\n```"
+                    )
+                    combined.append(text_result)
+                    image_blocks.extend(mm_payload.get("image_blocks", []))
+                    console.print(
+                        f"[magenta]🖼️ view_image: image attached "
+                        f"({len(mm_payload.get('image_blocks', []))} block(s))[/magenta]"
+                    )
+                else:
+                    combined.append(res)
+                    if _is_tool_error_result(res):
+                        errors[idx] = _extract_tool_error_summary(res)
+                    if self.config.verbose:
+                        console.print(Panel(
+                            res[:500] + "..." if len(res) > 500 else res,
+                            title=f"Tool Output: {action.name}",
+                            border_style="magenta",
+                        ))
+
+        return "\n\n".join(combined), errors, image_blocks
 
     # ------------------------------------------------------------------
     # Context / memory management
     # ------------------------------------------------------------------
+
+    def _strip_old_image_blocks(self, keep_last_n: int = 1) -> None:
+        """
+        Replace image_url data-URI blobs in older user messages with a short
+        text placeholder, keeping only the ``keep_last_n`` most-recent image
+        messages intact.
+
+        A single JPEG data URI can exceed 30 000 tokens.  Without stripping,
+        accumulated images across turns will overflow any context window.
+        The model has already processed older images; the placeholder preserves
+        a record that an image was loaded without re-paying the token cost.
+        """
+        # Collect indices of user messages that carry at least one image_url block
+        image_msg_indices = [
+            i for i, m in enumerate(self.messages)
+            if m.get("role") == "user"
+            and isinstance(m.get("content"), list)
+            and any(
+                isinstance(b, dict) and b.get("type") == "image_url"
+                for b in m["content"]
+            )
+        ]
+        # Strip everything except the most recent `keep_last_n`
+        to_strip = image_msg_indices[:-keep_last_n] if len(image_msg_indices) > keep_last_n else []
+        if not to_strip:
+            return
+
+        for idx in to_strip:
+            content = self.messages[idx]["content"]
+            new_blocks = []
+            stripped_count = 0
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "image_url":
+                    # Extract a human-readable path hint from the URL if present
+                    url = block.get("image_url", {}).get("url", "")
+                    hint = "[previously loaded image]"
+                    if not url.startswith("data:"):
+                        hint = f"[previously loaded image: {url}]"
+                    new_blocks.append({"type": "text", "text": hint})
+                    stripped_count += 1
+                else:
+                    new_blocks.append(block)
+            # Flatten to plain string if only text blocks remain
+            if all(isinstance(b, dict) and b.get("type") == "text" for b in new_blocks):
+                self.messages[idx]["content"] = "\n".join(
+                    b.get("text", "") for b in new_blocks
+                )
+            else:
+                self.messages[idx]["content"] = new_blocks
+            console.print(
+                f"[dim]🧹 Stripped {stripped_count} image block(s) from turn {idx} to save context.[/dim]"
+            )
 
     def _clean_history_messages(self) -> None:
         """
         1. Strip stale [Working Memory Snapshot] blocks from all but the last
            user message (re-injected fresh each turn).
         2. Drop near-empty assistant turns (blank after stripping <think> tags).
+        3. Strip base64 image blobs from old turns (keep only the most recent).
         """
         if len(self.messages) < 3:
             return
 
+        # Strip expensive image data from older turns first so the token
+        # estimate below reflects the true cost after clean-up.
+        self._strip_old_image_blocks(keep_last_n=1)
+
         for msg in self.messages[:-1]:
+            content = msg.get("content")
             if (
                 msg.get("role") == "user"
-                and msg.get("content", "").startswith("[Working Memory Snapshot]")
+                and _get_content_text(content).startswith("[Working Memory Snapshot]")
             ):
-                msg["content"] = _strip_snapshot(msg["content"])
+                if isinstance(content, str):
+                    msg["content"] = _strip_snapshot(content)
+                elif isinstance(content, list):
+                    # Strip snapshot from the first text block only
+                    for i, block in enumerate(content):
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            msg["content"][i]["text"] = _strip_snapshot(block["text"])
+                            break
 
         kept = [self.messages[0], self.messages[1]]
         for msg in self.messages[2:]:
@@ -663,7 +830,7 @@ class UniversalAgent:
         self._clean_history_messages()
 
         max_ctx = self.config.max_context
-        raw = sum(estimate_tokens(m.get("content", "")) for m in self.messages)
+        raw = _estimate_msg_tokens(self.messages)
         estimated = int(raw * self._TOKEN_ESTIMATE_CORRECTION)
         headroom = max_ctx - estimated
 
@@ -675,7 +842,7 @@ class UniversalAgent:
             for window in (6, 4, 2):
                 tail = self.messages[2:][-window:] if len(self.messages) > 2 else []
                 candidate = [self.messages[0], self.messages[1]] + tail
-                raw = sum(estimate_tokens(m.get("content", "")) for m in candidate)
+                raw = _estimate_msg_tokens(candidate)
                 estimated = int(raw * self._TOKEN_ESTIMATE_CORRECTION)
                 headroom = max_ctx - estimated
                 if headroom > 0 or window == 2:
@@ -885,7 +1052,7 @@ class UniversalAgent:
         )
         if self.messages:
             (turn_dir / "latest_instruction.md").write_text(
-                self.messages[-1]["content"], encoding="utf-8"
+                _get_content_text(self.messages[-1].get("content", "")), encoding="utf-8"
             )
         console.print(f"\n[bold yellow]>>> ReAct Turn {display_turn} / {self.config.max_turns}[/bold yellow]")
 
@@ -902,7 +1069,7 @@ class UniversalAgent:
 
     async def _run_llm_call(self, display_turn: int, allowlist: List[str]):
         max_ctx = self.config.max_context
-        _raw_input = sum(estimate_tokens(m.get("content", "")) for m in self.messages)
+        _raw_input = _estimate_msg_tokens(self.messages)
         _est_input = int(_raw_input * self._TOKEN_ESTIMATE_CORRECTION)
         _headroom = max_ctx - _est_input - 256
         if _headroom < 1024:
@@ -1064,16 +1231,22 @@ class UniversalAgent:
         display_turn: int,
         allowlist: List[str],
         ts: "_TaskState",
-    ) -> Tuple[List[str], bool]:
+    ) -> Tuple[List[str], bool, List[Dict[str, Any]]]:
         """
         Execute observation tools, do loop detection, detect parallel-branches completion.
-        Returns (feedback_blocks, parallel_just_completed).
+
+        Returns
+        -------
+        feedback_blocks       : List[str]
+        parallel_just_completed : bool
+        image_blocks          : List[dict]   — image_url blocks from any view_image calls
         """
         feedback_blocks: List[str] = []
         parallel_just_completed = False
+        image_blocks: List[Dict[str, Any]] = []
 
         if not standard_actions:
-            return feedback_blocks, parallel_just_completed
+            return feedback_blocks, parallel_just_completed, image_blocks
 
         # Loop detection
         deduped, skipped_ok, skipped_err = ts.loop_detector.check_tools(standard_actions)
@@ -1089,7 +1262,7 @@ class UniversalAgent:
         standard_actions = deduped
 
         if not standard_actions:
-            return feedback_blocks, parallel_just_completed
+            return feedback_blocks, parallel_just_completed, image_blocks
 
         # Update memory stage
         if self.working_memory:
@@ -1100,7 +1273,7 @@ class UniversalAgent:
                 }
             })
 
-        concurrent_results, per_errors = await self._execute_tools_concurrently(
+        concurrent_results, per_errors, image_blocks = await self._execute_tools_concurrently(
             standard_actions, turn_dir, allowlist
         )
         ts.loop_detector.record_tools(standard_actions, per_errors)
@@ -1129,7 +1302,7 @@ class UniversalAgent:
         if "execute_parallel_branches" in parallel_names:
             parallel_just_completed = True
 
-        return feedback_blocks, parallel_just_completed
+        return feedback_blocks, parallel_just_completed, image_blocks
 
     async def _handle_mutations(
         self,
@@ -1286,7 +1459,23 @@ class UniversalAgent:
                         + first_prompt
                     )
                 self._log_rl("user", prompt_md)
-                self.messages.append({"role": "user", "content": first_prompt})
+                if resume_messages and len(self.messages) > 1:
+                    # Replace messages[1] so the pruning anchor always reflects the
+                    # current task goal (prune keeps messages[0..1] + recent tail).
+                    self.messages[1] = {"role": "user", "content": first_prompt}
+                    # Append as the LAST message with an explicit separator so the
+                    # model responds to the NEW task and not to the previous turn's
+                    # "call finish_task" assistant message that ended the old session.
+                    # The separator prevents the model from treating old tool-result
+                    # turns as context for the new task.
+                    new_task_msg = (
+                        "[Previous task completed. A new independent task is starting now. "
+                        "Ignore previous results — start fresh.]\n\n"
+                        + first_prompt
+                    )
+                    self.messages.append({"role": "user", "content": new_task_msg})
+                else:
+                    self.messages.append({"role": "user", "content": first_prompt})
                 (turn_dir / "user_prompt.md").write_text(prompt_md, encoding="utf-8")
 
             # ── LLM call ────────────────────────────────────────────────────
@@ -1356,6 +1545,7 @@ class UniversalAgent:
                 if isinstance(a, (ActionWriteFile, ActionApplyDiff, ActionReplaceText))
             ]
             feedback_blocks: List[str] = []
+            turn_image_blocks: List[Dict[str, Any]] = []
             if json_parse_errors:
                 feedback_blocks.append(PromptRegistry.json_parse_soft_warning())
 
@@ -1420,7 +1610,7 @@ class UniversalAgent:
                 "register_custom_tool", "json_parse_error",
             }
             standard_actions = [a for a in info_actions if a.name not in _SKIP_NAMES]
-            obs_blocks, parallel_done = await self._handle_observation_tools(
+            obs_blocks, parallel_done, turn_image_blocks = await self._handle_observation_tools(
                 standard_actions, turn_dir, display_turn, allowlist, ts
             )
             feedback_blocks.extend(obs_blocks)
@@ -1493,7 +1683,19 @@ class UniversalAgent:
                 )
             self._log_rl("user", combined_feedback)
             self.messages.append({"role": "assistant", "content": content})
-            self.messages.append({"role": "user", "content": fp})
+
+            # ── Build multimodal user message if view_image was called ────────
+            if turn_image_blocks:
+                # Combine text feedback + image blocks into a content list so
+                # the vision model receives the actual pixel data.
+                user_content: Any = [{"type": "text", "text": fp}] + turn_image_blocks
+                console.print(
+                    f"[cyan]🖼️ Attaching {len(turn_image_blocks)} image block(s) to user message.[/cyan]"
+                )
+            else:
+                user_content = fp
+
+            self.messages.append({"role": "user", "content": user_content})
             (turn_dir / "user_feedback.md").write_text(fp, encoding="utf-8")
 
         # ── Max turns exceeded ───────────────────────────────────────────────────
@@ -1759,6 +1961,8 @@ Example usage:
 python BatchAgent/agent_main_v2.py --tool-strategy native_all --verbose
 
 python BatchAgent/agent_main_v2.py --model "qwen-35b" --base-url "http://127.0.0.1:8000/v1" --api-key "myhpcvllmqwen101" --tool-strategy native_all --verbose
+
+python BatchAgent/agent_main_v2.py --model "qwen3.5-35b-moe-int4" --base-url "http://127.0.0.1:8000/v1" --tool-strategy native_all --verbose
 
 
 python BatchAgent/agent_main_v2.py --provider anthropic \\

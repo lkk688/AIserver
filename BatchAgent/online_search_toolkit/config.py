@@ -27,8 +27,12 @@ class RerankConfig(BaseModel):
     api_model: Optional[str] = Field(default=os.getenv("RERANK_API_MODEL"))
 
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_CACHE_DIR = str(_PROJECT_ROOT / "agent_workspace" / ".cache" / "search")
+
+
 class StoreConfig(BaseModel):
-    file_cache_dir: Path = Field(default=Path(os.getenv("SEARCH_FILE_CACHE_DIR", ".cache/search")))
+    file_cache_dir: Path = Field(default=Path(os.getenv("SEARCH_FILE_CACHE_DIR", _DEFAULT_CACHE_DIR)))
     postgres_enabled: bool = Field(default=os.getenv("SEARCH_POSTGRES_ENABLED", "false").lower() == "true")
     postgres_dsn: str = Field(default=os.getenv("SEARCH_POSTGRES_DSN", "postgresql://postgres:postgres@localhost:5432/searchdb"))
     pgvector_enabled: bool = Field(default=os.getenv("SEARCH_PGVECTOR_ENABLED", "true").lower() == "true")

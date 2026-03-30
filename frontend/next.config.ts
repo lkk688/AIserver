@@ -10,7 +10,7 @@ const nextConfig: NextConfig = {
       },
       {
         source: "/agent/:path*",
-        destination: "http://127.0.0.1:8090/agent/:path*",
+        destination: `http://127.0.0.1:${process.env.AGENT_PORT || "8100"}/agent/:path*`,
       },
     ];
   },

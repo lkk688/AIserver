@@ -723,6 +723,105 @@ def search_code(query: str, root_dir: str = ".") -> str:
     return "\n".join(sections)
 
 
+def grep(
+    pattern: str,
+    path: str = ".",
+    *,
+    glob: str = "",
+    context: int = 2,
+    ignore_case: bool = False,
+    max_matches: int = 80,
+) -> str:
+    """
+    General-purpose grep over any file or directory.
+
+    Parameters
+    ----------
+    pattern     : regex or literal string to search for
+    path        : file path OR directory to search recursively (default: current dir)
+    glob        : optional file glob filter, e.g. "*.md", "*.py" (default: all text files)
+    context     : number of lines to show before/after each match (default 2)
+    ignore_case : case-insensitive matching (default False)
+    max_matches : max total matches returned (default 80)
+    """
+    root = Path(path).resolve()
+    flags = re.IGNORECASE if ignore_case else 0
+    try:
+        rx = re.compile(pattern, flags)
+    except re.error as exc:
+        # Fall back to literal match if pattern is not valid regex
+        rx = re.compile(re.escape(pattern), flags)
+
+    _SKIP_DIRS = {"__pycache__", "node_modules", "site-packages", "venv", "env", ".venv",
+                  ".git", ".mypy_cache", ".pytest_cache", "dist", "build"}
+
+    def _iter_files():
+        if root.is_file():
+            yield root
+            return
+        for rp, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in _SKIP_DIRS]
+            rp_path = Path(rp)
+            for fname in files:
+                if fname.startswith("."):
+                    continue
+                fp = rp_path / fname
+                if glob and not fnmatch.fnmatch(fname, glob):
+                    continue
+                # Skip likely-binary / large files
+                try:
+                    if fp.stat().st_size > 2 * 1024 * 1024:
+                        continue
+                except Exception:
+                    continue
+                if _is_binary(fp):
+                    continue
+                yield fp
+
+    results: list[str] = []
+    total = 0
+    truncated = False
+    file_count = 0
+
+    for fp in _iter_files():
+        try:
+            file_lines = fp.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            continue
+
+        match_nos = [i + 1 for i, ln in enumerate(file_lines) if rx.search(ln)]
+        if not match_nos:
+            continue
+        file_count += 1
+
+        # Merge overlapping context windows
+        windows = _merge_context_windows(match_nos, len(file_lines), context)
+        rel = str(fp.relative_to(root)) if not root.is_file() else fp.name
+        results.append(f"\n── {rel} ──")
+
+        for (wstart, wend) in windows:
+            for lineno in range(wstart, wend + 1):
+                marker = "▶ " if lineno in match_nos else "  "
+                results.append(f"  {marker}{lineno:4d} │ {file_lines[lineno - 1]}")
+                if lineno in match_nos:
+                    total += 1
+                    if total >= max_matches:
+                        truncated = True
+                        break
+            if truncated:
+                break
+        if truncated:
+            break
+
+    if not results:
+        return f'No matches for "{pattern}"' + (f' in {glob} files' if glob else '') + "."
+
+    header = f'grep "{pattern}": {total} match(es) in {file_count} file(s)'
+    if truncated:
+        header += f" [truncated at {max_matches}]"
+    return header + "\n" + "\n".join(results)
+
+
 def find_file(filename_pattern: str, root_dir: str = ".") -> str:
     results = []
     root = Path(root_dir).resolve()

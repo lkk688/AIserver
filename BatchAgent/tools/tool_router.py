@@ -38,13 +38,14 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from BatchAgent.tools.tool_registry_runtime import GLOBAL_TOOL_REGISTRY
 from BatchAgent.tools.document_tools import DocumentToolManager
 from BatchAgent.tools.local_tools import (
-    search_code,
+    grep,
     find_file,
     read_file_chunk,
     list_directory,
     run_bash_command,
     run_shell,
 )
+from BatchAgent.tools.image_tools import make_view_image_router_result
 from BatchAgent.tools.web_tools import (
     fetch_and_parse_url,
     perform_domain_aware_search,
@@ -105,7 +106,7 @@ class ToolRouter:
             # local / observation
             "web_search": self._handle_web_search,
             "read_url": self._handle_read_url,
-            "search_code": self._handle_search_code,
+            "grep": self._handle_grep,
             "find_file": self._handle_find_file,
             "read_file_chunk": self._handle_read_file_chunk,
             "list_directory": self._handle_list_directory,
@@ -116,7 +117,6 @@ class ToolRouter:
             # document
             "get_document_overview": self._handle_get_document_overview,
             "read_document_section": self._handle_read_document_section,
-            "search_document": self._handle_search_document,
 
             # memory
             "get_memory": self._handle_get_memory,
@@ -128,6 +128,9 @@ class ToolRouter:
 
             # parallel / brainstorm (active only when enable_parallel=True)
             "execute_parallel_branches": self._handle_execute_parallel_branches,
+
+            # vision
+            "view_image": self._handle_view_image,
         }
 
         self._validate_registry_bindings()
@@ -285,8 +288,15 @@ class ToolRouter:
             name_contains=args.get("name_contains", ""),
         )
 
-    def _handle_search_code(self, args: Dict[str, Any]) -> str:
-        return search_code(args.get("query", ""))
+    def _handle_grep(self, args: Dict[str, Any]) -> str:
+        return grep(
+            pattern=args.get("pattern", ""),
+            path=str(args.get("path", ".")),
+            glob=str(args.get("glob", "")),
+            context=int(args.get("context", 2)),
+            ignore_case=bool(args.get("ignore_case", False)),
+            max_matches=int(args.get("max_matches", 80)),
+        )
 
     def _handle_find_file(self, args: Dict[str, Any]) -> str:
         return find_file(args.get("pattern", ""))
@@ -309,6 +319,79 @@ class ToolRouter:
                 "Writing files via bash is strictly forbidden. Use write_file or search_and_replace instead."
             )
         return run_bash_command(cmd)
+
+    # Default vision token budget when no context information is available.
+    # Chosen so that even on a 32k context model the image leaves room for the
+    # system prompt, conversation history, and a meaningful model response.
+    _DEFAULT_VISION_TOKEN_BUDGET = 4096
+
+    def _vision_token_budget(self) -> int:
+        """
+        Compute a safe token budget for the image based on the model's context window.
+
+        Formula: use at most 25% of the total context, capped at a max of 16384
+        and floored at 512.  Callers may override via ``config.vision_max_tokens``.
+        """
+        override = getattr(self.ctx.config, "vision_max_tokens", None)
+        if override:
+            return max(256, int(override))
+        max_ctx = getattr(self.ctx.config, "max_context", 0)
+        if max_ctx > 0:
+            return max(512, min(16384, max_ctx // 4))
+        return self._DEFAULT_VISION_TOKEN_BUDGET
+
+    def _handle_view_image(self, args: Dict[str, Any]) -> str:
+        """
+        Load, resize, encode, and return an image as a sentinel-prefixed string.
+
+        Path resolution order (first existing path wins):
+        1. As-is (absolute paths or paths relative to CWD that already exist)
+        2. Relative to workspace_dir   (the agent's output workspace)
+        3. Relative to CWD             (where the Python process is running)
+        4. Relative to the project root (parent of the BatchAgent package)
+
+        Image resolution is chosen adaptively so that the token cost fits within
+        the computed vision budget (25% of model context, min 512, max 16384).
+        """
+        path = str(args.get("path", "")).strip()
+        if not path:
+            return "Error: 'path' argument is required for view_image."
+
+        # ── Remote URL: pass straight to image_tools (handles http/https fetch) ──
+        if path.startswith("http://") or path.startswith("https://"):
+            budget = self._vision_token_budget()
+            console.print(
+                f"[cyan]🖼️ view_image: fetching URL '{path}' "
+                f"(vision budget: {budget} tokens)[/cyan]"
+            )
+            return make_view_image_router_result(path, max_tokens=budget)
+
+        # ── Local file: 4-candidate path resolution ────────────────────────────
+        fpath = Path(path)
+        workspace_dir = Path(getattr(self.ctx.config, "workspace_dir", Path(".")))
+        project_root = Path(__file__).resolve().parent.parent.parent
+
+        candidates = [
+            fpath,                   # absolute or already-cwd-relative
+            workspace_dir / fpath,   # agent workspace
+            Path.cwd() / fpath,      # CWD of running process
+            project_root / fpath,    # project root (where tests/, etc. live)
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                budget = self._vision_token_budget()
+                console.print(
+                    f"[cyan]🖼️ view_image: loading '{candidate}' "
+                    f"(vision budget: {budget} tokens)[/cyan]"
+                )
+                return make_view_image_router_result(str(candidate), max_tokens=budget)
+
+        searched = ", ".join(f"'{c}'" for c in candidates)
+        return (
+            f"Error: Image file not found: '{path}'. "
+            f"Searched: {searched}. "
+            "Please verify the path, use an absolute path, or provide an http/https URL."
+        )
 
     def _handle_json_parse_error(self, args: Dict[str, Any]) -> str:
         return args.get("error", "JSON Parse Error")
@@ -336,11 +419,6 @@ class ToolRouter:
             return self.document_tools.read_page(int(page))
 
         return "Please provide either section_id or page."
-
-    def _handle_search_document(self, args: Dict[str, Any]) -> str:
-        query = str(args.get("query") or "").strip()
-        top_k = int(args.get("top_k", 5))
-        return self.document_tools.search_document(query=query, top_k=top_k)
 
     # ------------------------------------------------------------------
     # Memory handlers

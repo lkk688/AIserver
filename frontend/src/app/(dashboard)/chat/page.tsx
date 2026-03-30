@@ -1316,6 +1316,9 @@ function ChatView({
   const resolveFileUrl = useCallback((raw?: string) => {
     if (!raw) return '';
     if (/^https?:\/\//i.test(raw)) return raw;
+    // Agent file paths (/agent/sessions/…) go through the Next.js /agent/* proxy
+    // and must NOT be prefixed with apiBaseUrl (which points to the web-app backend).
+    if (raw.startsWith('/agent/')) return raw;
     if (raw.startsWith('/')) return `${apiBaseUrl}${raw}`;
     return `${apiBaseUrl}/${raw}`;
   }, [apiBaseUrl]);
@@ -1355,7 +1358,7 @@ function ChatView({
           id: `${f.name}-${idx}`,
           name: f.name,
           ext: f.ext || f.name.split('.').pop() || 'file',
-          url: resolveFileUrl(f.url || f.download_api_path || f.file_api_path),
+          url: resolveFileUrl(f.file_api_path || f.download_api_path || f.url),
           snapshot: (f.content || '').slice(0, 300),
           size: f.size,
           sourceUrl: f.source_url,
@@ -1377,11 +1380,11 @@ function ChatView({
         for (const mdFile of agentMdFiles) {
           let content = mdFile.content ?? '';
           if (!content) {
-            const resolved = resolveFileUrl(mdFile.url || mdFile.file_api_path);
+            const resolved = resolveFileUrl(mdFile.file_api_path || mdFile.download_api_path || mdFile.url);
             if (resolved) {
               try {
                 content = await fetch(resolved, {
-                  headers: ((resolved.startsWith(apiBaseUrl) || resolved.startsWith(agentApiUrl))) ? buildAuthHeaders() : undefined,
+                  headers: ((resolved.startsWith(apiBaseUrl) || resolved.startsWith(agentApiUrl) || resolved.startsWith('/agent/'))) ? buildAuthHeaders() : undefined,
                 }).then(r => (r.ok ? r.text() : ''));
               } catch { }
             }
@@ -1521,7 +1524,7 @@ function ChatView({
             ...existing,
             name: String(payload.name),
             ext,
-            url: resolveFileUrl(String(payload.url || payload.download_api_path || payload.file_api_path || '')),
+            url: resolveFileUrl(String(payload.file_api_path || payload.download_api_path || payload.url || '')),
             snapshot: String(payload.snapshot || '').slice(0, 300),
             size: Number(payload.size || file.size || 0),
             sourceUrl: String(payload.source_url || ''),
@@ -1594,7 +1597,7 @@ function ChatView({
             ...existing,
             name: String(payload.name),
             ext,
-            url: resolveFileUrl(String(payload.url || payload.download_api_path || payload.file_api_path || '')),
+            url: resolveFileUrl(String(payload.file_api_path || payload.download_api_path || payload.url || '')),
             snapshot: String(payload.snapshot || '').slice(0, 300),
             size: Number(payload.size || 0),
             sourceUrl: String(payload.source_url || item.sourceUrl || ''),
@@ -1790,7 +1793,7 @@ function ChatView({
               setActiveTools(prev => prev.includes(event.name) ? prev : [...prev, event.name]);
               updateBlocks(b => [...b, { type: 'tool', name: event.name } as ToolBlock]);
             } else if (event.type === 'file_written') {
-              const resolvedUrl = resolveFileUrl(event.url || event.download_api_path || event.file_api_path);
+              const resolvedUrl = resolveFileUrl(event.download_api_path || event.file_api_path || event.url);
               updateBlocks(b => upsertFileBlock(b, { type: 'file', name: event.name, url: resolvedUrl, fileState: 'saved' } as FileBlock));
               if (event.name) {
                 const writtenName = String(event.name);
@@ -2268,7 +2271,7 @@ function ChatView({
                       <span className="absolute top-1.5 right-3 w-2 h-2 rounded-full bg-indigo-500 animate-ping" />
                     )}
                   </>
-                  : <><FileText className="w-3.5 h-3.5" /> Output Document</>
+                  : <><FileText className="w-3.5 h-3.5" /> Output {outputDocs.length > 1 ? `Documents (${outputDocs.length})` : 'Document'}</>
                 }
               </button>
             ))}
@@ -2276,27 +2279,51 @@ function ChatView({
 
           {activeTab === 'editor' ? (
             <div className="flex-1 flex flex-col overflow-hidden">
-              {/* File browser — shown when session has multiple output docs */}
-              {outputDocs.length > 1 && (
-                <div className="flex items-center gap-1 px-3 py-1.5 border-b border-gray-100 bg-gray-50 overflow-x-auto shrink-0">
-                  {outputDocs.map(doc => (
-                    <button
-                      key={doc.name}
-                      onClick={() => {
-                        setSelectedDocName(doc.name);
-                        setDocumentState(prev => ({ ...prev, title: doc.name, content: doc.content }));
-                      }}
-                      className={clsx(
-                        "flex items-center gap-1 px-2.5 py-1 rounded-md text-xs whitespace-nowrap shrink-0 transition-colors",
-                        selectedDocName === doc.name
-                          ? "bg-indigo-600 text-white"
-                          : "bg-white border border-gray-200 text-gray-600 hover:border-indigo-300 hover:text-indigo-600"
-                      )}
-                    >
-                      <FileText className="w-3 h-3 shrink-0" />
-                      {doc.name}
-                    </button>
-                  ))}
+              {/* File card strip — shown whenever there are output docs */}
+              {outputDocs.length > 0 && (
+                <div className="shrink-0 border-b border-gray-100 bg-gray-50/80 px-3 py-2">
+                  <div className="flex gap-2 overflow-x-auto pb-1" style={{ scrollbarWidth: 'thin' }}>
+                    {outputDocs.map(doc => {
+                      const isSelected = selectedDocName === doc.name;
+                      const ext = doc.name.split('.').pop()?.toLowerCase() ?? '';
+                      const extColors: Record<string, string> = {
+                        md: 'bg-indigo-100 text-indigo-600',
+                        txt: 'bg-gray-100 text-gray-500',
+                        json: 'bg-yellow-100 text-yellow-700',
+                        csv: 'bg-green-100 text-green-700',
+                        py: 'bg-blue-100 text-blue-600',
+                      };
+                      const extColor = extColors[ext] ?? 'bg-purple-100 text-purple-600';
+                      return (
+                        <button
+                          key={doc.name}
+                          onClick={() => {
+                            setSelectedDocName(doc.name);
+                            setDocumentState(prev => ({ ...prev, title: doc.name, content: doc.content }));
+                          }}
+                          className={clsx(
+                            "flex flex-col items-start gap-1 px-3 py-2 rounded-lg text-left shrink-0 transition-all w-36 border",
+                            isSelected
+                              ? "bg-white border-indigo-400 shadow-sm ring-1 ring-indigo-300"
+                              : "bg-white border-gray-200 hover:border-indigo-200 hover:shadow-sm"
+                          )}
+                        >
+                          <div className="flex items-center gap-1.5 w-full">
+                            <span className={clsx("px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wide shrink-0", extColor)}>
+                              {ext || 'file'}
+                            </span>
+                            {isSelected && <span className="ml-auto w-1.5 h-1.5 rounded-full bg-indigo-500 shrink-0" />}
+                          </div>
+                          <span className={clsx(
+                            "text-xs leading-tight w-full truncate",
+                            isSelected ? "text-indigo-700 font-medium" : "text-gray-600"
+                          )} title={doc.name}>
+                            {doc.name.replace(/\.[^.]+$/, '')}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
               )}
               {/* Toolbar */}

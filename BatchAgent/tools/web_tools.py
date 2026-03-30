@@ -12,8 +12,9 @@ Public API (unchanged signatures):
 from __future__ import annotations
 
 import logging
+import re
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 
@@ -551,6 +552,347 @@ def perform_domain_aware_search(
 _DEFAULT_URL_WINDOW = 200  # lines per read_url page
 _MAX_URL_WINDOW = 1000
 
+# ---------------------------------------------------------------------------
+# Image extraction from web pages
+# ---------------------------------------------------------------------------
+
+# URL fragments that indicate tracking pixels, ads, or decorative assets
+_AD_URL_RE = re.compile(
+    r"(pixel|beacon|track(ing|er)?|analytics|doubleclick|googlead|adservice"
+    r"|googlesyndication|adnxs|outbrain|taboola|sharethrough|moatads"
+    r"|spacer|blank|placeholder|spinner|loading|1x1"
+    r"|logo\.|icon\.|avatar\.|badge\.)",
+    re.IGNORECASE,
+)
+
+# HTML containers that typically hold main article content
+_CONTENT_TAG_RE = re.compile(r"^(article|main|section|figure)$", re.IGNORECASE)
+_CONTENT_CLASS_RE = re.compile(
+    r"\b(article|post|content|story|body|entry|detail|prose|text|news|blog)\b",
+    re.IGNORECASE,
+)
+
+# HTML containers that typically hold chrome/noise (nav, ads, sidebars)
+_NOISE_TAG_RE = re.compile(r"^(header|footer|nav|aside|form)$", re.IGNORECASE)
+_NOISE_CLASS_RE = re.compile(
+    r"\b(header|footer|nav|sidebar|menu|widget|ad[s_-]|banner|promo"
+    r"|comment|related|recommend|subscribe|newsletter|share|social|cookie)\b",
+    re.IGNORECASE,
+)
+
+_MIN_EXPLICIT_DIM = 80   # pixels — images with explicit w/h < this are icons
+_MAX_IMAGES = 10         # cap on images reported per page
+
+
+def _score_img_element(img) -> int:  # type: ignore[return]
+    """
+    Walk the ancestor chain of a BeautifulSoup <img> tag and return a
+    content-relevance score.
+
+    Positive: inside article/main/figure/content-class containers
+    Negative: inside nav/footer/sidebar/ad-class containers
+    Zero:     neutral (no strong signal)
+    """
+    score = 0
+    for ancestor in img.parents:
+        tag = getattr(ancestor, "name", None)
+        if tag is None:
+            continue
+        classes = " ".join(ancestor.get("class") or [])
+        if _CONTENT_TAG_RE.match(tag or ""):
+            score += 3
+        if _CONTENT_CLASS_RE.search(classes):
+            score += 2
+        if tag == "figure":
+            score += 4          # <figure> almost always wraps content images
+        if _NOISE_TAG_RE.match(tag or ""):
+            score -= 4
+        if _NOISE_CLASS_RE.search(classes):
+            score -= 3
+    return score
+
+
+def _img_description(img) -> str:
+    """
+    Return the best human-readable description for an <img> element.
+
+    Priority: <figcaption> sibling → alt → title → aria-label → ''
+    """
+    # <figcaption> sibling inside the same <figure>
+    parent = img.find_parent("figure")
+    if parent:
+        cap = parent.find("figcaption")
+        if cap:
+            text = cap.get_text(" ", strip=True)
+            if text:
+                return text
+
+    for attr in ("alt", "title", "aria-label"):
+        val = (img.get(attr) or "").strip()
+        if val and val.lower() not in {"image", "photo", "picture", "img", "."}:
+            return val
+
+    # Enclosing <a> title
+    a = img.find_parent("a")
+    if a:
+        val = (a.get("title") or a.get("aria-label") or "").strip()
+        if val:
+            return val
+
+    return ""
+
+
+def _resolve_img_src(img, base_url: str) -> str:
+    """
+    Return the best absolute URL for an <img>, checking lazy-load attrs too.
+    """
+    for attr in ("src", "data-src", "data-original", "data-lazy-src", "data-srcset"):
+        val = (img.get(attr) or "").strip()
+        if val and not val.startswith("data:"):
+            # srcset may have "url 2x" — take just the first token
+            val = val.split()[0]
+            return urljoin(base_url, val)
+    return ""
+
+
+def _is_likely_content_image(src: str, img) -> bool:
+    """Return False for images that are very likely icons, pixels, or ads."""
+    if not src:
+        return False
+
+    # Explicit tiny dimensions in attributes
+    for attr in ("width", "height"):
+        val = img.get(attr, "")
+        try:
+            if int(str(val).replace("px", "").strip()) < _MIN_EXPLICIT_DIM:
+                return False
+        except (ValueError, TypeError):
+            pass
+
+    # Known ad/tracker URL patterns
+    if _AD_URL_RE.search(src):
+        return False
+
+    # SVG inline images used as icons (tiny data URIs already excluded above)
+    if src.endswith(".svg") and _AD_URL_RE.search(src):
+        return False
+
+    return True
+
+
+def _extract_page_images(html: str, base_url: str) -> List[Dict[str, str]]:
+    """
+    Parse *html* and return a scored, deduplicated list of content images.
+
+    Each entry: {"src": absolute_url, "description": text, "score": int}
+    Sorted by score descending; capped at _MAX_IMAGES.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    seen: set = set()
+    candidates: List[Dict] = []
+
+    for img in soup.find_all("img"):
+        src = _resolve_img_src(img, base_url)
+        if not src or src in seen:
+            continue
+        if not _is_likely_content_image(src, img):
+            continue
+        score = _score_img_element(img)
+        if score < -2:          # strongly noise-classified → skip
+            continue
+        seen.add(src)
+        candidates.append({
+            "src": src,
+            "description": _img_description(img),
+            "score": score,
+        })
+
+    # Sort: content images first, then by order of appearance (stable sort)
+    candidates.sort(key=lambda x: -x["score"])
+    return candidates[:_MAX_IMAGES]
+
+
+_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\((https?://[^)\s]+)\)", re.IGNORECASE)
+_MD_IMAGE_NOISE_RE = re.compile(
+    r"(pixel|beacon|track|analytics|doubleclick|googlead|spacer|1x1"
+    r"|/icons?/|/static/images/|/mobile/|/copyright/"
+    r"|[-_](\d{1,2})px[-_.]"   # e.g. -25px, _20px — tiny sized images in URL
+    r"|icon\.|logo\.|badge\.|spinner\.|wordmark\.|tagline\.)",
+    re.IGNORECASE,
+)
+
+_IMAGE_EXT_RE = re.compile(
+    r"\.(jpe?g|png|gif|webp|avif|tiff?|bmp|svg)(\?[^)]*)?$", re.IGNORECASE
+)
+
+def _extract_images_from_markdown(markdown: str) -> List[Dict[str, str]]:
+    """
+    Extract image URLs from Jina/markdownify output when HTML is unavailable.
+    Returns deduplicated list of {"src", "description", "score"} dicts.
+
+    Only includes URLs with recognised image extensions to avoid picking up
+    page URLs that appear as <img src> in language-switcher or similar widgets.
+    """
+    seen: set = set()
+    results: List[Dict[str, str]] = []
+    for m in _MD_IMAGE_RE.finditer(markdown):
+        alt, src = m.group(1).strip(), m.group(2).strip()
+        if not src or src in seen:
+            continue
+        # Must look like an actual image file
+        if not _IMAGE_EXT_RE.search(src.split("?")[0]):
+            continue
+        if _MD_IMAGE_NOISE_RE.search(src):
+            continue
+        seen.add(src)
+        results.append({"src": src, "description": alt, "score": 1})
+        if len(results) >= _MAX_IMAGES:
+            break
+    return results
+
+
+def _fetch_html_for_images(url: str, timeout: int = 15) -> str:
+    """
+    Lightweight raw HTML fetch for image extraction.
+
+    Uses urllib (stdlib) as primary transport — passes CDN bot-detection
+    that blocks httpx (e.g. Wikipedia).  Returns empty string on failure.
+    """
+    import urllib.request
+    import urllib.error
+    from urllib.parse import urlparse as _urlparse
+
+    parsed = _urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": origin + "/",
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ct = resp.headers.get("Content-Type", "")
+            if "html" in ct:
+                return resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    return ""
+
+
+def _fetch_wikipedia_images(url: str) -> List[Dict[str, str]]:
+    """
+    Fetch images for a Wikipedia article via the public REST API.
+
+    Works for any ``*.wikipedia.org/wiki/<Title>`` URL.
+    Returns a list of ``{"src": url, "alt": title, "description": ""}``
+    dicts, ready for ``_format_images_section``.
+    """
+    import urllib.request
+    import json
+    from urllib.parse import urlparse as _urlparse, quote
+
+    parsed = _urlparse(url)
+    # Only handle Wikipedia article pages
+    if "wikipedia.org" not in parsed.netloc:
+        return []
+    path_parts = parsed.path.split("/wiki/", 1)
+    if len(path_parts) < 2 or not path_parts[1]:
+        return []
+    article_title = path_parts[1]
+    lang = parsed.netloc.split(".")[0]  # e.g. "en"
+    api_url = f"https://{lang}.wikipedia.org/api/rest_v1/page/media-list/{quote(article_title)}"
+
+    _SKIP_EXT = {".svg", ".oga", ".ogv", ".ogg", ".webm", ".mp3", ".wav"}
+    _SKIP_RE = re.compile(
+        r"(icon|logo|flag|button|badge|arrow|stub|edit|portal|commons|wikidata"
+        r"|sound|audio|wikimedia-logo|wikipedia-wordmark|enwiki|question_book"
+        r"|red_pencil|padlock|globe|wikivoyage|wiktionary|wikisource)",
+        re.IGNORECASE,
+    )
+
+    try:
+        req = urllib.request.Request(
+            api_url,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+    except Exception:
+        return []
+
+    results: List[Dict[str, str]] = []
+    seen: set = set()
+    for item in data.get("items", []):
+        title = item.get("title", "").replace("File:", "").replace("_", " ")
+        if _SKIP_RE.search(title):
+            continue
+
+        # Prefer: largest srcset thumbnail → original source
+        # srcset is ordered smallest→largest, so take the last valid entry.
+        srcsets = item.get("srcset", [])
+        src = ""
+        for entry in reversed(srcsets):
+            s = entry.get("src", "")
+            if s:
+                src = ("https:" + s) if s.startswith("//") else s
+                break
+        if not src:
+            orig = item.get("original", {})
+            s = orig.get("source", "")
+            if s:
+                src = ("https:" + s) if s.startswith("//") else s
+
+        if not src or src in seen:
+            continue
+        # Skip non-photo types based on the FINAL url extension
+        url_path = src.split("?")[0]
+        ext = re.search(r"\.[a-z0-9]+$", url_path, re.IGNORECASE)
+        if ext and ext.group(0).lower() in _SKIP_EXT:
+            continue
+
+        seen.add(src)
+        results.append({"src": src, "alt": title, "description": ""})
+        if len(results) >= 15:
+            break
+    return results
+
+
+def _format_images_section(images: List[Dict[str, str]]) -> str:
+    """
+    Render the image list as a markdown section the model can act on.
+
+    Format: numbered list where each line contains the human-readable title
+    and the EXACT URL to pass to view_image, so the model cannot confuse
+    the display name with the URL.
+    """
+    if not images:
+        return ""
+    lines = [
+        "",
+        "## Page Images",
+        "Call `view_image` with the exact URL shown. Do NOT guess or modify URLs.",
+        "",
+    ]
+    for i, img in enumerate(images, 1):
+        src = img["src"]
+        alt = (img.get("alt") or img.get("description") or "").strip()
+        label = alt if alt else f"Image {i}"
+        lines.append(f"{i}. {label}")
+        lines.append(f"   URL: {src}")
+    return "\n".join(lines)
+
 
 def _apply_line_window(text: str, offset: int = 0, limit: int = _DEFAULT_URL_WINDOW) -> str:
     """Slice *text* to [offset, offset+limit) lines, appending pagination hints."""
@@ -657,6 +999,11 @@ def fetch_and_parse_url(
             )
 
         record = service.read_url(target_url)
+        # If the cached record is an error, force a fresh fetch — the site may
+        # now be accessible via Jina / alt-headers even if it was blocked before.
+        if record.metadata.get("error"):
+            record = service.read_url(target_url, force_refresh=True)
+
         if _is_not_found_record(record):
             return _handle_missing_url(
                 service,
@@ -670,7 +1017,29 @@ def fetch_and_parse_url(
             return _format_url_error(normalized_url, record.summary or "unknown error")
 
         full_text = _record_to_markdown(record, normalized_url)
-        return _apply_line_window(full_text, offset=offset, limit=limit)
+        paged = _apply_line_window(full_text, offset=offset, limit=limit)
+
+        # Append image list only on the first page (offset == 0) so it doesn't
+        # repeat on every paginated read_url call.
+        if offset == 0:
+            images: List[Dict[str, str]] = []
+            # 1. Wikipedia REST API — fast, clean, no bot-detection issues.
+            wiki_images = _fetch_wikipedia_images(target_url)
+            if wiki_images:
+                images = wiki_images
+            else:
+                # 2. Raw HTML fetch (urllib passes most CDN bot checks).
+                raw_html = _fetch_html_for_images(target_url)
+                if raw_html:
+                    images = _extract_page_images(raw_html, target_url)
+                else:
+                    # 3. Last resort: scan Jina/markdownify output for ![alt](url) patterns.
+                    images = _extract_images_from_markdown(full_text)
+            img_section = _format_images_section(images)
+            if img_section:
+                paged = paged + img_section
+
+        return paged
 
     except Exception as exc:
         logger.exception("fetch_and_parse_url failed for %s: %s", normalized_url, exc)

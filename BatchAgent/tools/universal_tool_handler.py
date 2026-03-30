@@ -374,7 +374,9 @@ class MutationManager:
             if action.old_text not in file_text:
                 return False, [
                     f"search_and_replace FAILED — 'old_text' not found in '{action.path}'. "
-                    f"The file content may have changed."
+                    f"The file content may have changed since you last read it. "
+                    f"Call read_file_chunk to get the current content, then retry search_and_replace "
+                    f"with the exact text from the file. Do NOT guess — copy the text verbatim."
                 ]
 
             new_text = file_text.replace(action.old_text, action.new_text, 1)

@@ -105,30 +105,6 @@ def _parse_case_entry(raw: str, defaults: Dict[str, str]) -> APICase:
 
 
 def _build_llm_cases(args: argparse.Namespace) -> List[APICase]:
-    defaults = {
-        "model": args.model,
-        "api_key": args.api_key,
-        "backend": args.backend,
-        "provider": args.provider,
-        "tokenizer": args.tokenizer,
-    }
-    if args.llm_case:
-        return [_parse_case_entry(raw, defaults) for raw in args.llm_case]
-    if args.base_urls:
-        urls = _parse_csv_list(args.base_urls)
-        return [
-            APICase(
-                name=f"case_{idx+1}",
-                base_url=url,
-                model=args.model,
-                api_key=args.api_key,
-                backend=args.backend,
-                provider=args.provider,
-                enable_thinking=args.enable_thinking,
-                tokenizer=args.tokenizer,
-            )
-            for idx, url in enumerate(urls)
-        ]
     return [
         APICase(
             name=args.base_url_name,
@@ -139,17 +115,7 @@ def _build_llm_cases(args: argparse.Namespace) -> List[APICase]:
             provider=args.provider,
             enable_thinking=args.enable_thinking,
             tokenizer=args.tokenizer,
-        ),
-        APICase(
-            name=args.base_url_alt_name,
-            base_url=args.base_url_alt,
-            model=args.model,
-            api_key=args.api_key,
-            backend=args.backend,
-            provider=args.provider,
-            enable_thinking=args.enable_thinking,
-            tokenizer=args.tokenizer,
-        ),
+        )
     ]
 
 
@@ -383,174 +349,181 @@ def _build_speed_report_html(summary_by_case: Dict[str, Any], summary_by_prefill
 </html>"""
 
 
-async def run_llm_speed_evaluation(args: argparse.Namespace, report_dir: Path, cases: List[APICase]) -> Dict[str, Any]:
+async def _run_single_speed_request(client: Any, case: APICase, messages: List[Dict[str, str]], max_output_tokens: int, model_max_context: int) -> Dict[str, Any]:
+    first_token_ts: Optional[float] = None
+    started = time.perf_counter()
+    
+    async def on_event(evt: Dict[str, Any]) -> None:
+        nonlocal first_token_ts
+        evt_type = str(evt.get("type", ""))
+        if evt_type not in {"message", "think"}:
+            return
+        if not str(evt.get("data", "")):
+            return
+        if first_token_ts is None:
+            first_token_ts = time.perf_counter()
+
+    error_text = ""
+    content = ""
+    usage_info: Dict[str, Any] = {}
+    try:
+        content, usage_info = await complete_with_async(
+            client=client,
+            model=case.model,
+            messages=messages,
+            temperature=0.0,
+            max_output_tokens=max_output_tokens,
+            model_max_context=model_max_context,
+            provider=case.provider,
+            stream=True,
+            verbose=False,
+            on_event=on_event,
+            backend=case.backend,
+            enable_thinking=case.enable_thinking,
+        )
+    except Exception as e:
+        error_text = str(e)
+        
+    elapsed = time.perf_counter() - started
+    prompt_tokens = int(usage_info.get("prompt_tokens", estimate_tokens("\n".join(m["content"] for m in messages))))
+    completion_tokens = int(usage_info.get("completion_tokens", estimate_tokens(content)))
+    ttft_sec = (first_token_ts - started) if first_token_ts is not None else elapsed
+    
+    speed_metrics = compute_stream_speed_metrics(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        elapsed_seconds=elapsed,
+        ttft_seconds=ttft_sec,
+    )
+    
+    success = (error_text == "") and (completion_tokens > 0 or len(content.strip()) > 0)
+    
+    return {
+        "success": success,
+        "error": error_text,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "ttft_sec": speed_metrics["ttft_seconds"],
+        "e2e_latency_sec": elapsed,
+        "per_token_decode_latency_ms": speed_metrics["per_token_decode_latency_ms"],
+        "usage_info": usage_info
+    }
+
+
+async def run_llm_speed_evaluation(args: argparse.Namespace, report_dir: Path, case: APICase) -> Dict[str, Any]:
+    batch_sizes = _parse_csv_int_list(args.batch_sizes)
     prefill_targets = _parse_csv_int_list(args.prefill_tokens)
+    max_output_tokens = args.max_output_tokens
+    
+    if not batch_sizes:
+        batch_sizes = [1, 2, 4]
     if not prefill_targets:
-        raise ValueError("No prefill token targets configured.")
+        prefill_targets = [1024, 4096]
+        
     speed_dir = report_dir / "speed"
     speed_dir.mkdir(parents=True, exist_ok=True)
     raw_json_path = speed_dir / "raw_runs.json"
-    existing_speed_runs = []
-    if getattr(args, "resume", False) and raw_json_path.exists():
-        try:
-            existing_speed_runs = json.loads(raw_json_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    rows: List[Dict[str, Any]] = existing_speed_runs[:]
-    completed_runs_set = { 
-        (r["case_name"], r["prefill_target_tokens"], r["run_index"]) 
-        for r in rows
-    }
-    for case in cases:
-        console.print(f"[bold cyan]Speed benchmark case:[/bold cyan] {case.name} ({case.base_url})")
-        http_client = httpx.AsyncClient(timeout=float(args.timeout_seconds))
-        async_openai_cls = _require_async_openai()
-        client = async_openai_cls(base_url=case.base_url, api_key=case.api_key, http_client=http_client)
-        try:
+    
+    rows: List[Dict[str, Any]] = []
+    
+    console.print(f"[bold cyan]Speed benchmark case:[/bold cyan] {case.name} ({case.base_url})")
+    http_client = httpx.AsyncClient(timeout=float(args.timeout_seconds))
+    async_openai_cls = _require_async_openai()
+    client = async_openai_cls(base_url=case.base_url, api_key=case.api_key, http_client=http_client)
+    
+    try:
+        for batch_size in batch_sizes:
             for prefill_target in prefill_targets:
-                prompt_context = _build_prefill_text(prefill_target)
-                for run_idx in range(args.runs):
-                    if (case.name, prefill_target, run_idx + 1) in completed_runs_set:
-                        console.print(f"[dim]Skipping finished speed run: {case.name} prefill={prefill_target} run={run_idx + 1}[/dim]")
+                for prompt_type in ["same", "different"]:
+                    console.print(f"Running batch_size={batch_size}, prefill={prefill_target}, prompt={prompt_type}...")
+                    
+                    tasks = []
+                    base_context = _build_prefill_text(prefill_target)
+                    
+                    for i in range(batch_size):
+                        if prompt_type == "different":
+                            # Make the prompt slightly different but same length
+                            prefix = f"Ignore this salt {i}: {random.randint(100000, 999999)}. "
+                            adjusted_context = prefix + base_context[len(prefix):] if len(base_context) > len(prefix) else base_context + prefix
+                        else:
+                            adjusted_context = base_context
+                            
+                        messages = [
+                            {"role": "system", "content": "You are a precise and concise assistant."},
+                            {"role": "user", "content": f"{adjusted_context}\n\nTask: Summarize the technical context in five concise bullets. Do not use markdown tables."},
+                        ]
+                        
+                        tasks.append(_run_single_speed_request(client, case, messages, max_output_tokens, args.model_max_context))
+                        
+                    batch_started = time.perf_counter()
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    batch_elapsed = time.perf_counter() - batch_started
+                    
+                    valid_results = [r for r in results if isinstance(r, dict) and r.get("success")]
+                    
+                    if not valid_results:
+                        console.print(f"[red]Batch completely failed![/red]")
+                        if any(isinstance(r, Exception) for r in results):
+                            console.print(f"[red]Exception: {next(r for r in results if isinstance(r, Exception))}[/red]")
                         continue
-                    first_token_ts: Optional[float] = None
-                    event_chunks = 0
-
-                    async def on_event(evt: Dict[str, Any]) -> None:
-                        nonlocal first_token_ts, event_chunks
-                        evt_type = str(evt.get("type", ""))
-                        if evt_type not in {"message", "think"}:
-                            return
-                        if not str(evt.get("data", "")):
-                            return
-                        event_chunks += 1
-                        ts = time.perf_counter()
-                        if first_token_ts is None:
-                            first_token_ts = ts
-
-                    messages = [
-                        {"role": "system", "content": "You are a precise and concise assistant."},
-                        {"role": "user", "content": f"{prompt_context}\n\nTask: Summarize the technical context in five concise bullets. Do not use markdown tables."},
-                    ]
-                    started = time.perf_counter()
-                    content = ""
-                    usage_info: Dict[str, Any] = {}
-                    error_text = ""
-                    finish_reason = "error"
-                    try:
-                        content, usage_info = await complete_with_async(
-                            client=client,
-                            model=case.model,
-                            messages=messages,
-                            temperature=0.0,
-                            max_output_tokens=args.max_output_tokens,
-                            model_max_context=args.model_max_context,
-                            provider=case.provider,
-                            stream=True,
-                            verbose=False,
-                            on_event=on_event,
-                            backend=case.backend,
-                            enable_thinking=case.enable_thinking,
-                        )
-                        finish_reason = str(usage_info.get("finish_reason", "stop"))
-                    except LLM_REQUEST_ERRORS as e:
-                        error_text = str(e)
-                    elapsed = time.perf_counter() - started
-                    prompt_tokens = int(usage_info.get("prompt_tokens", estimate_tokens("\n".join(m["content"] for m in messages))))
-                    completion_tokens = int(usage_info.get("completion_tokens", estimate_tokens(content)))
-                    ttft_sec = (first_token_ts - started) if first_token_ts is not None else elapsed
-                    speed_metrics = compute_stream_speed_metrics(
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        elapsed_seconds=elapsed,
-                        ttft_seconds=ttft_sec,
-                    )
-                    success = (error_text == "") and (completion_tokens > 0 or len(content.strip()) > 0)
-                    if not success and error_text == "":
-                        error_text = "Empty completion"
+                        
+                    # Calculate metrics
+                    ttft_vals = [r["ttft_sec"] for r in valid_results if r["ttft_sec"] > 0]
+                    tpot_vals = [r["per_token_decode_latency_ms"] for r in valid_results if r["per_token_decode_latency_ms"] > 0]
+                    
+                    mean_ttft_ms = (sum(ttft_vals) / len(ttft_vals) * 1000) if ttft_vals else 0
+                    mean_tpot_ms = (sum(tpot_vals) / len(tpot_vals)) if tpot_vals else 0
+                    
+                    total_prompt_tokens = sum(r["prompt_tokens"] for r in valid_results)
+                    total_completion_tokens = sum(r["completion_tokens"] for r in valid_results)
+                    
+                    max_ttft_sec = max(ttft_vals) if ttft_vals else 0.001
+                    max_e2e_sec = max([r["e2e_latency_sec"] for r in valid_results]) if valid_results else 0.001
+                    
+                    pp_tps = total_prompt_tokens / max_ttft_sec
+                    # Prevent division by zero if all tokens come in the first chunk
+                    decode_time_sec = (max_e2e_sec - max_ttft_sec) if (max_e2e_sec > max_ttft_sec) else 0.001
+                    tg_tps = total_completion_tokens / decode_time_sec
+                    
+                    throughput = total_completion_tokens / max_e2e_sec
+                    
+                    # Try to get peak mem from the first valid usage info if available
+                    peak_mem = "N/A"
+                    for r in valid_results:
+                        usage = r.get("usage_info", {})
+                        if isinstance(usage, dict) and "peak_mem" in usage:
+                            peak_mem_val = usage["peak_mem"]
+                            if peak_mem_val:
+                                peak_mem = str(peak_mem_val)
+                                break
+                    
                     row = {
                         "case_name": case.name,
-                        "endpoint": case.base_url,
-                        "model": case.model,
-                        "run_index": run_idx + 1,
-                        "prefill_target_tokens": prefill_target,
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "ttft_sec": round(speed_metrics["ttft_seconds"], 6),
-                        "e2e_latency_sec": round(elapsed, 6),
-                        "decode_latency_sec": round(speed_metrics["decode_latency_seconds"], 6),
-                        "e2e_tokens_per_sec": round(speed_metrics["e2e_tokens_per_second"], 6),
-                        "prefill_tokens_per_sec": round(speed_metrics["prefill_tokens_per_second"], 6),
-                        "decode_tokens_per_sec": round(speed_metrics["decode_tokens_per_second"], 6),
-                        "per_token_decode_latency_ms": round(speed_metrics["per_token_decode_latency_ms"], 6),
-                        "finish_reason": finish_reason,
-                        "success": success,
-                        "error": error_text,
-                        "event_chunks": event_chunks,
+                        "batch_size": batch_size,
+                        "prefill_target": prefill_target,
+                        "prompt_type": prompt_type,
+                        "success_count": len(valid_results),
+                        "total_requests": batch_size,
+                        "mean_ttft_ms": round(mean_ttft_ms, 2),
+                        "mean_tpot_ms": round(mean_tpot_ms, 2),
+                        "pp_tps": round(pp_tps, 2),
+                        "tg_tps": round(tg_tps, 2),
+                        "e2e_latency_sec": round(max_e2e_sec, 3),
+                        "throughput": round(throughput, 2),
+                        "peak_mem": peak_mem,
                     }
                     rows.append(row)
-                    icon = "✔" if success else "✖"
-                    console.print(f"[dim]{icon} {case.name} run={run_idx + 1} prefill={prefill_target} ttft={row['ttft_sec']:.3f}s e2e={row['e2e_latency_sec']:.3f}s e2e_tps={row['e2e_tokens_per_sec']:.2f} decode_tps={row['decode_tokens_per_sec']:.2f}[/dim]")
-        finally:
-            await http_client.aclose()
-    grouped_case: Dict[str, List[Dict[str, Any]]] = {}
-    grouped_prefill: Dict[str, List[Dict[str, Any]]] = {}
-    for row in rows:
-        grouped_case.setdefault(row["case_name"], []).append(row)
-        grouped_prefill.setdefault(f"{row['case_name']}::{row['prefill_target_tokens']}", []).append(row)
-    summary_by_case = {k: _summarize_speed_rows(v) for k, v in grouped_case.items()}
-    summary_by_prefill = {k: _summarize_speed_rows(v) for k, v in grouped_prefill.items()}
-    summary_by_prefill = {k: _summarize_speed_rows(v) for k, v in grouped_prefill.items()}
-    raw_csv_path = speed_dir / "raw_runs.csv"
-    summary_json_path = speed_dir / "summary.json"
-    report_html_path = speed_dir / "report.html"
+                    
+                    console.print(f"[dim]Batch {batch_size}x{prefill_target} ({prompt_type}): TTFT {mean_ttft_ms:.1f}ms, TPOT {mean_tpot_ms:.1f}ms, pp TPS {pp_tps:.1f}, tg TPS {tg_tps:.1f}, Peak Mem: {peak_mem}[/dim]")
+    finally:
+        await http_client.aclose()
+        
     raw_json_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-    _write_rows_csv(
-        raw_csv_path,
-        rows,
-        [
-            "case_name",
-            "endpoint",
-            "model",
-            "run_index",
-            "prefill_target_tokens",
-            "prompt_tokens",
-            "completion_tokens",
-            "ttft_sec",
-            "e2e_latency_sec",
-            "decode_latency_sec",
-            "e2e_tokens_per_sec",
-            "prefill_tokens_per_sec",
-            "decode_tokens_per_sec",
-            "per_token_decode_latency_ms",
-            "finish_reason",
-            "success",
-            "error",
-            "event_chunks",
-        ],
-    )
-    summary_json_path.write_text(
-        json.dumps(
-            {
-                "suite": "speed",
-                "runs": args.runs,
-                "prefill_targets": prefill_targets,
-                "cases": [case.__dict__ for case in cases],
-                "summary_by_case": summary_by_case,
-                "summary_by_prefill": summary_by_prefill,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    report_html_path.write_text(_build_speed_report_html(summary_by_case, summary_by_prefill, rows), encoding="utf-8")
+    
     return {
-        "raw_json": str(raw_json_path),
-        "raw_csv": str(raw_csv_path),
-        "summary_json": str(summary_json_path),
-        "report_html": str(report_html_path),
-        "summary_by_case": summary_by_case,
+        "suite": "speed",
+        "case_name": case.name,
+        "records": rows
     }
 
 
@@ -1060,12 +1033,11 @@ async def run_llm_accuracy_evaluation(args: argparse.Namespace, report_dir: Path
     )
     report_html_path.write_text(_build_accuracy_report_html(records), encoding="utf-8")
     return {
-        "records_json": str(records_json_path),
-        "records_csv": str(records_csv_path),
-        "passkey_trials_csv": str(passkey_trials_path),
-        "summary_json": str(summary_json_path),
-        "report_html": str(report_html_path),
-        "summary_by_case": summary,
+        "suite": "accuracy",
+        "case_names": [c.name for c in cases],
+        "records": records,
+        "passkey_trials": passkey_trials_rows,
+        "summary": summary
     }
 
 
@@ -1075,29 +1047,30 @@ async def run_agent_evaluation(_: argparse.Namespace, __: Path) -> Dict[str, Any
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="BatchAgent evaluation entrypoint")
-    parser.add_argument("--eval-type", default="llm", choices=["llm", "agent"])
-    parser.add_argument("--llm-suites", default="speed", help="Comma-separated suites: speed,accuracy,all")
-    parser.add_argument("--output-dir", default="./agent_workspace")
+    parser.add_argument("--action", default="speed", choices=["speed", "accuracy", "compare"], help="Action to perform")
+    parser.add_argument("--output-json", default="result.json", help="Path to save the JSON result (for speed/accuracy)")
+    parser.add_argument("--compare-files", nargs="+", default=[], help="JSON files to compare and draw figures from (for compare)")
+    parser.add_argument("--compare-output", default="comparison.html", help="Path to save the comparison HTML snippet/report (for compare)")
+    
+    # LLM API Config (simplified)
     parser.add_argument("--provider", default="openai", choices=["openai", "anthropic"])
-    parser.add_argument("--model", default=os.environ.get("VLLM_MODEL", "qwen3.5-9b")) #our own model name
+    parser.add_argument("--model", default=os.environ.get("VLLM_MODEL", "qwen3.5-9b"))
     parser.add_argument("--api-key", default=os.environ.get("VLLM_API_KEY", "EMPTY"))
-    parser.add_argument("--base-url-name", default=os.environ.get("VLLM_BASE_URL_NAME", "vllm_e0_rtx3090"))
     parser.add_argument("--base-url", default=os.environ.get("VLLM_BASE_URL", "http://100.110.236.127:8000/v1"))
-    parser.add_argument("--base-url-alt-name", default=os.environ.get("VLLM_BASE_URL_ALT_NAME", "vllm_e1_rtx5090"))
-    parser.add_argument("--base-url-alt", default=os.environ.get("VLLM_BASE_URL_ALT", "http://100.65.193.60:8001/v1"))
-    parser.add_argument("--base-urls", default=os.environ.get("BENCHMARK_BASE_URLS", ""), help="CSV endpoint URLs for unnamed cases")
-    parser.add_argument("--llm-case", action="append", default=[], help="Repeatable case: name=<name>,url=<url>,model=<optional>,backend=<optional>,api_key=<optional>")
-    parser.add_argument("--runs", type=int, default=5)
-    parser.add_argument("--prefill-tokens", default="512,2048,4096")
-    parser.add_argument("--max-output-tokens", type=int, default=512)
-    parser.add_argument("--timeout-seconds", type=float, default=300.0)
-    parser.add_argument("--tokenizer", default="", help="Tokenizer string for lm_eval local-completions")
-    parser.add_argument("--resume", action="store_true", help="Resume from the latest evaluation in output-dir")
-    parser.add_argument("--resume-dir", default="", type=str, help="Resume from a specific evaluation directory")
+    parser.add_argument("--base-url-name", default=os.environ.get("VLLM_BASE_URL_NAME", "default_endpoint"))
     parser.add_argument("--backend", default="vllm", choices=["vllm", "llama.cpp", "openai"])
+    parser.add_argument("--tokenizer", default="", help="Tokenizer string for lm_eval local-completions")
     parser.add_argument("--enable-thinking", action="store_true")
     parser.add_argument("--model-max-context", type=int, default=16384)
-    parser.add_argument("--accuracy-benchmarks", default="passkey,humaneval,mbpp,lm_eval", help="Comma-separated: passkey,ppl,humaneval,mbpp,evalplus_humaneval,evalplus_mbpp,lm_eval")
+    parser.add_argument("--timeout-seconds", type=float, default=300.0)
+    
+    # Speed test config
+    parser.add_argument("--batch-sizes", default="1,2,4", help="Comma-separated batch sizes for oMLX speed test")
+    parser.add_argument("--prefill-tokens", default="1024,4096", help="Comma-separated prefill targets for oMLX speed test")
+    parser.add_argument("--max-output-tokens", type=int, default=128, help="Target generation tokens (tg)")
+    
+    # Accuracy test config
+    parser.add_argument("--accuracy-benchmarks", default="passkey,humaneval,mbpp,lm_eval")
     parser.add_argument("--passkey-ctx", type=int, default=4096)
     parser.add_argument("--passkey-depth", type=float, default=0.5)
     parser.add_argument("--passkey-trials", type=int, default=10)
@@ -1105,6 +1078,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lm-eval-tasks", default="humaneval")
     parser.add_argument("--lm-eval-batch-size", type=int, default=8)
     parser.add_argument("--command-timeout-seconds", type=int, default=7200)
+    
+    # Legacy args
+    parser.add_argument("--eval-type", default="llm", choices=["llm", "agent"])
+    parser.add_argument("--output-dir", default="./agent_workspace")
+    parser.add_argument("--resume", action="store_true")
     return parser
 
 
@@ -1116,56 +1094,34 @@ async def main_async() -> None:
     if args.eval_type == "agent":
         await run_agent_evaluation(args, workspace_dir)
         return
+        
+    if args.action == "compare":
+        from BatchAgent.evaluator_compare import generate_comparison_report
+        generate_comparison_report(args.compare_files, args.compare_output)
+        return
+
     cases = _build_llm_cases(args)
     if not cases:
         raise ValueError("No LLM cases configured.")
+    case = cases[0]
     
-    if getattr(args, "resume_dir", ""):
-        report_dir = Path(args.resume_dir).resolve()
-        if not report_dir.exists():
-            console.print(f"[red]Resume directory {report_dir} does not exist. Creating new...[/red]")
-            report_dir = (workspace_dir / "evaluations" / "llm" / now_stamp()).resolve()
-    elif getattr(args, "resume", False):
-        evals_dir = workspace_dir / "evaluations" / "llm"
-        if evals_dir.exists():
-            subdirs = [d for d in evals_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
-            if subdirs:
-                latest_dir = max(subdirs, key=lambda d: d.name)
-                report_dir = latest_dir
-                console.print(f"[green]Resuming from {report_dir}[/green]")
-            else:
-                report_dir = (workspace_dir / "evaluations" / "llm" / now_stamp()).resolve()
-        else:
-            report_dir = (workspace_dir / "evaluations" / "llm" / now_stamp()).resolve()
-    else:
-        report_dir = (workspace_dir / "evaluations" / "llm" / now_stamp()).resolve()
-        
+    output_json_path = Path(args.output_json).resolve()
+    output_json_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # We use a scratch workspace for logs and temp files
+    report_dir = (workspace_dir / "evaluations" / "llm" / now_stamp()).resolve()
     report_dir.mkdir(parents=True, exist_ok=True)
-    suites = set(_parse_csv_list(args.llm_suites))
-    if "all" in suites:
-        suites = {"speed", "accuracy"}
-    outputs: Dict[str, Dict[str, Any]] = {}
-    if "speed" in suites:
-        outputs["speed"] = await run_llm_speed_evaluation(args, report_dir, cases)
-    if "accuracy" in suites:
-        outputs["accuracy"] = await run_llm_accuracy_evaluation(args, report_dir, cases)
-    top_summary_path = report_dir / "evaluation_summary.json"
-    top_summary_path.write_text(json.dumps(outputs, ensure_ascii=False, indent=2), encoding="utf-8")
-    console.print("[bold green]Evaluation completed.[/bold green]")
-    console.print(f"[green]Report Dir:[/green] {report_dir}")
-    console.print(f"[green]Top Summary:[/green] {top_summary_path}")
-    if "speed" in outputs:
-        console.print(f"[green]Speed Raw JSON:[/green] {outputs['speed']['raw_json']}")
-        console.print(f"[green]Speed Raw CSV:[/green] {outputs['speed']['raw_csv']}")
-        console.print(f"[green]Speed Summary:[/green] {outputs['speed']['summary_json']}")
-        console.print(f"[green]Speed HTML:[/green] {outputs['speed']['report_html']}")
-    if "accuracy" in outputs:
-        console.print(f"[green]Accuracy Records JSON:[/green] {outputs['accuracy']['records_json']}")
-        console.print(f"[green]Accuracy Records CSV:[/green] {outputs['accuracy']['records_csv']}")
-        console.print(f"[green]Accuracy Passkey CSV:[/green] {outputs['accuracy']['passkey_trials_csv']}")
-        console.print(f"[green]Accuracy Summary:[/green] {outputs['accuracy']['summary_json']}")
-        console.print(f"[green]Accuracy HTML:[/green] {outputs['accuracy']['report_html']}")
-
+    
+    if args.action == "speed":
+        result_data = await run_llm_speed_evaluation(args, report_dir, case)
+    elif args.action == "accuracy":
+        result_data = await run_llm_accuracy_evaluation(args, report_dir, [case])
+    else:
+        raise ValueError(f"Unknown action: {args.action}")
+        
+    output_json_path.write_text(json.dumps(result_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    console.print(f"[bold green]Evaluation completed.[/bold green]")
+    console.print(f"[green]Data saved to:[/green] {output_json_path}")
 
 if __name__ == "__main__":
     asyncio.run(main_async())
@@ -1173,4 +1129,12 @@ if __name__ == "__main__":
 """
 python BatchAgent/evaluator_main.py --eval-type llm --resume-dir /Developer/AIserver/agent_workspace/evaluations/llm/2026-03-15_163359 --tokenizer Qwen/Qwen3.5-9B --resume
 
+python BatchAgent/evaluator_main.py --action speed --output-json qwen_9b_speed.json
+
+python BatchAgent/evaluator_main.py --action compare --compare-files qwen_9b_speed.json
+python BatchAgent/evaluator_main.py --action compare --compare-files qwen_9b_speed.json --compare-output comparison.html
+
+
+python BatchAgent/evaluator_main.py --action speed --base-url http://localhost:8000/v1 --base-url-name "qwen3.5-9b-local" --output-json qwen_9b_speed_local.json
+python BatchAgent/evaluator_main.py --action compare --compare-files qwen_9b_speed_local.json --compare-output comparison_local9b.html
 """

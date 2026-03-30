@@ -181,10 +181,13 @@ def _default_profiles_for_tool(name: str, category: str) -> Set[str]:
     if category == "mutation":
         return {"coding", "general"}
 
-    if name in {"search_code", "find_file", "read_file_chunk", "list_directory", "run_bash_command"}:
-        return {"coding", "general"}
+    if name in {"grep", "find_file", "read_file_chunk", "list_directory", "run_bash_command"}:
+        return {"coding", "general", "document", "research"}
 
-    if name in {"get_document_overview", "read_document_section", "search_document"}:
+    if name == "view_image":
+        return {"coding", "document", "research", "general"}
+
+    if name in {"get_document_overview", "read_document_section"}:
         return {"document", "research", "general"}
 
     if name in {"web_search", "read_url"}:
@@ -236,7 +239,7 @@ def _default_requires_for_tool(name: str, category: str) -> Set[str]:
     if category == "mutation":
         return {"mutation"}
 
-    if name in {"get_document_overview", "read_document_section", "search_document"}:
+    if name in {"get_document_overview", "read_document_section"}:
         return {"document_manager"}
 
     if name in {"web_search", "read_url"}:
@@ -472,10 +475,10 @@ class ToolRegistryRuntime:
         if name in {"web_search", "read_url"} and not config.enable_web:
             return False
 
-        if name in {"get_document_overview", "read_document_section", "search_document"} and not config.enable_document:
+        if name in {"get_document_overview", "read_document_section"} and not config.enable_document:
             return False
 
-        if name in {"search_code", "find_file", "read_file_chunk", "list_directory"} and not config.enable_code_tools:
+        if name in {"grep", "find_file", "read_file_chunk", "list_directory"} and not config.enable_code_tools:
             return False
 
         if name == "run_bash_command" and not config.enable_bash:

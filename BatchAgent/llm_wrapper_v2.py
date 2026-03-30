@@ -2,7 +2,8 @@ import time
 import re
 import asyncio
 import json
-from typing import List, Dict, Any, Optional, Tuple, Callable, Awaitable
+import base64
+from typing import List, Dict, Any, Optional, Tuple, Callable, Awaitable, Union
 from pathlib import Path
 from rich.console import Console
 import sys
@@ -24,6 +25,218 @@ from BatchAgent.mini_batch_agent_base import AgentAction, ActionWriteFile, Actio
 
 # Import the new decoupled parser
 from BatchAgent.tools.text_action_parser import parse_text_actions
+
+# ==========================================
+# Multi-Modal Utilities
+# ==========================================
+
+def encode_image_to_base64(image_path: str) -> str:
+    """Encode an image file to a base64 string."""
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def make_image_content_block(image_source: str, media_type: str = "jpeg") -> Dict[str, Any]:
+    """
+    Create an OpenAI-compatible image_url content block.
+
+    Args:
+        image_source: A URL (http/https/data:) or a local file path.
+        media_type:   Image MIME sub-type – jpeg, png, gif, or webp.
+    """
+    if image_source.startswith(("http://", "https://", "data:")):
+        url = image_source
+    else:
+        b64 = encode_image_to_base64(image_source)
+        url = f"data:image/{media_type};base64,{b64}"
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def make_multimodal_message(
+    role: str,
+    text: str,
+    images: Optional[List[str]] = None,
+    media_type: str = "jpeg",
+) -> Dict[str, Any]:
+    """
+    Build a message dict with interleaved text and image content.
+
+    Args:
+        role:       "user", "assistant", or "system".
+        text:       The text portion of the message.
+        images:     List of image file paths or URLs (optional).
+        media_type: Default MIME sub-type used when encoding local files.
+
+    Returns:
+        A message dict accepted by any OpenAI-compatible chat API.
+    """
+    if not images:
+        return {"role": role, "content": text}
+    content: List[Dict[str, Any]] = [{"type": "text", "text": text}]
+    for img in images:
+        content.append(make_image_content_block(img, media_type))
+    return {"role": role, "content": content}
+
+
+def _extract_text_from_content(content: Union[str, list, None]) -> str:
+    """Return the concatenated text from either a plain string or a content-block list."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return str(content)
+
+
+def _count_images_in_content(content: Union[str, list, None]) -> int:
+    """Count image_url blocks in a message content."""
+    if not isinstance(content, list):
+        return 0
+    return sum(1 for b in content if isinstance(b, dict) and b.get("type") == "image_url")
+
+
+def _estimate_tokens_multimodal(messages: List[Dict[str, Any]]) -> int:
+    """
+    Token estimator that handles both plain-text and multimodal message content.
+
+    For data-URI images the cost is derived from the actual URI length
+    (base64 chars ≈ tokens × 4) rather than a flat 512, because a single
+    full-resolution JPEG can easily exceed 30 000 tokens.
+    URL-referenced images fall back to a flat 512.
+    """
+    total = 0
+    for m in messages:
+        content = m.get("content")
+        total += estimate_tokens(_extract_text_from_content(content))
+        if isinstance(content, list):
+            for block in content:
+                if not (isinstance(block, dict) and block.get("type") == "image_url"):
+                    continue
+                url = block.get("image_url", {}).get("url", "")
+                if url.startswith("data:"):
+                    total += max(256, len(url) // 4)
+                else:
+                    total += 512
+    return total
+
+
+def _compress_messages_multimodal(
+    messages: List[Dict[str, Any]], max_allowed_tokens: int
+) -> List[Dict[str, Any]]:
+    """
+    Multimodal-aware compress_messages.
+
+    Compression priority
+    --------------------
+    1. Strip image_url data-URI blobs from older messages (highest token cost
+       per block — a single JPEG can exceed 30 000 tokens).  Only the most
+       recent message containing images is kept intact; older image blocks
+       are replaced with a short text placeholder.
+    2. Truncate the longest text block (existing text-compression logic).
+
+    The system message (index 0) and the initial user task (index 1) are
+    never touched so vLLM prefix caching remains intact.
+    """
+    import copy
+    msgs = copy.deepcopy(messages)
+
+    # ── Phase 1: strip old image blocks ──────────────────────────────────────
+    # Collect indices of messages (beyond the protected pair) that have images.
+    def _has_images(m: Dict) -> bool:
+        c = m.get("content")
+        return isinstance(c, list) and any(
+            isinstance(b, dict) and b.get("type") == "image_url" for b in c
+        )
+
+    image_indices = [i for i, m in enumerate(msgs) if i >= 2 and _has_images(m)]
+    # Keep the last one intact; strip the rest first.
+    to_strip = image_indices[:-1] if len(image_indices) > 1 else []
+
+    for idx in to_strip:
+        if _estimate_tokens_multimodal(msgs) <= max_allowed_tokens:
+            break
+        content = msgs[idx]["content"]
+        new_blocks = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image_url":
+                new_blocks.append({"type": "text", "text": "[previously loaded image — stripped to save context]"})
+            else:
+                new_blocks.append(block)
+        # Flatten to string if only text blocks remain
+        if all(isinstance(b, dict) and b.get("type") == "text" for b in new_blocks):
+            msgs[idx]["content"] = "\n".join(b.get("text", "") for b in new_blocks)
+        else:
+            msgs[idx]["content"] = new_blocks
+
+    # Also strip the last image message if still over budget
+    if image_indices and _estimate_tokens_multimodal(msgs) > max_allowed_tokens:
+        last_idx = image_indices[-1]
+        content = msgs[last_idx]["content"]
+        new_blocks = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image_url":
+                new_blocks.append({"type": "text", "text": "[previously loaded image — stripped to save context]"})
+            else:
+                new_blocks.append(block)
+        if all(isinstance(b, dict) and b.get("type") == "text" for b in new_blocks):
+            msgs[last_idx]["content"] = "\n".join(b.get("text", "") for b in new_blocks)
+        else:
+            msgs[last_idx]["content"] = new_blocks
+
+    # ── Phase 2: truncate longest text blocks ─────────────────────────────────
+    TRUNCATION_TAG = "\n...[TRUNCATED]...\n"
+    while True:
+        if _estimate_tokens_multimodal(msgs) <= max_allowed_tokens:
+            break
+
+        # Find the longest *text* among compressible messages (skip system + first user)
+        longest_idx, longest_len = -1, 0
+        for i, m in enumerate(msgs):
+            if i in (0, 1):
+                continue
+            tlen = len(_extract_text_from_content(m.get("content")))
+            if tlen > longest_len:
+                longest_len, longest_idx = tlen, i
+
+        if longest_idx == -1:
+            # Fallback: allow any message except system
+            for i, m in enumerate(msgs):
+                if i == 0:
+                    continue
+                tlen = len(_extract_text_from_content(m.get("content")))
+                if tlen > longest_len:
+                    longest_len, longest_idx = tlen, i
+
+        if longest_idx == -1 or longest_len < 400:
+            break
+
+        keep_chars = int(longest_len * 0.45)
+        if keep_chars * 2 + 35 >= longest_len:
+            break
+
+        content = msgs[longest_idx]["content"]
+        if isinstance(content, str):
+            msgs[longest_idx]["content"] = (
+                content[:keep_chars] + TRUNCATION_TAG + content[-keep_chars:]
+            )
+        elif isinstance(content, list):
+            # Truncate the first text block whose length matches
+            for j, block in enumerate(content):
+                if isinstance(block, dict) and block.get("type") == "text":
+                    txt = block.get("text", "")
+                    if len(txt) == longest_len:
+                        msgs[longest_idx]["content"][j]["text"] = (
+                            txt[:keep_chars] + TRUNCATION_TAG + txt[-keep_chars:]
+                        )
+                        break
+
+    return msgs
+
 
 # ==========================================
 # Helper Modules for LLM Interaction
@@ -318,16 +531,17 @@ async def complete_with_continuation_async(
     for i in range(max_loops):
         if i > 0: console.print(f"[dim]Generation loop {i+1}/{max_loops}...[/dim]")
         
-        # 1. Token budgeting
-        input_text = "\n".join(m.get("content", "") for m in current_messages)
-        input_est = estimate_tokens(input_text)
+        # 1. Token budgeting (multimodal-aware)
+        input_est = _estimate_tokens_multimodal(current_messages)
         min_output = 1024
         max_allowed_input = model_max_context - 1000 - min_output
-        
+
         if int(input_est * 1.1) > max_allowed_input > 0:
             console.print(f"[yellow]Compressing messages (est {input_est} > limit).[/yellow]")
-            current_messages = compress_messages(current_messages, max_allowed_tokens=int(max_allowed_input / 1.1))
-            input_est = estimate_tokens("\n".join(m.get("content", "") for m in current_messages))
+            current_messages = _compress_messages_multimodal(
+                current_messages, max_allowed_tokens=int(max_allowed_input / 1.1)
+            )
+            input_est = _estimate_tokens_multimodal(current_messages)
 
         safe_tokens = compute_safe_max_tokens(input_est, model_max_context, max_output_tokens, min_output)
 
@@ -484,12 +698,15 @@ async def complete_with_continuation_async(
 # ==========================================
 if __name__ == "__main__":
     from openai import AsyncOpenAI
-    
+
     # Configure parameters as supplied by the user instructions
-    API_BASE = "http://100.110.236.127:8000/v1"
+    API_BASE = "http://localhost:8000/v1"
     API_KEY = "EMPTY"
-    MODEL_NAME = "qwen3.5-9b"
-    
+    MODEL_NAME = "qwen3.5-35b-moe-int4"
+
+    # Path to the demo image used in vision tests
+    DEMO_IMAGE = str(Path(__file__).resolve().parent.parent / "tests" / "demo.jpeg")
+
     sample_tools = [
         {
             "type": "function",
@@ -499,15 +716,92 @@ if __name__ == "__main__":
                 "parameters": {
                     "type": "object",
                     "properties": {"dir_path": {"type": "string"}},
-                }
-            }
+                },
+            },
         }
     ]
 
+    # ------------------------------------------------------------------
+    # Unit tests for the multimodal utility helpers (no network required)
+    # ------------------------------------------------------------------
+    def test_multimodal_helpers():
+        console.print("\n[bold blue]== Unit Tests: Multimodal Helpers ==[/bold blue]")
+
+        # 1. _extract_text_from_content
+        assert _extract_text_from_content("hello") == "hello"
+        assert _extract_text_from_content(None) == ""
+        blocks = [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "x"}}]
+        assert _extract_text_from_content(blocks) == "hi"
+        console.print("[green]✓ _extract_text_from_content[/green]")
+
+        # 2. _count_images_in_content
+        assert _count_images_in_content("text") == 0
+        assert _count_images_in_content(blocks) == 1
+        console.print("[green]✓ _count_images_in_content[/green]")
+
+        # 3. _estimate_tokens_multimodal (image adds 512)
+        msgs = [{"role": "user", "content": blocks}]
+        est = _estimate_tokens_multimodal(msgs)
+        text_est = estimate_tokens("hi")
+        assert est == text_est + 512, f"Expected {text_est + 512}, got {est}"
+        console.print("[green]✓ _estimate_tokens_multimodal[/green]")
+
+        # 4. make_image_content_block with a URL (no file I/O)
+        block = make_image_content_block("https://example.com/img.png")
+        assert block["type"] == "image_url"
+        assert block["image_url"]["url"] == "https://example.com/img.png"
+        console.print("[green]✓ make_image_content_block (url)[/green]")
+
+        # 5. make_multimodal_message – text only
+        msg = make_multimodal_message("user", "describe this")
+        assert msg == {"role": "user", "content": "describe this"}
+        console.print("[green]✓ make_multimodal_message (text only)[/green]")
+
+        # 6. make_multimodal_message – with a base64-embedded local image
+        if Path(DEMO_IMAGE).exists():
+            msg = make_multimodal_message("user", "describe this", images=[DEMO_IMAGE])
+            assert isinstance(msg["content"], list) and len(msg["content"]) == 2
+            assert msg["content"][0] == {"type": "text", "text": "describe this"}
+            assert msg["content"][1]["type"] == "image_url"
+            assert msg["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+            console.print("[green]✓ make_multimodal_message (with local image)[/green]")
+        else:
+            console.print(f"[yellow]Skipping local-image test – {DEMO_IMAGE} not found[/yellow]")
+
+        # 7. _compress_messages_multimodal – text path
+        long_text = "word " * 500
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": long_text},
+        ]
+        compressed = _compress_messages_multimodal(msgs, max_allowed_tokens=100)
+        assert len(_extract_text_from_content(compressed[2]["content"])) < len(long_text)
+        console.print("[green]✓ _compress_messages_multimodal (text)[/green]")
+
+        # 8. _compress_messages_multimodal – multimodal path (image preserved)
+        mm_content = [{"type": "text", "text": long_text}, {"type": "image_url", "image_url": {"url": "data:x"}}]
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "task"},
+            {"role": "user", "content": mm_content},
+        ]
+        compressed = _compress_messages_multimodal(msgs, max_allowed_tokens=100)
+        result_content = compressed[2]["content"]
+        assert isinstance(result_content, list)
+        assert any(b.get("type") == "image_url" for b in result_content), "Image block should be preserved"
+        assert len(_extract_text_from_content(result_content)) < len(long_text)
+        console.print("[green]✓ _compress_messages_multimodal (multimodal – image preserved)[/green]")
+
+        console.print("[bold green]All helper unit tests passed.[/bold green]")
+
+    # ------------------------------------------------------------------
+    # Integration tests (require a running vLLM server)
+    # ------------------------------------------------------------------
     async def run_integration_tests():
         client = AsyncOpenAI(api_key=API_KEY, base_url=API_BASE)
-        console.print(f"\\n[bold green]Testing Connection to vLLM ({API_BASE} using {MODEL_NAME})[/bold green]\\n")
-        
+        console.print(f"\n[bold green]Testing Connection to vLLM ({API_BASE} using {MODEL_NAME})[/bold green]\n")
+
         # Testing 1: "text_only" strategy
         console.print("=> [cyan]Testing Strategy: text_only[/cyan]")
         msg = [{"role": "user", "content": "Please output a raw XML tool call to list the current directory '.' wrapped in a <tool_call> block. Do not write text."}]
@@ -515,24 +809,81 @@ if __name__ == "__main__":
             client=client, model=MODEL_NAME, messages=msg, tool_strategy="text_only", tools=sample_tools, verbose=True
         )
         console.print(f"Result parsed actions ({len(result_actions)}): {result_actions}")
-        
+
         # Testing 2: "native_all" strategy
-        console.print("\\n=> [cyan]Testing Strategy: native_all[/cyan]")
+        console.print("\n=> [cyan]Testing Strategy: native_all[/cyan]")
         msg = [{"role": "user", "content": "Please emit purely Native JSON for the list_directory tool with dir_path: './foo'."}]
         _, result_actions = await complete_with_continuation_async(
             client=client, model=MODEL_NAME, messages=msg, tool_strategy="native_all", tools=sample_tools, verbose=True
         )
         console.print(f"Result parsed actions ({len(result_actions)}): {result_actions}")
-        
+
         # Testing 3: "hybrid" strategy
-        console.print("\\n=> [cyan]Testing Strategy: hybrid[/cyan]")
+        console.print("\n=> [cyan]Testing Strategy: hybrid[/cyan]")
         msg = [{"role": "user", "content": "Please output a raw <write_file><path>test.txt</path><content>data123</content></write_file> chunk."}]
         _, result_actions = await complete_with_continuation_async(
             client=client, model=MODEL_NAME, messages=msg, tool_strategy="hybrid", tools=sample_tools, verbose=True, allowlist=["test.txt"]
         )
         console.print(f"Result parsed actions ({len(result_actions)}): {result_actions}")
 
+        # Testing 4: vision / multimodal message
+        console.print("\n=> [cyan]Testing Strategy: vision (multimodal image input)[/cyan]")
+        if Path(DEMO_IMAGE).exists():
+            vision_msg = make_multimodal_message(
+                "user",
+                "请仔细观察这张图片，描述它所展现的场景、其中的技术元素以及整体氛围。",
+                images=[DEMO_IMAGE],
+            )
+            content, _ = await complete_with_continuation_async(
+                client=client,
+                model=MODEL_NAME,
+                messages=[vision_msg],
+                tool_strategy="text_only",
+                verbose=True,
+                max_output_tokens=512,
+            )
+            console.print(f"\n[bold]Vision response:[/bold] {content[:300]}...")
+        else:
+            console.print(f"[yellow]Skipping vision test – {DEMO_IMAGE} not found[/yellow]")
+
+        # Testing 5: multi-turn conversation with inline image
+        console.print("\n=> [cyan]Testing: multi-turn conversation with image[/cyan]")
+        if Path(DEMO_IMAGE).exists():
+            turn1 = make_multimodal_message(
+                "user",
+                "这张图片里有什么颜色？",
+                images=[DEMO_IMAGE],
+            )
+            turn1_reply, _ = await complete_with_continuation_async(
+                client=client,
+                model=MODEL_NAME,
+                messages=[turn1],
+                tool_strategy="text_only",
+                verbose=True,
+                max_output_tokens=128,
+            )
+            # Follow-up question (text only – image already in context)
+            conversation = [
+                turn1,
+                {"role": "assistant", "content": turn1_reply},
+                {"role": "user", "content": "你觉得这张图片的风格是什么？"},
+            ]
+            follow_up, _ = await complete_with_continuation_async(
+                client=client,
+                model=MODEL_NAME,
+                messages=conversation,
+                tool_strategy="text_only",
+                verbose=True,
+                max_output_tokens=128,
+            )
+            console.print(f"\n[bold]Follow-up response:[/bold] {follow_up[:300]}")
+        else:
+            console.print(f"[yellow]Skipping multi-turn vision test – {DEMO_IMAGE} not found[/yellow]")
+
+    # Run unit tests first (no server needed), then integration tests
+    test_multimodal_helpers()
+
     try:
         asyncio.run(run_integration_tests())
     except Exception as e:
-        console.print(f"[red]Test connection failed. Is the vLLM server running? Error: {e}[/red]")
+        console.print(f"[red]Integration test failed. Is the vLLM server running? Error: {e}[/red]")

@@ -53,11 +53,35 @@ _DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml,application/pdf;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
 }
+
+# Alternative headers for sites that block the default UA (different OS/browser)
+_ALT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
+
+# HTTP status codes that indicate bot-detection / access control worth retrying
+_BOT_BLOCK_CODES = {403, 401, 429, 503, 451}
 
 
 def _truncate_content(text: str, max_chars: int = _MAX_CONTENT_CHARS) -> str:
@@ -85,18 +109,116 @@ def _extract_pdf_text(raw_bytes: bytes) -> str:
     return _truncate_content("\n\n".join(pages))
 
 
+def _fetch_via_jina(url: str, timeout: int = 25) -> Tuple[str, str]:
+    """
+    Fetch a URL via the Jina Reader service (https://r.jina.ai/).
+
+    Jina proxies the request through its own servers and returns clean markdown,
+    bypassing bot-protection / Cloudflare / paywalls that block direct httpx calls.
+    No API key required for basic use.
+
+    Returns
+    -------
+    (title, content)  — both empty strings on any failure.
+    """
+    jina_url = f"https://r.jina.ai/{url}"
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            resp = client.get(
+                jina_url,
+                headers={
+                    "Accept": "text/plain",
+                    "User-Agent": _DEFAULT_HEADERS["User-Agent"],
+                },
+            )
+        if resp.status_code != 200 or not resp.text.strip():
+            return "", ""
+
+        raw = resp.text.strip()
+
+        # Parse Jina's structured output:
+        #   Title: …
+        #   URL Source: …
+        #   Published Time: …   (optional)
+        #   Markdown Content:
+        #   <content>
+        title = ""
+        content = raw
+
+        title_m = re.search(r"^Title:\s*(.+)$", raw, re.MULTILINE)
+        if title_m:
+            title = title_m.group(1).strip()
+
+        # Everything after "Markdown Content:" is the page body
+        mc_split = re.split(r"^Markdown Content:\s*$", raw, maxsplit=1, flags=re.MULTILINE)
+        if len(mc_split) == 2:
+            content = mc_split[1].strip()
+        else:
+            # Fallback: drop the header block (up to the first blank line after metadata)
+            lines = raw.splitlines()
+            for i, line in enumerate(lines):
+                if line.startswith("Markdown Content:") or (i > 3 and not line.startswith(("Title:", "URL Source:", "Published"))):
+                    content = "\n".join(lines[i:]).strip()
+                    break
+
+        return title, _truncate_content(content)
+
+    except Exception as exc:
+        logger.debug("Jina fallback failed for %s: %s", url, exc)
+        return "", ""
+
+
 def _fetch_via_playwright(url: str) -> str:
+    """
+    Fetch a URL with a headless Chromium browser.
+
+    Returns structured markdown extracted from the page HTML (preferred over
+    raw innerText for better link/heading preservation).  Falls back to
+    innerText if markdownify is not available.  Returns "" on any error.
+    """
     if not _PLAYWRIGHT_AVAILABLE:
         return ""
 
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
-            page = browser.new_page(user_agent=_DEFAULT_HEADERS["User-Agent"])
-            page.goto(url, timeout=30000, wait_until="domcontentloaded")
-            text = page.evaluate("() => document.body.innerText")
+            context = browser.new_context(
+                user_agent=_DEFAULT_HEADERS["User-Agent"],
+                locale="en-US",
+                java_script_enabled=True,
+                # Bypass some bot-detection by mimicking a real viewport
+                viewport={"width": 1280, "height": 800},
+            )
+            page = context.new_page()
+            page.goto(url, timeout=30000, wait_until="networkidle")
+            html_content = page.content()
             browser.close()
-        return _truncate_content(text or "")
+
+        if not html_content:
+            return ""
+
+        soup = BeautifulSoup(html_content, "html.parser")
+        for tag in _NOISE_TAGS:
+            for el in soup.find_all(tag):
+                el.decompose()
+        main_content = (
+            soup.find("article")
+            or soup.find("main")
+            or soup.find(id=re.compile(r"content|main|body|post", re.I))
+            or soup.find(class_=re.compile(r"content|main|article|post|entry", re.I))
+            or soup.body
+        )
+        if main_content:
+            markdown_text = markdownify.markdownify(
+                str(main_content),
+                heading_style="ATX",
+                strip=["img"],
+            )
+        else:
+            markdown_text = soup.get_text(separator="\n", strip=True)
+
+        return _truncate_content(markdown_text.strip())
+
     except Exception as exc:
         logger.debug("Playwright fallback failed for %s: %s", url, exc)
         return ""
@@ -347,9 +469,71 @@ class URLReader:
 
             with httpx.Client(timeout=20.0, follow_redirects=True) as client:
                 response = client.get(url, headers=headers)
-                response.raise_for_status()
-                content_type = response.headers.get("content-type", "").lower()
-                raw_bytes = response.content
+
+            # ── Bot-protection / access-control fallback chain ──────────────
+            if response.status_code in _BOT_BLOCK_CODES:
+                # Attempt 2: alternative browser headers (different OS/UA)
+                try:
+                    with httpx.Client(timeout=20.0, follow_redirects=True) as client2:
+                        response2 = client2.get(url, headers=_ALT_HEADERS)
+                    if response2.status_code not in _BOT_BLOCK_CODES:
+                        response = response2
+                    else:
+                        logger.debug(
+                            "Alt-headers also blocked (%d) for %s",
+                            response2.status_code, url,
+                        )
+                except Exception as exc2:
+                    logger.debug("Alt-headers fetch failed for %s: %s", url, exc2)
+
+            # Attempt 3: Jina Reader — free proxy service, no install needed,
+            # bypasses most bot-protection / Cloudflare challenges.
+            if response.status_code in _BOT_BLOCK_CODES:
+                logger.info("HTTP %d for %s — retrying via Jina Reader", response.status_code, url)
+                jina_title, jina_content = _fetch_via_jina(url)
+                if jina_content:
+                    return self._make_record(
+                        url=url,
+                        title=jina_title or urlparse(url).netloc,
+                        summary=jina_content,
+                        content=jina_content,
+                        record_type="web_page",
+                        source_type="url_fetch",
+                        source=urlparse(url).netloc,
+                        domain=domain,
+                        category=category,
+                        metadata={
+                            "reader": "jina",
+                            "fallback_reason": f"http_{response.status_code}",
+                        },
+                    )
+
+            # Attempt 4: Playwright headless browser (bypasses JS-based bot checks)
+            if response.status_code in _BOT_BLOCK_CODES and _PLAYWRIGHT_AVAILABLE:
+                logger.info("HTTP %d for %s — retrying with Playwright", response.status_code, url)
+                pw_text = _fetch_via_playwright(url)
+                if pw_text:
+                    return self._make_record(
+                        url=url,
+                        title=urlparse(url).netloc,
+                        summary=pw_text,
+                        content=pw_text,
+                        record_type="web_page",
+                        source_type="url_fetch",
+                        source=urlparse(url).netloc,
+                        domain=domain,
+                        category=category,
+                        metadata={
+                            "reader": "playwright",
+                            "fallback_reason": f"http_{response.status_code}",
+                        },
+                    )
+
+            # Raise for any remaining non-2xx status (all fallbacks exhausted)
+            response.raise_for_status()
+
+            content_type = response.headers.get("content-type", "").lower()
+            raw_bytes = response.content
 
             url_path = url.split("?")[0].lower()
             is_pdf = (
@@ -430,6 +614,25 @@ class URLReader:
                 pw_text = _fetch_via_playwright(url)
                 if len(pw_text) > len(markdown_text):
                     markdown_text = pw_text
+
+            # SPA / JS-rendered pages return HTTP 200 with an empty shell.
+            # Fall back to Jina Reader which runs a headless browser server-side.
+            if len(markdown_text) < _PLAYWRIGHT_THRESHOLD:
+                logger.info("Thin content (%d chars) for %s — retrying via Jina Reader", len(markdown_text), url)
+                jina_title, jina_content = _fetch_via_jina(url)
+                if jina_content:
+                    return self._make_record(
+                        url=url,
+                        title=jina_title or title or urlparse(url).netloc,
+                        summary=jina_content,
+                        content=jina_content,
+                        record_type="web_page",
+                        source_type="url_fetch",
+                        source=urlparse(url).netloc,
+                        domain=domain,
+                        category=category,
+                        metadata={"reader": "jina", "fallback_reason": "spa_thin_content"},
+                    )
 
             if not markdown_text.strip():
                 raise RuntimeError("Could not extract meaningful page content")

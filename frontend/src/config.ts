@@ -59,18 +59,27 @@ export const config = {
   },
 
   agent: {
-    apiUrl: process.env.NEXT_PUBLIC_AGENT_API_URL || '/api/v1',
+    apiUrl: process.env.NEXT_PUBLIC_AGENT_BASE_URL || '/agent',
     defaultModel: 'local-qwen',
     maxContext: 0,
     maxOutput: 0,
     models: [
       {
         id: 'local-qwen',
-        name: 'Qwen (Local)',
+        name: 'Qwen3.5-9B (Local)',
         provider: 'openai',
         baseUrl: process.env.NEXT_PUBLIC_VLLM_BASE_URL || 'http://100.110.236.127:8000/v1',
         apiKey: process.env.NEXT_PUBLIC_VLLM_API_KEY || 'EMPTY',
-        model: process.env.NEXT_PUBLIC_VLLM_MODEL || 'qwen3-30b-a3b',
+        model: process.env.NEXT_PUBLIC_VLLM_MODEL || 'qwen3.5-9b',
+        backend: 'vllm',
+      },
+      {
+        id: 'local-qwen-35b',
+        name: 'Qwen3.5-35B MoE (Local)',
+        provider: 'openai',
+        baseUrl: process.env.NEXT_PUBLIC_VLLM2_BASE_URL || 'http://127.0.0.1:8000/v1',
+        apiKey: process.env.NEXT_PUBLIC_VLLM2_API_KEY || 'EMPTY',
+        model: process.env.NEXT_PUBLIC_VLLM2_MODEL || 'qwen3.5-35b-moe-int4',
         backend: 'vllm',
       },
       {
