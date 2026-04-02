@@ -145,6 +145,11 @@ class AgentConfig:
     # ── Behaviour / safety ────────────────────────────────────────────────────
     require_approval: bool = False
     sandbox_container: Optional[str] = None
+    # Path to a Python venv to use for code verification (e.g. "/path/to/.venv").
+    # When set, `python3` / `python` in verify commands is replaced with the
+    # venv interpreter so agent-generated scripts run in an isolated environment.
+    # Set to "auto" to automatically create a per-workspace venv on demand.
+    sandbox_venv: Optional[str] = None
     verbose: bool = False
     max_retries: int = 4
     enable_turn_limits: bool = False
@@ -1469,8 +1474,11 @@ class UniversalAgent:
                     # The separator prevents the model from treating old tool-result
                     # turns as context for the new task.
                     new_task_msg = (
-                        "[Previous task completed. A new independent task is starting now. "
-                        "Ignore previous results — start fresh.]\n\n"
+                        "[SYSTEM: Previous task is COMPLETE. A new independent task starts NOW.]\n"
+                        "[ACTION REQUIRED: Do NOT re-read files from the previous task. "
+                        "Use context resources already provided in the prompt below. "
+                        "Start executing immediately — gather only what is strictly missing, "
+                        "then write the output. Do not spend turns re-reading what you already have.]\n\n"
                         + first_prompt
                     )
                     self.messages.append({"role": "user", "content": new_task_msg})
@@ -1516,7 +1524,10 @@ class UniversalAgent:
             ]
             if json_parse_errors:
                 ts.consecutive_json_parse_turns += 1
-                if self.config.tool_strategy == "native_all" and ts.consecutive_json_parse_turns >= 2:
+                # write_file is a large-payload mutation — JSON is structurally hard to
+                # get right for long files. Switch to hybrid XML immediately on the 1st
+                # failure rather than wasting a turn retrying with the same strategy.
+                if self.config.tool_strategy == "native_all" and ts.consecutive_json_parse_turns >= 1:
                     self.config.tool_strategy = "hybrid"
                     self._rebuild_tools_and_prompt("hybrid", self.config.domain)
                     self._append_feedback(

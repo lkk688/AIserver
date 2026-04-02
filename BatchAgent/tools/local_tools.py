@@ -359,12 +359,24 @@ def robust_json_loads(json_str: str, tool_name: str = "") -> Optional[Dict[str, 
                     .replace("\\\\", "\\")
                 )
 
-            path_raw = _extract_string_field(json_str, "path")
+            # Try "path" first, fall back to "filepath" (common model mistake)
+            path_raw = _extract_string_field(json_str, "path") or _extract_string_field(json_str, "filepath")
             content_raw = _extract_string_field(json_str, "content")
             if path_raw is not None and content_raw is not None:
                 path = _unescape_json_string(path_raw)
                 clean_content = _unescape_json_string(content_raw)
                 return {"path": path, "content": clean_content}
+            # Last resort: newline-unescape the whole payload then retry standard parse
+            try:
+                relaxed = json_str.replace("\r\n", "\\n").replace("\r", "\\n")
+                # Replace bare (unescaped) newlines inside string values
+                import re as _re
+                relaxed = _re.sub(r'(?<!\\)\n', r'\\n', relaxed)
+                result = json.loads(relaxed)
+                if isinstance(result, dict):
+                    return result
+            except Exception:
+                pass
         except Exception as e:
             logging.error(f"Violent regex extraction failed: {e}")
 

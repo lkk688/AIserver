@@ -62,6 +62,10 @@ class AgentService:
         reranker_base_url: str = "",
         reranker_api_key: str = "",
         reranker_model: str = "",
+        # Sandbox for code verification: path to venv dir, "auto", or "" for none
+        sandbox_venv: str = "",
+        # Docker container name for full isolation (existing support)
+        sandbox_container: str = "",
     ) -> None:
         self.base_url = base_url
         self.api_key = api_key
@@ -102,6 +106,8 @@ class AgentService:
         self.reranker_base_url = reranker_base_url
         self.reranker_api_key = reranker_api_key
         self.reranker_model = reranker_model
+        self.sandbox_venv = sandbox_venv or None
+        self.sandbox_container = sandbox_container or None
 
     def _build_client(self) -> Any:
         if self.provider == "anthropic":
@@ -259,6 +265,8 @@ class AgentService:
             reranker_base_url=self.reranker_base_url,
             reranker_api_key=self.reranker_api_key,
             reranker_model=self.reranker_model,
+            sandbox_venv=self.sandbox_venv,
+            sandbox_container=self.sandbox_container,
         )
 
         agent = UniversalAgent(config=config, system_message=system_prompt, tools=compiled_tools)

@@ -91,20 +91,29 @@ class OnlineSearchService:
             self.pg_store.upsert_records(enriched)
 
     def build_search_plan(self, request: SearchRequest) -> SearchPlan:
+        # Normalise domain aliases so the plan branches see canonical names
+        domain = request.domain
+        if domain == "health":
+            domain = "medical"
+        elif domain in ("finance", "business"):
+            domain = "finance"
+        elif domain in ("code", "programming"):
+            domain = "software_eng"
+
         plan = SearchPlan(
             normalized_query=request.query.strip(),
-            domain=request.domain,
+            domain=request.domain,  # keep original for cache keying
             category=request.category,
             use_youtube=request.enable_youtube,
         )
 
-        if request.domain == "news":
+        if domain == "news":
             plan.use_news_rss = True
             plan.use_news_api = True
             plan.use_wikimedia = False
             plan.recent_hours = self.config.general_cache_hours
 
-        elif request.domain in ("academic", "medical", "medical_academic", "research"):
+        elif domain in ("academic", "medical", "medical_academic", "research"):
             plan.use_pubmed = request.use_academic_sources or request.use_medical_sources
             plan.use_medlineplus = request.use_medical_sources
             plan.use_nimh = False  # consistently 403; disabled
@@ -113,14 +122,14 @@ class OnlineSearchService:
             plan.use_news_api = False
             plan.use_wikimedia = True
             plan.recent_hours = self.config.general_cache_hours
-            if request.domain == "medical":
+            if domain == "medical":
                 # Health info: PubMed + MedlinePlus consumer pages + Europe PMC
                 plan.use_arxiv = False
                 plan.use_semantic_scholar = False
                 plan.use_cdc = False  # JS-rendered, no usable API
                 plan.use_who = False  # iris.who.int requires auth (403)
                 plan.use_europe_pmc = True
-            elif request.domain == "medical_academic":
+            elif domain == "medical_academic":
                 # Research papers only: PubMed + Europe PMC; no consumer health pages
                 plan.use_pubmed = True
                 plan.use_medlineplus = False
@@ -134,7 +143,20 @@ class OnlineSearchService:
                 plan.use_arxiv = True
                 plan.use_semantic_scholar = True
 
+        elif domain in ("software_eng", "math", "science", "language", "finance",
+                        "assistant", "sales_support"):
+            # Domain-filtered web search — serper/tavily use site: filters from
+            # SearchAPIFetcher._DOMAIN_FILTER_MAP for these domains.
+            plan.use_serper = True
+            plan.use_tavily = True
+            plan.use_wikimedia = (domain in ("math", "science", "language"))
+            plan.use_crawler = False
+            plan.use_news_rss = False
+            plan.use_news_api = False
+            plan.recent_hours = self.config.general_cache_hours
+
         else:
+            # General web search
             plan.use_serper = True
             plan.use_tavily = True
             plan.use_wikimedia = True
@@ -206,10 +228,18 @@ class OnlineSearchService:
 
         if self.web_search_fn is not None and request.use_web_search:
             try:
+                # Normalise domain aliases so SearchAPIFetcher applies the right site filter
+                _d = request.domain
+                if _d == "health":
+                    _d = "medical"
+                elif _d in ("finance", "business"):
+                    _d = "finance"
+                elif _d in ("code", "programming"):
+                    _d = "software_eng"
                 fetched.extend(
                     self.web_search_fn(
                         query=plan.normalized_query,
-                        domain=request.domain,
+                        domain=_d,
                         limit=request.limit,
                         language=request.language,
                         category=request.category,

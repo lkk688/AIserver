@@ -311,7 +311,9 @@ def _has_unclosed_tool_markup(text: str) -> bool:
 def _parse_native_dict_to_action(name: str, args_dict: dict, allowlist: List[str]) -> AgentAction:
     """Translates a native parsed tool dictionary into our AgentAction protocol."""
     if name == "write_file":
-        return ActionWriteFile(path=args_dict.get("path", ""), content=args_dict.get("content", ""))
+        # Normalize "filepath" alias — some model checkpoints emit this instead of "path"
+        path = args_dict.get("path") or args_dict.get("filepath", "")
+        return ActionWriteFile(path=path, content=args_dict.get("content", ""))
     elif name == "search_and_replace":
         return ActionReplaceText(
             path=args_dict.get("path", ""), 
@@ -684,12 +686,28 @@ async def complete_with_continuation_async(
             if act not in final_actions:
                 final_actions.append(act)
     elif tool_strategy == "text_only" or (tool_strategy == "native_all" and not final_actions):
-        if verbose:
-            console.print(f"[dim]Applying {tool_strategy} fallback parser for mutations or textual tool calls...[/dim]")
-        parsed_text_actions = parse_text_actions(full_content, allowlist, dynamic_tools_registry)
-        for act in parsed_text_actions:
-            if act not in final_actions:
-                final_actions.append(act)
+        # For native_all, only use the text fallback if there is actual non-thinking content.
+        # If the model only produced <think>...</think> with nothing after, skip parsing —
+        # running the parser on pure thinking content can produce garbage writes with empty paths.
+        if tool_strategy == "native_all":
+            stripped_for_check = re.sub(r"<think>.*?</think>", "", full_content, flags=re.DOTALL | re.IGNORECASE).strip()
+            if not stripped_for_check:
+                if verbose:
+                    console.print("[dim]native_all: model output was entirely inside <think> blocks — skipping text fallback parser to avoid spurious actions.[/dim]")
+            else:
+                if verbose:
+                    console.print(f"[dim]Applying native_all fallback parser (non-think content found)...[/dim]")
+                parsed_text_actions = parse_text_actions(full_content, allowlist, dynamic_tools_registry)
+                for act in parsed_text_actions:
+                    if act not in final_actions:
+                        final_actions.append(act)
+        else:
+            if verbose:
+                console.print(f"[dim]Applying text_only parser...[/dim]")
+            parsed_text_actions = parse_text_actions(full_content, allowlist, dynamic_tools_registry)
+            for act in parsed_text_actions:
+                if act not in final_actions:
+                    final_actions.append(act)
 
     return full_content, final_actions
 

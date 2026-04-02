@@ -20,7 +20,10 @@ All SkillDB I/O reuses helpers from mini_batch_agent_libs.
 
 import asyncio
 import json
+import os
 import re
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
@@ -40,6 +43,68 @@ from BatchAgent.mini_batch_agent_base import ActionApplyDiff, ActionWriteFile
 from BatchAgent.prompt_registry_v2 import PromptRegistry
 
 console = Console()
+
+# ---------------------------------------------------------------------------
+# Sandbox helpers
+# ---------------------------------------------------------------------------
+
+def _ensure_venv(venv_path: Path) -> Path:
+    """Create a venv at *venv_path* if it does not already exist. Returns the path."""
+    python_bin = venv_path / "bin" / "python3"
+    if not python_bin.exists():
+        console.print(f"[cyan]→ Creating sandbox venv at {venv_path} ...[/cyan]")
+        result = subprocess.run(
+            [sys.executable, "-m", "venv", str(venv_path)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to create venv: {result.stderr}")
+        console.print("[green]✅ Sandbox venv created.[/green]")
+    return venv_path
+
+
+def _resolve_sandbox_cmd(verify_cmd: str, config: Any, workspace_dir: Path) -> str:
+    """
+    Re-write *verify_cmd* to run inside the configured sandbox:
+
+    1. Docker container  — prepends `docker exec ...` (existing behaviour).
+       Handled downstream by run_shell(sandbox_container=...), so no change here.
+    2. Explicit venv path — replaces `python3`/`python` with `<venv>/bin/python3`.
+    3. "auto" venv       — creates (or reuses) `.sandbox_venv` inside the workspace.
+    4. No sandbox        — returns the command unchanged.
+    """
+    sandbox_venv = getattr(config, "sandbox_venv", None)
+    sandbox_container = getattr(config, "sandbox_container", None)
+
+    # Docker is handled by run_shell — nothing to do here.
+    if sandbox_container or not sandbox_venv:
+        return verify_cmd
+
+    if sandbox_venv == "auto":
+        venv_dir = workspace_dir / ".sandbox_venv"
+        try:
+            _ensure_venv(venv_dir)
+            sandbox_venv = str(venv_dir)
+        except Exception as exc:
+            console.print(f"[yellow]⚠️ Could not create auto venv ({exc}). Running without venv.[/yellow]")
+            return verify_cmd
+
+    venv_python = Path(sandbox_venv) / "bin" / "python3"
+    if not venv_python.exists():
+        console.print(f"[yellow]⚠️ Venv python not found at {venv_python}. Running without venv.[/yellow]")
+        return verify_cmd
+
+    # Replace leading `python3` or `python` (not `python3.x` sub-commands) with venv python
+    new_cmd = re.sub(
+        r"(?<![/\w])python3?(?!\w)",
+        str(venv_python),
+        verify_cmd,
+        count=1,
+    )
+    console.print(f"[dim]Sandbox venv active: {new_cmd}[/dim]")
+    return new_cmd
+
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -210,10 +275,13 @@ class VerificationManager:
             if not Confirm.ask("Approve execution?"):
                 return f"⚠️ User skipped verification for: {verify_cmd}"
 
+        # Resolve sandbox: venv wrapping or docker (docker handled inside run_shell)
+        sandboxed_cmd = _resolve_sandbox_cmd(verify_cmd, self._config, self._config.workspace_dir)
         console.print("[cyan]→ Running verification sandbox...[/cyan]")
         code, out = run_shell(
-            verify_cmd,
+            sandboxed_cmd,
             cap=20000,
+            cwd=str(self._config.workspace_dir),
             sandbox_container=getattr(self._config, "sandbox_container", None),
         )
         (turn_dir / "verify_stdout.txt").write_text(out, encoding="utf-8")
@@ -387,7 +455,11 @@ class VerificationManager:
             # ── SkillDB lookup ────────────────────────────────────────────────
             skill_block = ""
             error_query = v_feedback[:400]
-            skills = select_relevant_skills(error_query, self._skilldb_dir, topk=4)
+            try:
+                skills = select_relevant_skills(error_query, self._skilldb_dir, topk=4)
+            except Exception as _skill_err:
+                console.print(f"[yellow]⚠️ SkillDB lookup failed (non-fatal): {_skill_err}[/yellow]")
+                skills = []
             if skills:
                 skill_block = format_skill_injection(skills)
             elif self._web_search_callback is not None:

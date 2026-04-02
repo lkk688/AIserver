@@ -299,7 +299,10 @@ class ToolRouter:
         )
 
     def _handle_find_file(self, args: Dict[str, Any]) -> str:
-        return find_file(args.get("pattern", ""))
+        return find_file(
+            filename_pattern=args.get("filename_pattern", ""),
+            root_dir=str(args.get("root_dir", ".")),
+        )
 
     def _handle_read_file_chunk(self, args: Dict[str, Any]) -> str:
         return read_file_chunk(
@@ -458,13 +461,17 @@ class ToolRouter:
     # ------------------------------------------------------------------
 
     def _handle_load_domain_tools(self, args: Dict[str, Any]) -> str:
+        # NOTE: in a normal agent run this is intercepted by agent_main_v2.py before
+        # reaching the router (it rebuilds the tool list and system prompt there).
+        # This fallback fires only when the router is used standalone.
         domain = str(args.get("domain") or "").strip()
         if not domain:
             return "Please provide a domain name."
-        return (
-            f"Domain tool loading requested: {domain}. "
-            f"Domain-specific activation is not enabled yet in this build."
-        )
+        from BatchAgent.tools.domain_tools import DOMAIN_REGISTRY
+        if domain not in DOMAIN_REGISTRY:
+            return f"Unknown domain '{domain}'. Available: {', '.join(sorted(DOMAIN_REGISTRY.keys()))}"
+        tool_names = [t["name"] for t in DOMAIN_REGISTRY[domain]]
+        return f"Domain '{domain}' loaded. Additional tools available: {', '.join(tool_names)}"
 
     def _handle_register_custom_tool(self, args: Dict[str, Any]) -> str:
         tool_name = args["tool_name"]

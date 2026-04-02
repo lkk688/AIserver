@@ -705,7 +705,10 @@ def _resolve_existing_file_path(record: TaskRecord, name: str) -> Optional[Path]
 def _normalize_file_entry(task_id: str, entry: Dict[str, Any], workspace_dir: Optional[str]) -> Dict[str, Any]:
     normalized = dict(entry)
     name = str(normalized.get("name") or "").strip()
-    ext = str(normalized.get("ext") or Path(name).suffix.lstrip(".")).lower()
+    ext_raw = normalized.get("ext")
+    if isinstance(ext_raw, list):
+        ext_raw = ext_raw[0] if ext_raw else ""
+    ext = str(ext_raw or Path(name).suffix.lstrip(".")).lower()
     normalized["ext"] = ext
     if name:
         normalized["file_api_path"] = _file_api_path(task_id, name)
@@ -884,6 +887,10 @@ class RunRequest(BaseModel):
     reranker_api_key: str = Field(default_factory=lambda: os.environ.get("RERANK_API_KEY", ""))
     reranker_model: str = Field(default_factory=lambda: os.environ.get("RERANK_API_MODEL", ""))
     context_resources: List[Dict[str, Any]] = Field(default_factory=list)
+    # Sandbox for code execution: "" = none, "auto" = per-workspace venv, or explicit venv path
+    sandbox_venv: str = Field(default_factory=lambda: os.environ.get("AGENT_SANDBOX_VENV", ""))
+    # Docker container name for full isolation (empty = no Docker)
+    sandbox_container: str = Field(default_factory=lambda: os.environ.get("AGENT_SANDBOX_CONTAINER", ""))
 
 
 class RunResponse(BaseModel):
@@ -955,6 +962,8 @@ def _make_service(req: RunRequest) -> AgentService:
         reranker_base_url=req.reranker_base_url,
         reranker_api_key=req.reranker_api_key,
         reranker_model=req.reranker_model,
+        sandbox_venv=req.sandbox_venv,
+        sandbox_container=req.sandbox_container,
     )
 
 
@@ -1219,9 +1228,16 @@ async def agent_run(
 
 
 @router.get("/agent/tools", summary="Get active tools available for the agent")
-def get_active_tools(strategy: str = "native_all"):
-    tools = get_base_tools(strategy=strategy)
+def get_active_tools(strategy: str = "native_all", domain: str = "general"):
+    tools = get_base_tools(strategy=strategy, domain=domain)
     return {"tools": tools}
+
+
+@router.get("/agent/domains", summary="List available agent domains")
+def get_agent_domains():
+    from BatchAgent.tools.domain_tools import DOMAIN_REGISTRY
+    domains = ["general"] + sorted(DOMAIN_REGISTRY.keys())
+    return {"domains": domains}
 
 
 @router.post("/agent/sessions/init", summary="Initialize an empty task session")
@@ -1403,7 +1419,39 @@ async def agent_stream(
 
             trace_str = traceback.format_exc()
             print(f"!!! CRITICAL PRODUCER EXCEPTION !!!\n{trace_str}")
-            err = json.dumps({"type": "error", "detail": f"{str(exc)}\n{trace_str}"})
+
+            # Save full traceback to a log file in the session directory so the UI
+            # can offer a "View error log" link without dumping the full traceback inline.
+            log_api_path: Optional[str] = None
+            try:
+                session_dir_obj: Optional[Path] = None
+                try:
+                    if record and record.session_dir:
+                        session_dir_obj = Path(record.session_dir)
+                except Exception:
+                    pass
+                if session_dir_obj is None and task_id:
+                    # Best-effort: look for the session dir under the workspace root
+                    workspace_root = Path(os.getenv("AGENT_WORKSPACE_DIR", "agent_workspace"))
+                    for p in workspace_root.rglob(f"*{task_id[:8]}*"):
+                        if p.is_dir():
+                            session_dir_obj = p
+                            break
+                if session_dir_obj and session_dir_obj.is_dir():
+                    log_file = session_dir_obj / "agent_error.log"
+                    log_file.write_text(
+                        f"Error: {str(exc)}\n\n{trace_str}",
+                        encoding="utf-8",
+                    )
+                    log_api_path = f"/agent/sessions/{task_id}/files/raw?name=agent_error.log"
+            except Exception:
+                pass
+
+            err = json.dumps({
+                "type": "error",
+                "detail": str(exc),  # brief message only — full trace is in log file
+                "log_path": log_api_path,
+            })
             await queue.put(f"data: {err}\n\n")
         finally:
             await queue.put(None)

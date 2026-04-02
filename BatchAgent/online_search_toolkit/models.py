@@ -36,9 +36,19 @@ DomainType = Literal[
     "news",
     "academic",
     "medical",
+    "medical_academic",
     "research",
     "programming",
+    "code",
+    "software_eng",
+    "math",
+    "science",
+    "language",
+    "business",
     "finance",
+    "health",
+    "assistant",
+    "sales_support",
 ]
 
 

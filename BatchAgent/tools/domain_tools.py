@@ -12,6 +12,14 @@ import tempfile
 import random
 
 # ==========================================
+# Feature flag — set to True to re-enable domain-specific plugin tools.
+# When False, DOMAIN_REGISTRY returns empty lists so no extra agent tools are loaded.
+# Domain-specific search is handled by online_search_toolkit via the web_search
+# category parameter (e.g. web_search(query="...", category="medical")).
+# ==========================================
+DOMAIN_TOOLS_ENABLED = False
+
+# ==========================================
 # 1. 医疗健康领域 (Medical)
 # ==========================================
 MEDICAL_TOOLS = [
@@ -702,7 +710,7 @@ def create_support_ticket(customer_id: str, issue_summary: str, priority: str) -
 # ==========================================
 # 领域路由字典 (DOMAIN_REGISTRY)
 # ==========================================
-DOMAIN_REGISTRY = {
+_FULL_DOMAIN_REGISTRY = {
     "medical": MEDICAL_TOOLS,
     "academic": ACADEMIC_TOOLS,
     "news": NEWS_TOOLS,
@@ -713,6 +721,13 @@ DOMAIN_REGISTRY = {
     "business": BUSINESS_TOOLS,
     "assistant": COMPUTER_ASSISTANT_TOOLS,
     "sales_support": COMPANY_SUPPORT_TOOLS
+}
+
+# When DOMAIN_TOOLS_ENABLED is False, domain-specific tools are not injected
+# into the agent — search routing is done by online_search_toolkit instead.
+DOMAIN_REGISTRY = {
+    k: (v if DOMAIN_TOOLS_ENABLED else [])
+    for k, v in _FULL_DOMAIN_REGISTRY.items()
 }
 
 # ==========================================

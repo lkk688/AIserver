@@ -115,6 +115,7 @@ interface TurnsApiResponse {
     download_api_path?: string;
     content?: string;
     detail?: string;
+    log_path?: string;
     success?: boolean;
     stats?: { total_prompt_tokens?: number; total_completion_tokens?: number; total_elapsed_s?: number };
     isFinalSummary?: boolean;
@@ -650,7 +651,10 @@ function reconstructBlocksFromChatHistory(data: TurnsApiResponse): Block[] {
       }
       fileWriteUrls.set(name, String(event.download_api_path || event.url || event.file_api_path || ''));
     } else if (event.type === 'error') {
-      blocks.push({ type: 'text', content: `\n\n❌ **Error:** ${String(event.detail ?? 'Unknown error')}` } as TextBlock);
+      const _detail = String(event.detail ?? 'Unknown error');
+      const _first = _detail.split('\n')[0].trim();
+      const _logRef = event.log_path ? ` — [View error log](${event.log_path})` : '';
+      blocks.push({ type: 'text', content: `\n\n❌ **Error:** ${_first}${_logRef}` } as TextBlock);
     } else if (event.type === 'done') {
       blocks.push({ type: 'completion', success: Boolean(event.success), stats: event.stats } as CompletionBlock);
     }
@@ -683,17 +687,17 @@ function upsertFileBlock(blocks: Block[], nextBlock: FileBlock): Block[] {
 
 // ─── Settings Panel ───────────────────────────────────────────────────────────
 
-const DOMAINS = ['general', 'software_eng', 'science', 'finance', 'medical', 'legal'];
-
 function SettingsPanel({
   settings,
   onChange,
   modelConnected,
+  domains,
   audio,
 }: {
   settings: AgentSettings;
   onChange: (s: AgentSettings) => void;
   modelConnected: boolean | null;
+  domains: string[];
   audio: {
     asrType: 'native' | 'webgpu' | 'none';
     setAsrType: (mode: 'native' | 'webgpu' | 'none') => void;
@@ -789,7 +793,7 @@ function SettingsPanel({
               <Globe className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-gray-400" />
               <select value={settings.domain} onChange={e => onChange({ ...settings, domain: e.target.value })}
                 className="w-full pl-7 pr-2 py-1.5 text-xs border border-gray-200 rounded-md bg-white focus:ring-1 focus:ring-indigo-400 focus:border-indigo-400 appearance-none">
-                {DOMAINS.map(d => <option key={d} value={d}>{d}</option>)}
+                {domains.map((d: string) => <option key={d} value={d}>{d}</option>)}
               </select>
             </div>
           </div>
@@ -1185,7 +1189,7 @@ function ChatView({
     isCustomizing: false,
   });
   // All agent-generated output docs in this session (file browser)
-  const [outputDocs, setOutputDocs] = useState<Array<{ name: string; content: string }>>([]);
+  const [outputDocs, setOutputDocs] = useState<Array<{ name: string; content: string; history: string[] }>>([]);
   const [selectedDocName, setSelectedDocName] = useState<string>('');
   const [attachedFiles, setAttachedFiles] = useState<AttachedFileItem[]>([]);
   const [showUrlComposer, setShowUrlComposer] = useState(false);
@@ -1203,6 +1207,7 @@ function ChatView({
   const [urlDraft, setUrlDraft] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [activeTools, setActiveTools] = useState<string[]>([]);
+  const [domains, setDomains] = useState<string[]>(['general']);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // Agent settings
@@ -1307,11 +1312,18 @@ function ChatView({
   }, [messages]);
 
   useEffect(() => {
-    fetch(`${agentApiUrl}/agent/tools?strategy=native_all`)
+    fetch(`${agentApiUrl}/agent/domains`)
+      .then(r => r.json())
+      .then(data => { if (Array.isArray(data.domains)) setDomains(data.domains); })
+      .catch(() => { });
+  }, [agentApiUrl]);
+
+  useEffect(() => {
+    fetch(`${agentApiUrl}/agent/tools?strategy=${settings.tool_strategy}&domain=${settings.domain}`)
       .then(r => r.json())
       .then(data => { if (Array.isArray(data.tools)) setActiveTools(data.tools.map((t: { name?: string; function?: { name?: string } }) => t.name || t.function?.name)); })
       .catch(() => { });
-  }, [apiBaseUrl]);
+  }, [agentApiUrl, settings.tool_strategy, settings.domain]);
 
   const resolveFileUrl = useCallback((raw?: string) => {
     if (!raw) return '';
@@ -1368,15 +1380,17 @@ function ChatView({
         }));
         setAttachedFiles(mappedFiles);
 
-        // Only auto-load agent-generated .md files (not user-uploaded sources).
+        // Auto-load agent-generated text/code output files (not user-uploaded sources).
+        const _textExts = new Set(['md', 'markdown', 'txt', 'rst', 'log', 'csv',
+          'py', 'js', 'ts', 'sh', 'bash', 'json', 'yaml', 'yml', 'toml', 'sql', 'html', 'xml']);
         const agentMdFiles = hasTurns
-          ? (data.files ?? []).filter(f =>
-              (f.ext === 'md' || f.ext === 'markdown' || f.name.toLowerCase().endsWith('.md') || f.name.toLowerCase().endsWith('.markdown'))
-              && !f.source_url && !f.resource_type
-            )
+          ? (data.files ?? []).filter(f => {
+              const ext = (f.ext || f.name.split('.').pop() || '').toLowerCase();
+              return _textExts.has(ext) && !f.source_url && !f.resource_type;
+            })
           : [];
 
-        const loadedDocs: Array<{ name: string; content: string }> = [];
+        const loadedDocs: Array<{ name: string; content: string; history: string[] }> = [];
         for (const mdFile of agentMdFiles) {
           let content = mdFile.content ?? '';
           if (!content) {
@@ -1396,7 +1410,7 @@ function ChatView({
               content = typeof payload?.content === 'string' ? payload.content : '';
             } catch { }
           }
-          if (content) loadedDocs.push({ name: mdFile.name, content });
+          if (content) loadedDocs.push({ name: mdFile.name, content, history: [] });
         }
         if (loadedDocs.length > 0) {
           setOutputDocs(loadedDocs);
@@ -1409,14 +1423,19 @@ function ChatView({
       .finally(() => setHistoryLoading(false));
   }, [agentApiUrl, apiBaseUrl, taskId, resolveFileUrl]);
 
-  // Accumulate agent-generated docs; update documentState to the latest
+  // Accumulate agent-generated docs; preserve previous content as version history.
   const upsertOutputDoc = useCallback((name: string, content: string) => {
     setOutputDocs(prev => {
       const idx = prev.findIndex(d => d.name === name);
-      const next = idx >= 0
-        ? prev.map((d, i) => i === idx ? { name, content } : d)
-        : [...prev, { name, content }];
-      return next;
+      if (idx >= 0) {
+        const existing = prev[idx];
+        // Only push to history when content actually changed
+        const history = existing.content && existing.content !== content
+          ? [...existing.history, existing.content]
+          : existing.history;
+        return prev.map((d, i) => i === idx ? { ...d, content, history } : d);
+      }
+      return [...prev, { name, content, history: [] }];
     });
     setSelectedDocName(name);
     setDocumentState(prev => ({ ...prev, title: name, content }));
@@ -1698,8 +1717,11 @@ function ChatView({
     const userMsg: Message = { id: Date.now().toString(), role: 'user', content: outgoingInput };
     setMessages(prev => [...prev, userMsg]);
     setInput('');
-    setOutputDocs([]);
-    setSelectedDocName('');
+    // Only reset docs when starting a fresh session; preserve docs from earlier tasks in same session
+    if (!currentTaskId && !taskId) {
+      setOutputDocs([]);
+      setSelectedDocName('');
+    }
     setIsStreaming(true);
     const assistantId = (Date.now() + 1).toString();
     setMessages(prev => [...prev, { id: assistantId, role: 'assistant', content: '', blocks: [] }]);
@@ -1751,7 +1773,8 @@ function ChatView({
 
       if (!response.ok) {
         const errText = await response.text().catch(() => response.statusText);
-        updateBlocks(b => [...b, { type: 'text', content: `\n\n❌ **Server error ${response.status}:** ${errText}` } as TextBlock]);
+        const errFirst = errText.split('\n')[0].slice(0, 200).trim();
+        updateBlocks(b => [...b, { type: 'text', content: `\n\n❌ **Server error ${response.status}:** ${errFirst}` } as TextBlock]);
         return;
       }
       if (!response.body) throw new Error('No readable stream');
@@ -1816,7 +1839,9 @@ function ChatView({
               }
               const fileName = String(event.name || '');
               const lowerName = fileName.toLowerCase();
-              const isTextDoc = ['.md', '.markdown', '.txt', '.rst', '.log', '.csv'].some(ext => lowerName.endsWith(ext));
+              const _TEXT_EXTS = ['.md', '.markdown', '.txt', '.rst', '.log', '.csv',
+                '.py', '.js', '.ts', '.sh', '.bash', '.json', '.yaml', '.yml', '.toml', '.sql', '.html', '.xml'];
+              const isTextDoc = _TEXT_EXTS.some(ext => lowerName.endsWith(ext));
               if (isTextDoc) {
                 const inline = event.content;
                 if (inline) {
@@ -1863,7 +1888,10 @@ function ChatView({
               }
             } else if (event.type === 'error') {
               setStreamStatus('');
-              updateBlocks(b => [...b, { type: 'text', content: `\n\n❌ **Error:** ${event.detail ?? 'Unknown error'}` } as TextBlock]);
+              const _errDetail = String(event.detail ?? 'Unknown error');
+              const _errFirst = _errDetail.split('\n')[0].trim();
+              const _errLog = event.log_path ? ` — [View error log](${event.log_path})` : '';
+              updateBlocks(b => [...b, { type: 'text', content: `\n\n❌ **Error:** ${_errFirst}${_errLog}` } as TextBlock]);
             }
           } catch { /* incomplete chunk */ }
         }
@@ -2229,6 +2257,7 @@ function ChatView({
               settings={settings}
               onChange={setSettings}
               modelConnected={modelConnected}
+              domains={domains}
               audio={{
                 asrType,
                 setAsrType,
@@ -2292,8 +2321,16 @@ function ChatView({
                         json: 'bg-yellow-100 text-yellow-700',
                         csv: 'bg-green-100 text-green-700',
                         py: 'bg-blue-100 text-blue-600',
+                        js: 'bg-yellow-100 text-yellow-600',
+                        ts: 'bg-blue-100 text-blue-700',
+                        sh: 'bg-gray-100 text-gray-600',
+                        html: 'bg-orange-100 text-orange-600',
+                        sql: 'bg-teal-100 text-teal-700',
+                        yaml: 'bg-rose-100 text-rose-600',
+                        yml: 'bg-rose-100 text-rose-600',
                       };
                       const extColor = extColors[ext] ?? 'bg-purple-100 text-purple-600';
+                      const hasHistory = doc.history.length > 0;
                       return (
                         <button
                           key={doc.name}
@@ -2312,7 +2349,12 @@ function ChatView({
                             <span className={clsx("px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wide shrink-0", extColor)}>
                               {ext || 'file'}
                             </span>
-                            {isSelected && <span className="ml-auto w-1.5 h-1.5 rounded-full bg-indigo-500 shrink-0" />}
+                            {hasHistory && (
+                              <span className="ml-auto text-[9px] font-medium text-indigo-400 shrink-0" title={`${doc.history.length} previous version${doc.history.length > 1 ? 's' : ''}`}>
+                                {doc.history.length}v
+                              </span>
+                            )}
+                            {isSelected && !hasHistory && <span className="ml-auto w-1.5 h-1.5 rounded-full bg-indigo-500 shrink-0" />}
                           </div>
                           <span className={clsx(
                             "text-xs leading-tight w-full truncate",
@@ -2333,6 +2375,31 @@ function ChatView({
                   className="font-mono text-xs font-semibold text-gray-700 bg-transparent border-none focus:ring-1 focus:ring-indigo-300 rounded px-1 min-w-0 flex-1 truncate"
                 />
                 <div className="flex items-center gap-1 shrink-0">
+                  {/* Version history selector — visible when selected doc has previous versions */}
+                  {(() => {
+                    const selDoc = outputDocs.find(d => d.name === selectedDocName);
+                    if (!selDoc || selDoc.history.length === 0) return null;
+                    const allVersions = [...selDoc.history, selDoc.content]; // oldest → newest
+                    const currentIdx = allVersions.length - 1;
+                    return (
+                      <select
+                        title="Browse document versions"
+                        className="text-[11px] border border-gray-200 rounded px-1.5 py-0.5 text-gray-600 bg-white"
+                        value={currentIdx}
+                        onChange={e => {
+                          const idx = Number(e.target.value);
+                          const versionContent = allVersions[idx] ?? selDoc.content;
+                          setDocumentState(prev => ({ ...prev, content: versionContent }));
+                        }}
+                      >
+                        {allVersions.map((_, i) => (
+                          <option key={i} value={i}>
+                            {i === currentIdx ? 'Current' : `v${i + 1}`}
+                          </option>
+                        ))}
+                      </select>
+                    );
+                  })()}
                   <div className="flex bg-gray-100 rounded-md p-0.5">
                     <button onClick={() => setDocumentState(p => ({ ...p, isCustomizing: false }))}
                       className={clsx("px-2 py-0.5 text-xs rounded transition-all", !documentState.isCustomizing ? "bg-white text-gray-800 shadow-sm" : "text-gray-500")}>
@@ -2394,7 +2461,15 @@ function ChatView({
                   />
                 ) : (
                   <div className="px-8 py-6 pb-20 max-w-none min-h-full">
-                    <MarkdownContent content={documentState.content} />
+                    {(() => {
+                      const _codeExts = new Set(['py', 'js', 'ts', 'sh', 'bash', 'json', 'yaml', 'yml', 'toml', 'sql', 'html', 'xml', 'css', 'rs', 'go', 'java', 'cpp', 'c']);
+                      const _docExt = (documentState.title || '').split('.').pop()?.toLowerCase() ?? '';
+                      const _isCode = _codeExts.has(_docExt);
+                      const _content = _isCode
+                        ? `\`\`\`${_docExt}\n${documentState.content}\n\`\`\``
+                        : documentState.content;
+                      return <MarkdownContent content={_content} />;
+                    })()}
                   </div>
                 )}
               </div>

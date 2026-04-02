@@ -1763,7 +1763,10 @@ def score_skill(skill: Skill, query: str) -> int:
     s = 0
     
     # 1. Pattern Match (Strong signal)
-    patt = (skill.pattern or "").lower().strip()
+    raw_patt = skill.pattern
+    if isinstance(raw_patt, list):
+        raw_patt = " ".join(str(x) for x in raw_patt)
+    patt = (raw_patt or "").lower().strip()
     if patt and patt in q:
         s += 5
         

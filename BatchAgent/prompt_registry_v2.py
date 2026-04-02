@@ -267,19 +267,24 @@ class PromptRegistry:
             "3. **Context-Aware Verification**:\n"
             "   - **For Executable Code**: After modifying scripts, you MUST run a verification command when the appropriate tools are active.\n"
             "   - **For Documents/Reports**: (e.g., `.md`, `.txt`) Do NOT attempt to execute them. Once the writing tool reports success, consider them verified.\n"
+            "4. **Multi-Step Mutations — Complete All in One Turn**:\n"
+            "   - If you need to insert or replace **multiple items** (e.g., 4 images, 3 sections) into a document, "
+            "issue ALL `search_and_replace` or `write_file` calls in the **same response** — do NOT stop after the first one.\n"
+            "   - Plan first (inside `<think>`), then emit ALL tool calls back-to-back outside `<think>` in one response.\n"
+            "   - NEVER emit only a `<think>` block with no tool call after it — your thinking has no effect unless a tool call follows.\n"
         )
 
         if has_finish_task:
             general_rules += (
-                "4. **End of Task**: The moment you have fully achieved the user's goal, you MUST immediately call the `finish_task` tool in your very next response.\n"
-                "5. **Unrecoverable Failures**: If a tool returns a permanent error (e.g. `[URL Permanently Blocked]`, `[URL Not Found]`, `[Web Search Unavailable]`) "
+                "5. **End of Task**: The moment you have fully achieved the user's goal, you MUST immediately call the `finish_task` tool in your very next response.\n"
+                "6. **Unrecoverable Failures**: If a tool returns a permanent error (e.g. `[URL Permanently Blocked]`, `[URL Not Found]`, `[Web Search Unavailable]`) "
                 "and no alternative source or tool can supply the needed information, do NOT keep retrying. "
                 "Call `finish_task` immediately, explaining what was attempted and why the information could not be retrieved. "
                 "Repeating failed tool calls in a loop wastes turns and never helps.\n"
             )
         else:
             general_rules += (
-                "4. **End of Task**: Once the goal is fully achieved, provide a concise completion response.\n"
+                "5. **End of Task**: Once the goal is fully achieved, provide a concise completion response.\n"
             )
 
         cot_rules = (
@@ -514,9 +519,12 @@ class PromptRegistry:
                 "Do NOT repeat the same search_and_replace."
             )
         return (
-            "⚠️ Repeated identical file mutation skipped. "
-            "The same write/edit was already applied. "
-            "Call `finish_task` if the goal is completed."
+            "⚠️ Repeated identical file mutation skipped — this exact edit was already applied.\n"
+            "**Do NOT repeat the same operation.**\n"
+            "- If you had multiple items to insert/replace (e.g., multiple images, sections, or code blocks), "
+            "move on to the NEXT item now — make a new tool call with the next pending content.\n"
+            "- If all planned operations are complete, call `finish_task`.\n"
+            "- Do NOT re-plan or re-summarize what was already done."
         )
 
     @staticmethod

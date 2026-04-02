@@ -58,17 +58,29 @@ class SearchAPIFetcher:
             metadata={},
         )
 
+    # Canonical domain → site-filter string
+    _DOMAIN_FILTER_MAP: Dict[str, str] = {
+        "news":             "site:reuters.com OR site:apnews.com OR site:bbc.com OR site:theguardian.com OR site:bloomberg.com",
+        "academic":         "site:arxiv.org OR site:scholar.google.com OR site:semanticscholar.org OR site:pubmed.ncbi.nlm.nih.gov",
+        "medical":          "site:pubmed.ncbi.nlm.nih.gov OR site:medlineplus.gov OR site:nih.gov OR site:mayoclinic.org OR site:webmd.com",
+        "medical_academic": "site:pubmed.ncbi.nlm.nih.gov OR site:europepmc.org OR site:ncbi.nlm.nih.gov",
+        "research":         "site:arxiv.org OR site:semanticscholar.org OR site:scholar.google.com OR site:jstor.org",
+        "programming":      "site:stackoverflow.com OR site:github.com OR site:docs.python.org OR site:pypi.org",
+        "code":             "site:stackoverflow.com OR site:github.com OR site:docs.python.org OR site:pypi.org",
+        "software_eng":     "site:stackoverflow.com OR site:github.com OR site:dev.to OR site:pypi.org OR site:docs.python.org",
+        "math":             "site:artofproblemsolving.com OR site:math.stackexchange.com OR site:mathworld.wolfram.com OR site:khanacademy.org",
+        "science":          "site:nature.com OR site:sciencedirect.com OR site:phys.org OR site:wolframalpha.com OR site:pnas.org",
+        "language":         "site:wiktionary.org OR site:languagelearning.stackexchange.com OR site:bbc.co.uk/languages",
+        "business":         "site:sec.gov OR site:finance.yahoo.com OR site:bloomberg.com OR site:investopedia.com OR site:wsj.com",
+        "finance":          "site:sec.gov OR site:finance.yahoo.com OR site:bloomberg.com OR site:investopedia.com OR site:wsj.com",
+        "assistant":        "site:superuser.com OR site:askubuntu.com OR site:serverfault.com OR site:apple.stackexchange.com",
+        "sales_support":    "site:zendesk.com OR site:hubspot.com OR site:salesforce.com OR site:freshdesk.com",
+        "health":           "site:pubmed.ncbi.nlm.nih.gov OR site:medlineplus.gov OR site:nih.gov OR site:mayoclinic.org",
+        "general":          "",
+    }
+
     def _domain_filter(self, domain: str) -> str:
-        mapping: Dict[str, str] = {
-            "news": "site:reuters.com OR site:apnews.com OR site:bbc.com OR site:theguardian.com OR site:bloomberg.com",
-            "academic": "site:arxiv.org OR site:scholar.google.com OR site:semanticscholar.org OR site:pubmed.ncbi.nlm.nih.gov",
-            "medical": "site:pubmed.ncbi.nlm.nih.gov OR site:medlineplus.gov OR site:nih.gov OR site:nimh.nih.gov",
-            "programming": "site:stackoverflow.com OR site:github.com OR site:docs.python.org OR site:pypi.org",
-            "finance": "site:sec.gov OR site:finance.yahoo.com OR site:investopedia.com OR site:bloomberg.com",
-            "research": "site:arxiv.org OR site:semanticscholar.org OR site:scholar.google.com OR site:jstor.org",
-            "general": "",
-        }
-        return mapping.get(domain, "")
+        return self._DOMAIN_FILTER_MAP.get(domain, "")
 
     def search_serper(self, query: str, domain: str, limit: int = 8) -> List[SearchRecord]:
         if not self.serper_api_key or self.serper_api_key == "EMPTY":
@@ -292,7 +304,9 @@ class SearchAPIFetcher:
         if use_serper:
             results.extend(self.search_serper(query=query, domain=domain, limit=limit))
 
-        if not results and use_tavily:
+        # Run Tavily as a supplement when serper returns fewer than requested results,
+        # or as the sole source when serper is disabled/unavailable.
+        if use_tavily and len(results) < limit:
             results.extend(self.search_tavily(query=query, domain=domain, limit=limit))
 
         if use_wikimedia:
