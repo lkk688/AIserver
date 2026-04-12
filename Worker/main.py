@@ -9,6 +9,8 @@ from settings import settings
 from db import db
 from worker_comm import comm
 from jobs.llm import process_llm_job
+from jobs.audio_asr import process_long_audio_job
+from jobs.video_yolo import process_video_job
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -28,7 +30,7 @@ async def shutdown(ctx):
 
 # ARQ Worker Settings
 class WorkerSettings:
-    functions = [process_llm_job]
+    functions = [process_llm_job, process_long_audio_job, process_video_job]
     redis_settings = RedisSettings(
         host=settings.REDIS_HOST,
         port=settings.REDIS_PORT,
@@ -64,6 +66,20 @@ async def redis_blpop_loop():
                         model=data.get("model"),
                         messages=data.get("messages"),
                         user_id=data.get("user_id")
+                    )
+                elif task_type == "audio_asr":
+                    await process_long_audio_job(
+                        job_id=data.get("job_id"),
+                        file_path=data.get("file_path"),
+                        user_id=data.get("user_id"),
+                        summarize=data.get("summarize", True)
+                    )
+                elif task_type == "video_yolo":
+                    await process_video_job(
+                        job_id=data.get("job_id"),
+                        video_path=data.get("video_path"),
+                        user_id=data.get("user_id"),
+                        conf_threshold=data.get("conf_threshold", 0.5)
                     )
             
         except Exception as e:

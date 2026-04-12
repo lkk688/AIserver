@@ -45,11 +45,15 @@ def health_check():
 
 from backend.app.api.routers import router as api_router
 from backend.app.api.llm_router import router as llm_router
+from backend.app.api.audio_router import router as audio_router
+from backend.app.api.meeting_router import router as meeting_router
 from BatchAgent.agent_route_fastapi import router as agent_router
 from BatchAgent.online_search_toolkit.router import router as online_search_router
 
 app.include_router(api_router, prefix="/api/v1")
 app.include_router(llm_router, prefix="/api/v1")
+app.include_router(audio_router, prefix="/api/v1")
+app.include_router(meeting_router, prefix="/api/v1")
 app.include_router(agent_router, prefix="/api/v1")
 app.include_router(online_search_router, prefix="/api/v1")
 

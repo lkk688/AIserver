@@ -39,3 +39,4 @@ search_cache
 cache
 BatchAgent/cache
 BatchAgent/cache/search/*.json
+*.mp3

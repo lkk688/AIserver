@@ -11,6 +11,7 @@ import {
   User,
   Waves,
   Globe,
+  Video,
 } from "lucide-react";
 import clsx from "clsx";
 
@@ -23,6 +24,7 @@ function Sidebar() {
     { icon: FileText, label: "My Documents", href: "/documents" },
     { icon: CalendarClock, label: "Scheduler", href: "/jobs" },
     { icon: Waves, label: "Audio Lab", href: "/audio" },
+    { icon: Video, label: "Meeting Call", href: "/meeting" },
     { icon: Sparkles, label: "Chat Agent", href: "/chat" },
     { icon: Globe, label: "Online Search", href: "/search" },
   ];

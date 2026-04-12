@@ -30,6 +30,17 @@ export default function AudioPage() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [status, setStatus] = useState<string>("");
 
+  const [ttsText, setTtsText] = useState("你好，我是部署在1080Ti上的语音助手，很高兴为你服务！");
+  const [ttsBackend, setTtsBackend] = useState("sovits");
+  const [ttsVoice, setTtsVoice] = useState("zh_female_vv_uranus_bigtts");
+  const [ttsStatus, setTtsStatus] = useState("");
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  const [asrFile, setAsrFile] = useState<File | null>(null);
+  const [asrMode, setAsrMode] = useState("short");
+  const [asrStatus, setAsrStatus] = useState("");
+  const [asrResult, setAsrResult] = useState("");
+
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -70,7 +81,6 @@ export default function AudioPage() {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       ((window as any).AudioContext || (window as any).webkitAudioContext);
     if (supported) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setCanStream(true);
     }
   }, []);
@@ -269,14 +279,172 @@ export default function AudioPage() {
     }
   };
 
+  const handleTtsGenerate = async () => {
+    setTtsStatus("Generating audio...");
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
+      const resp = await fetch(`${apiUrl}/audio/tts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: ttsText,
+          backend: ttsBackend,
+          voice: ttsVoice,
+        }),
+      });
+
+      if (!resp.ok) {
+        setTtsStatus("Error: " + resp.statusText);
+        return;
+      }
+
+      const buf = await resp.arrayBuffer();
+      const blob = new Blob([buf], { type: "audio/wav" });
+      const url = URL.createObjectURL(blob);
+      const audioEl = ttsAudioRef.current!;
+      audioEl.src = url;
+      audioEl.play().catch(() => {});
+      setTtsStatus("Audio generated successfully.");
+    } catch (e) {
+      console.error(e);
+      setTtsStatus("Failed to generate audio.");
+    }
+  };
+
+  const handleAsrTranscribe = async () => {
+    if (!asrFile) {
+      setAsrStatus("Please select an audio file first.");
+      return;
+    }
+    setAsrStatus("Transcribing audio...");
+    setAsrResult("");
+    
+    try {
+      const formData = new FormData();
+      formData.append("file", asrFile);
+      formData.append("mode", asrMode);
+      formData.append("model", "large-v3");
+
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
+      const resp = await fetch(`${apiUrl}/audio/asr`, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!resp.ok) {
+        setAsrStatus("Error: " + resp.statusText);
+        return;
+      }
+
+      const data = await resp.json();
+      setAsrResult(data.text || "");
+      setAsrStatus("Transcription complete.");
+    } catch (e) {
+      console.error(e);
+      setAsrStatus("Failed to transcribe audio.");
+    }
+  };
+
   return (
     <div className="space-y-8">
       <div className="bg-gradient-to-r from-indigo-600 to-purple-600 rounded-2xl p-6 text-white shadow-lg">
         <h1 className="text-2xl font-bold mb-2">Audio Lab</h1>
-        <p className="text-indigo-100">Test streaming and non-streaming TTS with professional controls.</p>
+        <p className="text-indigo-100">Test streaming and non-streaming TTS, plus robust ASR processing.</p>
       </div>
 
-      <Section title="Synthesis Controls">
+      {/* New TTS Section */}
+      <Section title="Universal TTS Synthesis">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <Field label="Text">
+            <textarea
+              value={ttsText}
+              onChange={(e) => setTtsText(e.target.value)}
+              rows={4}
+              className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none"
+            />
+          </Field>
+          <div>
+            <Field label="Backend Engine">
+              <select
+                value={ttsBackend}
+                onChange={(e) => setTtsBackend(e.target.value)}
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none"
+              >
+                <option value="sovits">GPT-SoVITS (intel13rack)</option>
+                <option value="doubao">Doubao TTS (Volcengine)</option>
+              </select>
+            </Field>
+            {ttsBackend === "doubao" && (
+              <Field label="Voice (Doubao only)">
+                <input
+                  type="text"
+                  value={ttsVoice}
+                  onChange={(e) => setTtsVoice(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                />
+              </Field>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-4 mt-4">
+          <button
+            onClick={handleTtsGenerate}
+            className="px-5 py-2.5 rounded-lg font-semibold text-white bg-indigo-600 hover:bg-indigo-700 transition-colors"
+          >
+            Generate Audio
+          </button>
+          <span className="text-sm text-gray-500">{ttsStatus}</span>
+        </div>
+        <div className="mt-4">
+          <audio ref={ttsAudioRef} controls className="w-full" />
+        </div>
+      </Section>
+
+      {/* New ASR Section */}
+      <Section title="Whisper ASR Transcription">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <Field label="Audio File">
+            <input
+              type="file"
+              accept="audio/*"
+              onChange={(e) => {
+                if (e.target.files && e.target.files.length > 0) {
+                  setAsrFile(e.target.files[0]);
+                }
+              }}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+            />
+          </Field>
+          <Field label="Mode">
+            <select
+              value={asrMode}
+              onChange={(e) => setAsrMode(e.target.value)}
+              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none"
+            >
+              <option value="short">Short Audio (Single Pass)</option>
+              <option value="chunked">Long Audio (Chunked Streaming)</option>
+            </select>
+          </Field>
+        </div>
+        <div className="flex items-center gap-4 mt-4">
+          <button
+            onClick={handleAsrTranscribe}
+            className="px-5 py-2.5 rounded-lg font-semibold text-white bg-green-600 hover:bg-green-700 transition-colors"
+          >
+            Transcribe
+          </button>
+          <span className="text-sm text-gray-500">{asrStatus}</span>
+        </div>
+        {asrResult && (
+          <div className="mt-4 p-4 bg-gray-50 border border-gray-200 rounded-lg">
+            <h3 className="font-semibold text-gray-800 mb-2">Transcription Result:</h3>
+            <p className="text-gray-700 whitespace-pre-wrap">{asrResult}</p>
+          </div>
+        )}
+      </Section>
+
+      {/* Existing VibeVoice Section */}
+      <Section title="VibeVoice Streaming Controls">
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           <Field label="Text">
             <textarea
@@ -346,7 +514,7 @@ export default function AudioPage() {
         </div>
       </Section>
 
-      <Section title="Playback">
+      <Section title="VibeVoice Playback">
         <audio ref={audioRef} controls className="w-full" />
         <p className="text-xs text-gray-500 mt-2">
           Streaming uses WebSocket PCM16 chunks played via AudioContext; single requests return WAV.
